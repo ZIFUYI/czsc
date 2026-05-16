@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.DS_Store
 */docs/source/api
 */gmcache
 .idea/
@@ -9,6 +10,7 @@ manuscrips/
 *.xlsx
 *.html
 *.png
+examples/results/
 */.ipynb_checkpoints/
 # C extensions
 *.so

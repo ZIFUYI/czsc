@@ -10,11 +10,25 @@ from datetime import datetime, timedelta
 from typing import List
 from urllib.parse import quote
 
-from ..objects import RawBar, Freq
-from ..utils.bar_generator import freq_end_time, BarGenerator
-from czsc.data.base import freq_cn2jq
+from czsc import RawBar, Freq
+try:
+    from czsc.py import freq_end_time, BarGenerator
+except ImportError:
+    from czsc import freq_end_time, BarGenerator
 
-url = "https://dataapi.joinquant.com/apis"
+# freq_cn2jq 映射
+freq_cn2jq = {
+    "1分钟": "1min",
+    "5分钟": "5min",
+    "15分钟": "15min",
+    "30分钟": "30min",
+    "60分钟": "60min",
+    "日线": "D",
+    "周线": "W",
+    "月线": "M",
+}
+
+url = os.environ.get("JQDATA_HTTP_URL", "https://dataapi.joinquant.com/v2/apis")
 home_path = os.path.expanduser("~")
 file_token = os.path.join(home_path, "jq.token")
 
@@ -72,7 +86,19 @@ def get_token():
         "pwd": quote(jq_pwd),  # Password为聚宽官网登录密码，新申请用户默认为手机号后6位
     }
     response = requests.post(url, data=json.dumps(body))
-    token = response.text
+    response.raise_for_status()
+    token = response.text.strip()
+    if token.startswith("error:"):
+        raise RuntimeError(f"聚宽 JQData HTTP API 获取 token 失败：{token}")
+
+    # 旧版入口已返回 JSON 410；这里保留判断，便于环境变量误设为旧地址时给出清晰错误。
+    if token.startswith("{"):
+        try:
+            msg = json.loads(token)
+            if msg.get("status") and msg.get("status") != 200:
+                raise RuntimeError(f"聚宽 JQData HTTP API 获取 token 失败：{msg}")
+        except json.JSONDecodeError:
+            pass
     return token
 
 
@@ -300,8 +326,9 @@ def get_kline(
             # amount 单位：元
     if start_date:
         bars = [x for x in bars if x.dt >= start_date]
-    if "min" in freq:
-        bars[-1].dt = freq_end_time(bars[-1].dt, freq=freq_map[freq])
+    # 注释掉 freq_end_time 调用，因为 Rust 版本的 Freq 枚举不兼容
+    # if "min" in freq:
+    #     bars[-1].dt = freq_end_time(bars[-1].dt, freq=freq_map[freq])
     bars = [x for x in bars if x.dt <= end_date]
     return bars
 
@@ -365,8 +392,9 @@ def get_kline_period(
             # amount 单位：元
     if start_date:
         bars = [x for x in bars if x.dt >= start_date]
-    if "min" in freq and bars:
-        bars[-1].dt = freq_end_time(bars[-1].dt, freq=freq_map[freq])
+    # 注释掉 freq_end_time 调用，因为 Rust 版本的 Freq 枚举不兼容
+    # if "min" in freq and bars:
+    #     bars[-1].dt = freq_end_time(bars[-1].dt, freq=freq_map[freq])
     bars = [x for x in bars if x.dt <= end_date]
     return bars
 
