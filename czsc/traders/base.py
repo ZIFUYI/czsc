@@ -532,7 +532,34 @@ class CzscTrader(CzscSignals):
                             _op['op_desc'] = f"{pos.name} | {_op['op_desc']}"
                             bs.append(_op)
 
-            chart = ka.to_echarts(width, height, bs)
+            try:
+                chart = ka.to_echarts(width, height, bs)
+            except TypeError:
+                # rs-czsc 的 to_echarts 签名与 Python 版不完全一致，先退化为无参调用
+                chart = ka.to_echarts()
+
+            if isinstance(chart, str):
+                from czsc.utils.echarts_plot import kline_pro
+
+                kline = [x.__dict__ for x in ka.bars_raw]
+                if len(ka.bi_list) > 0:
+                    bi = [{"dt": x.fx_a.dt, "bi": x.fx_a.fx} for x in ka.bi_list] + [
+                        {"dt": ka.bi_list[-1].fx_b.dt, "bi": ka.bi_list[-1].fx_b.fx}
+                    ]
+                    fx = [{"dt": x.dt, "fx": x.fx} for x in ka.fx_list]
+                else:
+                    bi = []
+                    fx = []
+
+                chart = kline_pro(
+                    kline,
+                    bi=bi,
+                    fx=fx,
+                    width=width,
+                    height=height,
+                    bs=bs,
+                    title=f"{ka.symbol}-{ka.freq.value}",
+                )
             tab.add(chart, freq)
 
         signals = {k: v for k, v in self.s.items() if len(k.split("_")) == 3}

@@ -19,6 +19,93 @@ from czsc.signals.tas import update_ma_cache, update_macd_cache
 from czsc.utils import single_linear, get_sub_elements, create_single_signal
 
 
+def _get_current_day_bars(bars: List[RawBar]) -> List[RawBar]:
+    """获取当前交易日的全部基础周期K线。"""
+    if not bars:
+        return []
+
+    trade_date = bars[-1].dt.date()
+    day_bars = []
+    for bar in reversed(bars):
+        if bar.dt.date() != trade_date:
+            break
+        day_bars.append(bar)
+    return list(reversed(day_bars))
+
+
+def bar_intraday_direction_V260424(c: CZSC, **kwargs) -> OrderedDict:
+    """日内 9:35 方向信号
+
+    参数模板："{freq}_D1T{decision_time}_日内方向V260424"
+
+    **信号逻辑：**
+
+    1. 在 decision_time 对应的基础周期 K 线结束时，比较当前收盘价与当日首根K线开盘价。
+    2. 当前收盘价 >= 当日开盘价，输出看多；否则输出看空。
+
+    **信号列表：**
+
+    - Signal('1分钟_D1T0935_日内方向V260424_看多_任意_任意_0')
+    - Signal('1分钟_D1T0935_日内方向V260424_看空_任意_任意_0')
+    - Signal('1分钟_D1T0935_日内方向V260424_其他_任意_任意_0')
+
+    :param c: CZSC对象
+    :param kwargs: 参数字典
+        - decision_time: 决策时间，默认 0935
+    :return: 信号识别结果
+    """
+    decision_time = kwargs.get("decision_time", "0935")
+    freq = c.freq.value
+    k1, k2, k3 = f"{freq}_D1T{decision_time}_日内方向V260424".split("_")
+
+    if not c.bars_raw:
+        return create_single_signal(k1=k1, k2=k2, k3=k3, v1="其他")
+
+    last_bar = c.bars_raw[-1]
+    if last_bar.dt.strftime("%H%M") != decision_time:
+        return create_single_signal(k1=k1, k2=k2, k3=k3, v1="其他")
+
+    day_bars = _get_current_day_bars(c.bars_raw)
+    if not day_bars:
+        return create_single_signal(k1=k1, k2=k2, k3=k3, v1="其他")
+
+    day_open = day_bars[0].open
+    v1 = "看多" if last_bar.close >= day_open else "看空"
+    return create_single_signal(k1=k1, k2=k2, k3=k3, v1=v1)
+
+
+def bar_intraday_exit_V260424(c: CZSC, **kwargs) -> OrderedDict:
+    """日内固定时间平仓信号
+
+    参数模板："{freq}_D1T{exit_time}_日内平仓V260424"
+
+    **信号逻辑：**
+
+    1. 在 exit_time 对应的基础周期 K 线结束时，输出平仓。
+    2. 其他时间输出其他。
+
+    **信号列表：**
+
+    - Signal('1分钟_D1T1455_日内平仓V260424_平仓_任意_任意_0')
+    - Signal('1分钟_D1T1455_日内平仓V260424_其他_任意_任意_0')
+
+    :param c: CZSC对象
+    :param kwargs: 参数字典
+        - exit_time: 平仓时间，默认 1455
+    :return: 信号识别结果
+    """
+    exit_time = kwargs.get("exit_time", "1455")
+    freq = c.freq.value
+    k1, k2, k3 = f"{freq}_D1T{exit_time}_日内平仓V260424".split("_")
+
+    if not c.bars_raw:
+        return create_single_signal(k1=k1, k2=k2, k3=k3, v1="其他")
+
+    last_bar = c.bars_raw[-1]
+    v1 = "平仓" if last_bar.dt.strftime("%H%M") == exit_time else "其他"
+    return create_single_signal(k1=k1, k2=k2, k3=k3, v1=v1)
+
+
 def bar_single_V230506(c: CZSC, **kwargs) -> OrderedDict:
     """单K趋势因子辅助判断买卖点
 

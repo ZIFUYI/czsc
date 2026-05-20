@@ -78,6 +78,8 @@ from czsc.signals.vol import (
 )
 
 from czsc.signals.bar import (
+    bar_intraday_direction_V260424,
+    bar_intraday_exit_V260424,
     bar_end_V221211,
     bar_operate_span_V221111,
     bar_zdt_V230331,
