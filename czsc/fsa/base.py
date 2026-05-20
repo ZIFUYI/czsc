@@ -1,19 +1,13 @@
-# -*- coding: utf-8 -*-
-"""
-author: zengbin93
-email: zeng_bin8888@163.com
-create_dt: 2022/12/16 19:42
-describe: 
-"""
-# -*- coding: utf-8 -*-
 """
 author: zengbin93
 email: zeng_bin8888@163.com
 create_dt: 2022/12/5 19:02
 describe: 飞书应用API接口封装
 """
+
 import os
 import time
+
 import loguru
 import requests
 from loguru import logger
@@ -32,7 +26,7 @@ def request(method, url, headers, payload=None) -> dict:
     :param payload: 传参
     :return:
     """
-    payload = {} if not payload else payload
+    payload = payload if payload else {}
     response = requests.request(method, url, headers=headers, json=payload)
     logger.info(f"{'+' * 88}")
     logger.info(f"URL: {url} || X-Tt-Logid: {response.headers['X-Tt-Logid']}")
@@ -63,7 +57,7 @@ class FeishuApiBase:
         self.app_secret = app_secret
         self.host = "https://open.feishu.cn"
         self.headers = {"Content-Type": "application/json"}
-        self.cache = dict()
+        self.cache = {}
         self.logger = kwargs.get("logger", loguru.logger)
 
     def get_access_token(self, key="app_access_token"):
@@ -156,16 +150,17 @@ class FeishuApiBase:
 
         file_size = os.path.getsize(file_path)
         url = "https://open.feishu.cn/open-apis/drive/v1/files/upload_all"
-        form = {
-            "file_name": os.path.basename(file_path),
-            "parent_type": "explorer",
-            "parent_node": parent_node,
-            "size": str(file_size),
-            "file": (open(file_path, "rb")),
-        }
-        multi_form = MultipartEncoder(form)
-        headers = {"Authorization": f"Bearer {self.get_access_token()}", "Content-Type": multi_form.content_type}
-        response = requests.request("POST", url, headers=headers, data=multi_form)
+        with open(file_path, "rb") as _fp:
+            form = {
+                "file_name": os.path.basename(file_path),
+                "parent_type": "explorer",
+                "parent_node": parent_node,
+                "size": str(file_size),
+                "file": _fp,
+            }
+            multi_form = MultipartEncoder(form)
+            headers = {"Authorization": f"Bearer {self.get_access_token()}", "Content-Type": multi_form.content_type}
+            response = requests.request("POST", url, headers=headers, data=multi_form)
         return response.json()["data"]["file_token"]
 
     def download_file(self, file_token, file_path):

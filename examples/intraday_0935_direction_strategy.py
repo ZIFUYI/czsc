@@ -27,11 +27,8 @@ for mod in [
 ]:
     sys.modules.setdefault(mod, MagicMock())
 
-from czsc.core import RawBar
-from czsc.py import Event, Position, Signal, Operate
+from czsc import BarGenerator, CzscTrader, Event, Operate, Position, RawBar, Signal
 from czsc.strategies import CzscStrategyBase
-from czsc.sensors.cta import CTAResearch
-from czsc.signals import bar_intraday_direction_V260424, bar_intraday_exit_V260424
 
 
 def event_from_factor(name: str, operate: Operate, factor: dict) -> Event:
@@ -99,7 +96,7 @@ def create_intraday_positions(
         "interval": 15 * 3600,
         "timeout": 1000,
         "stop_loss": stop_loss_bp,
-        "T0": True,
+        "t0": True,
     }
     return [
         Position(
@@ -141,16 +138,28 @@ class Intraday0935DirectionStrategy(CzscStrategyBase):
     def signals_config(self):
         return [
             {
-                "name": bar_intraday_direction_V260424,
+                "name": "bar_intraday_direction_V260424",
                 "freq": self.base_freq_value,
                 "decision_time": self.decision_time,
             },
             {
-                "name": bar_intraday_exit_V260424,
+                "name": "bar_intraday_exit_V260424",
                 "freq": self.base_freq_value,
                 "exit_time": self.exit_time,
             },
         ]
+
+    def init_trader(self, bars: List[RawBar], **kwargs):
+        """创建并回放一个 CzscTrader，兼容旧示例的调用方式。"""
+        bg = BarGenerator(base_freq=self.base_freq, freqs=self.freqs, max_count=int(kwargs.get("max_count", 5000)))
+        trader = CzscTrader(bg, positions=self.positions, signals_config=self.signals_config)
+        sdt = pd.to_datetime(kwargs.get("sdt")) if kwargs.get("sdt") else None
+        for bar in bars:
+            if sdt is not None and pd.to_datetime(bar.dt) < sdt:
+                bg.update(bar)
+                continue
+            trader.update(bar)
+        return trader
 
 
 def ensure_jq_token():
@@ -220,14 +229,15 @@ def run_single_symbol(symbol="000852.XSHG", sdt="20240101", edt="20240430"):
 
 
 def run_batch_backtest(symbols, results_path, bar_sdt="20240101", sdt="20240201", edt="20240430", max_workers=2):
-    """使用 CTAResearch 批量回测。"""
+    """批量回测示例；上游 1.0 架构已移除 CTAResearch，这里保留轻量循环版本。"""
     ensure_jq_token()
-    bot = CTAResearch(
-        strategy=Intraday0935DirectionStrategy,
-        read_bars=read_bars,
-        results_path=str(results_path),
-    )
-    bot.backtest(symbols=symbols, max_workers=max_workers, bar_sdt=bar_sdt, sdt=sdt, edt=edt)
+    results_path = Path(results_path)
+    results_path.mkdir(parents=True, exist_ok=True)
+    for symbol in symbols:
+        tactic = Intraday0935DirectionStrategy(symbol=symbol)
+        bars = read_bars(symbol, tactic.base_freq, bar_sdt, edt, fq="不复权")
+        res = tactic.backtest(bars, sdt=sdt)
+        logger.info(f"{symbol} 回测完成：{res}")
 
 
 if __name__ == "__main__":

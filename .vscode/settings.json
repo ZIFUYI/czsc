@@ -2,10 +2,11 @@
     "python.defaultInterpreterPath": ".venv/Scripts/python.exe",
     "python.analysis.autoImportCompletions": true,
     "python.analysis.indexing": true,
-    "python.analysis.typeCheckingMode": "basic",
+    "python.analysis.typeCheckingMode": "off",
     "python.analysis.autoSearchPaths": true,
     "python.analysis.extraPaths": [
-        "."
+        ".",
+        "czsc"
     ],
     "files.exclude": {
         "**/__pycache__": true,
@@ -16,7 +17,10 @@
     },
     "python.testing.pytestEnabled": true,
     "python.testing.pytestArgs": [
-        "test"
+        "test",
+        "-s",
+        "--log-cli-level=INFO"
     ],
-    "python.testing.unittestEnabled": false
+    "python.testing.unittestEnabled": false,
+    "liveServer.settings.port": 5502
 }

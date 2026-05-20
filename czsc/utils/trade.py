@@ -1,11 +1,17 @@
-# -*- coding: utf-8 -*-
 """
 author: zengbin93
 email: zeng_bin8888@163.com
 create_dt: 2023/3/21 16:04
 describe: 交易相关的工具函数
 """
+
 import pandas as pd
+
+
+def _get_trade_dates(start_date, end_date):
+    start = pd.to_datetime(start_date)
+    end = pd.to_datetime(end_date)
+    return pd.bdate_range(start, end).tolist()
 
 
 def risk_free_returns(start_date="20180101", end_date="20210101", year_returns=0.03):
@@ -19,9 +25,7 @@ def risk_free_returns(start_date="20180101", end_date="20210101", year_returns=0
     :param year_returns: 年化收益率
     :return: pd.DataFrame
     """
-    from czsc.py.calendar import get_trading_dates
-
-    trade_dates = get_trading_dates(start_date, end_date)  # type: ignore
+    trade_dates = _get_trade_dates(start_date, end_date)
     df = pd.DataFrame({"date": trade_dates, "returns": year_returns / 252})
     return df
 
@@ -50,8 +54,7 @@ def update_nxb(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
     df = df.sort_values(["dt", "symbol"]).reset_index(drop=True)
 
     nseq = kwargs.get("nseq", (1, 2, 3, 5, 8, 10, 13))
-    for symbol, dfg in df.groupby("symbol"):
-
+    for _symbol, dfg in df.groupby("symbol"):
         for n in nseq:
             dfg[f"n{n}b"] = dfg["price"].shift(-n) / dfg["price"] - 1
             df.loc[dfg.index, f"n{n}b"] = dfg[f"n{n}b"].fillna(0)
@@ -127,17 +130,12 @@ def resample_to_daily(df: pd.DataFrame, sdt=None, edt=None, only_trade_date=True
     :param only_trade_date: 是否只保留交易日数据
     :return: pd.DataFrame
     """
-    from czsc.py.calendar import get_trading_dates
-
     df["dt"] = pd.to_datetime(df["dt"])
     sdt = df["dt"].min() if not sdt else pd.to_datetime(sdt)
     edt = df["dt"].max() if not edt else pd.to_datetime(edt)
 
     # 创建日期序列
-    if only_trade_date:
-        trade_dates = get_trading_dates(sdt=sdt, edt=edt)
-    else:
-        trade_dates = pd.date_range(sdt, edt, freq="D").tolist()
+    trade_dates = _get_trade_dates(sdt, edt) if only_trade_date else pd.date_range(sdt, edt, freq="D").tolist()
     trade_dates = pd.DataFrame({"date": trade_dates})
     trade_dates = trade_dates.sort_values("date", ascending=True).reset_index(drop=True)
 
@@ -146,7 +144,9 @@ def resample_to_daily(df: pd.DataFrame, sdt=None, edt=None, only_trade_date=True
     trade_dates = pd.merge_asof(trade_dates, vdt, left_on="date", right_on="dt")
     trade_dates = trade_dates.dropna(subset=["dt"]).reset_index(drop=True)
 
-    dt_map = {dt: dfg for dt, dfg in df.groupby("dt")}
+    # noqa: C416 — DataFrameGroupBy.keys 是字符串属性而非方法，dict(grouper) 会把
+    # mapping 路径走崩（'str' object is not callable）。必须用显式 dict-comp。
+    dt_map = {dt: dfg for dt, dfg in df.groupby("dt")}  # noqa: C416
     results = []
     for row in trade_dates.to_dict("records"):
         # 注意：这里必须进行 copy，否则默认浅拷贝导致数据异常

@@ -1,385 +1,301 @@
-# -*- coding: utf-8 -*-
 """
-author: zengbin93
-email: zeng_bin8888@163.com
-create_dt: 2022/5/6 13:24
-describe: 提供一些策略的编写案例
+策略门面（Facade）模块
 
-以 trader_ 开头的是择时交易策略案例
+定位:
+    在 Rust 后端的 Trader / 信号 / 仓位之上，提供一层 Python 友好的策略
+    抽象（CzscStrategyBase），屏蔽底层 PyO3 类型与运行时格式细节。
+    用户只需要继承基类、实现 ``positions`` 即可获得完整的回测、回放、
+    序列化与反序列化能力。
+
+关键设计:
+    1. 策略元数据（unique_signals / signals_config / freqs / base_freq）
+       全部由 ``positions`` 自动派生，避免子类手工填写引起不一致
+    2. 用户层与运行时配置之间的格式互转集中在 czsc._runtime_adapters，本模块只负责
+       调度，不直接关心字段映射
+    3. backtest / replay 委托给 czsc.research 中的 run_research / run_replay，
+       本模块只组合参数与处理 IO（路径、刷新、是否落盘等）
+    4. save_positions / load_positions 整段下沉 Rust（PR-G）：新契约采用
+       sha256(canonical JSON) 作为 ``checksum`` 字段，可在 Rust / Python 端
+       byte-for-byte 一致地复现。旧的 ``md5`` 字段（CPython 字典 repr() 计算）
+       在加载时**静默忽略**，用户可调用 ``save_positions`` 写回升级。
 """
-import os
-import time
+
+from __future__ import annotations
+
 import shutil
-import hashlib
-import pandas as pd
-from tqdm import tqdm
-from copy import deepcopy
-from datetime import timedelta, datetime
 from abc import ABC, abstractmethod
-from loguru import logger
-from typing import List
-from czsc.traders.base import CzscTrader
-from czsc.traders.sig_parse import get_signals_freqs, get_signals_config
-from czsc.utils.io import dill_dump, save_json, read_json
-from czsc.py.bar_generator import check_freq_and_market
-from czsc.core import RawBar, Signal, Position, BarGenerator
+from pathlib import Path
+from typing import Any
+
+# 直接调用 Rust 端的派生器（用下划线后缀别名，避免与同名公开 API 混淆）
+# 2026-05-17 PR-F / PR-G：unique_signals / save_position / load_position 全部
+# 下沉 Rust（czsc_trader::strategy），与 Rust crate 上同名 API 共享实现，
+# 开发宪法第一条完整收口。
+from czsc._native import (
+    derive_signals_config as _derive_signals_config_impl,
+)
+from czsc._native import (
+    derive_signals_freqs as _derive_signals_freqs_impl,
+)
+from czsc._native import (
+    strategy_load_position as _strategy_load_position_impl,
+)
+from czsc._native import (
+    strategy_save_position as _strategy_save_position_impl,
+)
+from czsc._native import (
+    strategy_unique_signals as _strategy_unique_signals_impl,
+)
+from czsc._runtime_adapters import (
+    bars_to_dataframe,
+    sort_freqs,
+)
+from czsc.research import run_replay, run_research
+
 
 class CzscStrategyBase(ABC):
     """
-    择时交易策略的要素：
+    czsc 风格策略定义的 Python 抽象基类
 
-    1. 交易品种以及该品种对应的参数
-    2. K线周期列表
-    3. 交易信号参数配置
-    4. 持仓策略列表
+    使用方式:
+        子类只需实现 :attr:`positions` 属性，返回 ``Position`` 列表；
+        其它元数据（unique_signals / signals_config / freqs / base_freq）
+        会由本类基于 ``positions`` 自动派生，子类无需关心。
+
+    必填初始化参数（通过 kwargs 传入）:
+        - symbol: 策略对应的标的代码
+
+    常用可选参数:
+        - name:                策略名（默认取类名），影响产物目录命名
+        - market:              市场标识，默认 "默认"
+        - bg_max_count:        BarGenerator 缓冲根数上限，默认 5000
+        - sdt / include_sdt_bar: 起始时间相关
     """
 
     def __init__(self, **kwargs):
+        """保存策略级参数，子类可通过 ``self.kwargs.get(key)`` 读取或扩展。"""
         self.kwargs = kwargs
-        self.signals_module_name = kwargs.get("signals_module_name", "czsc.signals")
 
     @property
     def symbol(self):
-        """交易标的"""
+        """策略绑定的标的代码（必传，缺失会触发 KeyError 显式报错）"""
         return self.kwargs["symbol"]
 
     @property
     def unique_signals(self):
-        """所有持仓策略中的交易信号列表"""
-        sig_seq = []
-        for pos in self.positions:  # type: ignore
-            sig_seq.extend(pos.unique_signals)
-        return list(set(sig_seq))
+        """汇总所有 Position 中出现过的信号 key，去重并保持首次出现顺序。
+
+        实现下沉到 Rust（``czsc._native.strategy_unique_signals`` /
+        ``czsc_trader::strategy::unique_signals_across``），保证 ``cargo
+        add czsc`` 的 Rust 用户与 ``pip install czsc`` 的 Python 用户拿到
+        完全一致的语义（参见 CLAUDE.md「🏛️ 开发宪法 · 第一条」）。
+        Python 侧只做一次列表透传，不再维护任何去重 / 排序逻辑。
+        """
+        return list(_strategy_unique_signals_impl(self.positions))
 
     @property
     def signals_config(self):
-        """交易信号参数配置"""
-        return get_signals_config(self.unique_signals, self.signals_module_name)
+        """基于 ``unique_signals`` 派生的信号配置列表（运行时三段式格式）。"""
+        return list(_derive_signals_config_impl(self.unique_signals))
 
     @property
     def freqs(self):
-        """K线周期列表"""
-        return get_signals_freqs(self.unique_signals)
+        """
+        策略涉及的所有周期集合（去重并按缠论惯用顺序排序）
+
+        实现细节:
+            先把 signals_config 转回运行时格式，再交给 Rust 派生器返回所有
+            涉及的周期；最后用 :func:`sort_freqs` 做去重与排序。
+        """
+        # signals_config 已经是 derive_signals_config 返回的扁平 dict；
+        # Rust 端 derive_signals_freqs 直接接受这种形态，无需再做适配（PR-2）。
+        return sort_freqs(_derive_signals_freqs_impl(self.signals_config))
 
     @property
     def sorted_freqs(self):
-        """排好序的 K 线周期列表"""
-        from czsc.utils import freqs_sorted
-        
-        return freqs_sorted(self.freqs)
+        """与 :attr:`freqs` 等价的别名（保留接口兼容）"""
+        return sort_freqs(self.freqs)
 
     @property
     def base_freq(self):
-        """基础 K 线周期"""
+        """策略基础周期：取 freqs 中最小（最高频）的那一档"""
         return self.sorted_freqs[0]
 
+    @property
     @abstractmethod
-    def positions(self) -> List[Position]:
-        """持仓策略列表"""
+    def positions(self):
+        """
+        策略持仓列表（必须由子类实现）
+
+        返回值要求:
+            list[czsc._native.Position]，每个元素描述一组开/平仓事件与参数。
+        """
         raise NotImplementedError
 
-    def init_bar_generator(self, bars: List[RawBar], **kwargs):
-        """使用策略定义初始化一个 BarGenerator 对象
-
-        函数执行逻辑：
-
-        - 该方法的目的是使用策略定义初始化一个BarGenerator对象。BarGenerator是用于生成K线数据的类。
-        - 参数bars表示基础周期的K线数据，**kwargs用于接收额外的关键字参数。
-        - 首先，方法获取了基础K线的频率，并检查了是否已经有一个初始化好的BarGenerator对象传入。
-        - 然后，根据基础频率是否在排序后的频率列表中，确定要使用的频率列表。
-        - 如果没有传入BarGenerator对象，则根据传入的基础K线数据和其他参数创建一个新的BarGenerator对象，
-          并使用部分K线数据初始化它。余下的K线数据将用于trader的初始化区间。
-        - 如果传入了BarGenerator对象，则会做一些断言检查，确保传入的基础K线数据与已有的BarGenerator对象的基础周期一致，
-          并且BarGenerator的end_dt是datetime类型。然后，筛选出在BarGenerator的end_dt之后的K线数据。
-        - 最后，返回BarGenerator对象和余下的K线数据。
-
-        :param bars: 基础周期K线
-        :param kwargs:
-
-            bg   已经初始化好的BarGenerator对象，如果传入了bg，则忽略sdt和n参数
-            sdt  初始化开始日期
-            n    初始化最小K线数量
-
-        :return:
+    def backtest(self, bars, **kwargs):
         """
-        base_freq = str(bars[0].freq.value)
-        bg: BarGenerator = kwargs.pop("bg", None)
-        freqs = self.sorted_freqs[1:] if base_freq in self.sorted_freqs else self.sorted_freqs
+        执行策略回测，返回内存中的 :class:`ResearchResult`
 
-        if bg is None:
-            uni_times = sorted(list({x.dt.strftime("%H:%M") for x in bars}))
-            _, market = check_freq_and_market(uni_times, freq=base_freq)
-
-            sdt = pd.to_datetime(kwargs.get("sdt", "20200101"))
-            n = int(kwargs.get("n", 500))
-            bg = BarGenerator(base_freq, freqs=freqs, market=market)
-
-            # 拆分基础周期K线，sdt 之前的用来初始化BarGenerator，随后的K线是 trader 初始化区间
-            bars_init = [x for x in bars if x.dt <= sdt]
-            if len(bars_init) > n:
-                bars1 = bars_init
-                bars2 = [x for x in bars if x.dt > sdt]
-            else:
-                bars1 = bars[:n]
-                bars2 = bars[n:]
-
-            for bar in bars1:
-                bg.update(bar)
-
-            return bg, bars2
-        else:
-            assert bg.base_freq == bars[-1].freq.value, "BarGenerator 的基础周期和 bars 的基础周期不一致"
-            assert isinstance(bg.end_dt, datetime), "BarGenerator 的 end_dt 必须是 datetime 类型"
-            bars2 = [x for x in bars if x.dt > bg.end_dt]
-            return bg, bars2
-
-    def init_trader(self, bars: List[RawBar], **kwargs) -> CzscTrader:
-        """使用策略定义初始化一个 CzscTrader 对象
-
-        **注意：** 这里会将所有持仓策略在 sdt 之后的交易信号计算出来并缓存在持仓策略实例内部，所以初始化的过程本身也是回测的过程。
-
-        函数执行逻辑：
-
-        - 首先，它通过调用init_bar_generator方法获取已经初始化好的BarGenerator对象和余下的K线数据。
-        - 然后，它创建一个CzscTrader对象，将BarGenerator对象、持仓策略的深拷贝、交易信号配置的深拷贝等参数传递给CzscTrader的构造函数。
-        - 接着，使用余下的K线数据对CzscTrader对象进行初始化，通过调用trader.on_bar(bar)方法处理每一根K线数据。
-        - 最后，返回初始化完成的CzscTrader对象。
-
-        :param bars: 基础周期K线
-        :param kwargs:
-
-            bg   已经初始化好的BarGenerator对象，如果传入了bg，则忽略sdt和n参数
-            sdt  初始化开始日期
-            n    初始化最小K线数量
-
-        :return: 完成策略初始化后的 CzscTrader 对象
+        参数:
+            bars:   K 线数据；可以是 DataFrame、RawBar 列表或 Arrow 字节
+            kwargs: 可选覆盖项：
+                    - sdt:           起始时间覆盖
+                    - emit_signals:  是否产出信号产物
+                    - include_sdt_bar: 是否包含 sdt 当根 K 线
         """
-        bg, bars2 = self.init_bar_generator(bars, **kwargs)
-        trader = CzscTrader(bg=bg, positions=deepcopy(self.positions),  # type: ignore
-                            signals_config=deepcopy(self.signals_config), **kwargs)
-        for bar in bars2:
-            trader.on_bar(bar)
-        return trader
+        return run_research(
+            self._normalize_bars_input(bars),
+            self._build_runtime_strategy(kwargs),
+            sdt=kwargs.get("sdt"),
+            opts=self._build_run_opts(kwargs),
+        )
 
-    def backtest(self, bars: List[RawBar], **kwargs) -> CzscTrader:
-        trader = self.init_trader(bars, **kwargs)
-        return trader
-
-    def dummy(self, sigs: List[dict], **kwargs) -> CzscTrader:
-        """使用信号缓存进行策略回测
-
-        :param sigs: 信号缓存，一般指 generate_czsc_signals 函数计算的结果缓存
-        :return: 完成策略回测后的 CzscTrader 对象
+    def replay(self, bars, res_path, **kwargs):
         """
-        sleep_time = kwargs.get("sleep_time", 0)
-        sleep_step = kwargs.get("sleep_step", 1000)
+        执行策略回放，结果写入指定目录
 
-        trader = CzscTrader(positions=deepcopy(self.positions))     # type: ignore
-        for i, sig in tqdm(enumerate(sigs), desc=f"回测 {self.symbol} {self.sorted_freqs}"):
-            trader.on_sig(sig)
+        参数:
+            bars:     K 线数据
+            res_path: 落盘根目录
+            kwargs:
+                refresh:   True 表示先清空 res_path 再写入；默认 False
+                exist_ok:  目录已存在但 refresh=False 时是否仍然执行；
+                           默认 False，此时会跳过执行并返回 None
+                其余可覆盖项同 :meth:`backtest`
 
-            if i % sleep_step == 0:
-                time.sleep(sleep_time)
-
-        return trader
-
-    def replay(self, bars: List[RawBar], res_path, **kwargs):
-        """交易策略交易过程回放
-
-        函数执行逻辑：
-
-        - 该方法用于交易策略交易过程的回放。它接受基础周期的K线数据、结果目录以及额外的关键字参数作为输入。
-        - 首先，它检查refresh参数，如果为True，则使用shutil.rmtree删除已存在的结果目录。
-        - 然后，它检查结果目录是否已存在，并且是否允许覆盖。如果目录已存在且不允许覆盖，则记录一条警告信息并返回。
-        - 通过调用os.makedirs创建结果目录，确保目录的存在。
-        - 接着，调用init_bar_generator方法初始化BarGenerator对象，并进行相关的初始化操作。
-        - 创建一个CzscTrader对象，并将初始化好的BarGenerator对象、持仓策略的深拷贝、交易信号配置的深拷贝等参数传递给CzscTrader的构造函数。
-        - 为每个持仓策略创建相应的目录。
-        - 遍历K线数据，调用trader.on_bar(bar)方法处理每一根K线数据。
-        - 在每根K线数据处理完成后，检查每个持仓策略是否有操作，并且操作的时间是否与当前K线的时间一致。
-            如果有操作，则生成相应的HTML文件名，并调用trader.take_snapshot(file_html)方法生成交易快照。
-        - 最后，遍历每个持仓策略，记录其评估信息，包括多空合并表现、多头表现、空头表现等。
-
-        :param bars: 基础周期K线
-        :param res_path: 结果目录
-        :param kwargs:
-
-            bg          已经初始化好的BarGenerator对象，如果传入了bg，则忽略sdt和n参数
-            sdt         初始化开始日期
-            n           初始化最小K线数量
-            refresh     是否刷新结果目录
-        :return:
+        返回:
+            :class:`ReplayResult`；当目录已存在且未要求覆盖时返回 ``None``
         """
-        from czsc.utils import x_round
-        
+        path = Path(res_path)
+        # 显式要求刷新：先清空目录，避免新旧产物混合
         if kwargs.get("refresh", False):
-            shutil.rmtree(res_path, ignore_errors=True)
+            shutil.rmtree(path, ignore_errors=True)
 
+        # 既不允许覆盖也未要求刷新 -> 跳过执行（避免重复回放浪费算力）
         exist_ok = kwargs.get("exist_ok", False)
-        if os.path.exists(res_path) and not exist_ok:
-            logger.warning(f"结果文件夹存在且不允许覆盖：{res_path}，如需执行，请先删除文件夹")
-            return
-        os.makedirs(res_path, exist_ok=exist_ok)
+        if path.exists() and not exist_ok and not kwargs.get("refresh", False):
+            return None
 
-        bg, bars2 = self.init_bar_generator(bars, **kwargs)
-        trader = CzscTrader(bg=bg, positions=deepcopy(self.positions),  # type: ignore
-                            signals_config=deepcopy(self.signals_config), **kwargs)
-        for position in trader.positions:
-            pos_path = os.path.join(res_path, position.name)
-            os.makedirs(pos_path, exist_ok=exist_ok)
-
-        for bar in bars2:
-            trader.on_bar(bar)
-            for position in trader.positions:
-                pos_path = os.path.join(res_path, position.name)
-
-                if position.operates and position.operates[-1]["dt"] == bar.dt:
-                    op = position.operates[-1]
-                    _dt = op["dt"].strftime("%Y%m%d#%H%M")
-                    file_name = f"{_dt}_{op['op'].value}_{op['bid']}_{x_round(op['price'], 2)}_{op['op_desc']}.html"
-                    file_html = os.path.join(pos_path, file_name)
-                    trader.take_snapshot(file_html)
-                    logger.info(f"{file_html}")
-
-        for position in trader.positions:
-            logger.info(
-                f"{position.name}  "
-                f"\n 多空合并：{position.evaluate()} "
-                f"\n 多头表现：{position.evaluate('多头')} "
-                f"\n 空头表现：{position.evaluate('空头')}"
-            )
-
-        file_trader = os.path.join(res_path, "trader.ct")
-        try:
-            dill_dump(trader, file_trader)
-            logger.info(f"交易对象保存到：{file_trader}")
-        except Exception as e:
-            logger.error(f"交易对象保存失败：{e}；通常的原因是交易对象中包含了不支持序列化的对象，比如函数")
-        return trader
-
-    def check(self, bars: List[RawBar], res_path, **kwargs):
-        """检查交易策略中的信号是否正确
-
-        :param bars: 基础周期K线
-        :param res_path: 结果目录
-        :param kwargs:
-            bg   已经初始化好的BarGenerator对象，如果传入了bg，则忽略sdt和n参数
-            sdt  初始化开始日期
-            n    初始化最小K线数量
-        :return:
-        """
-        if kwargs.get("refresh", False):
-            shutil.rmtree(res_path, ignore_errors=True)
-
-        exist_ok = kwargs.get("exist_ok", False)
-        if os.path.exists(res_path) and not exist_ok:
-            logger.warning(f"结果文件夹存在且不允许覆盖：{res_path}，如需执行，请先删除文件夹")
-            return
-        os.makedirs(res_path, exist_ok=exist_ok)
-
-        # 第一遍执行，获取信号
-        bg, bars2 = self.init_bar_generator(bars, **kwargs)
-        trader = CzscTrader(bg=bg, positions=deepcopy(self.positions),  # type: ignore
-                            signals_config=deepcopy(self.signals_config), **kwargs)
-
-        _signals = []
-        for bar in bars2:
-            trader.on_bar(bar)
-            _signals.append(trader.s)
-
-        for position in trader.positions:
-            print(f"{position.name}: {position.evaluate()}")
-
-        df = pd.DataFrame(_signals)
-        df.to_excel(os.path.join(res_path, "signals.xlsx"), index=False)
-        unique_signals = {}
-        for col in [x for x in df.columns if len(x.split("_")) == 3]:
-            unique_signals[col] = [Signal(f"{col}_{v}") for v in df[col].unique() if "其他" not in v]
-
-        print("\n", "+" * 100)
-        for key, values in unique_signals.items():
-            print(f"\n{key}:")
-            for value in values:
-                print(f"- {value}")
-        print("\n", "+" * 100)
-
-        # 第二遍执行，检查信号，生成html
-        bg, bars2 = self.init_bar_generator(bars, **kwargs)
-        trader = CzscTrader(bg=bg, positions=deepcopy(self.positions),  # type: ignore
-                            signals_config=deepcopy(self.signals_config), **kwargs)
-
-        # 记录每个信号最后一次出现的时间
-        last_sig_dt = {y.key: trader.end_dt for x in unique_signals.values() for y in x}
-        delta_days = kwargs.get("delta_days", 1)
-
-        for bar in bars2:
-            trader.on_bar(bar)
-
-            for key, values in unique_signals.items():
-                html_path = os.path.join(res_path, key)
-                os.makedirs(html_path, exist_ok=True)
-
-                for signal in values:
-                    if bar.dt - last_sig_dt[signal.key] > timedelta(days=delta_days) and signal.is_match(trader.s):
-                        file_html = f"{bar.dt.strftime('%Y%m%d_%H%M')}_{signal.signal}.html"
-                        file_html = os.path.join(html_path, file_html)
-                        print(file_html)
-                        trader.take_snapshot(file_html, height=kwargs.get("height", "680px"))
-                        last_sig_dt[signal.key] = bar.dt
+        return run_replay(
+            self._normalize_bars_input(bars),
+            self._build_runtime_strategy(kwargs),
+            res_path=path,
+            sdt=kwargs.get("sdt"),
+            opts=self._build_run_opts(kwargs),
+        )
 
     def save_positions(self, path):
-        """保存持仓策略配置
+        """将策略持仓序列化为 JSON 文件落盘，附带 sha256 ``checksum`` 字段。
 
-        :param path: 结果路径
-        :return: None
+        每个 Position 写为一个独立 JSON 文件（``<position_name>.json``）。
+        IO + 校验逻辑由 Rust 端 ``czsc._native.strategy_save_position`` 完成
+        （见 ``czsc_trader::strategy::save_position_to_file``，开发宪法第一条收口）。
+
+        参数:
+            path: 输出目录；不存在会自动创建
         """
-        os.makedirs(path, exist_ok=True)
-        for pos in self.positions:          # type: ignore
-            pos_ = pos.dump()
-            pos_.pop("symbol")
-            hash_code = hashlib.md5(str(pos_).encode()).hexdigest()
-            pos_["md5"] = hash_code
-            save_json(pos_, os.path.join(path, f"{pos_['name']}.json"))
+        out_dir = Path(path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for pos in self.positions:
+            target = out_dir / f"{pos.name}.json"
+            _strategy_save_position_impl(pos, target)
 
-    def load_positions(self, files: List, check=True) -> List[Position]:
-        """从配置文件中加载持仓策略
+    def load_positions(self, files, check=True):
+        """从多个 JSON 文件加载 Position 列表，自动绑定当前策略的 symbol。
 
-        :param files: 以json格式保存的持仓策略文件列表
-        :param check: 是否校验 MD5 值，默认为 True
-        :return: 持仓策略列表
+        IO + 校验逻辑由 Rust 端 ``czsc._native.strategy_load_position`` 完成
+        （见 ``czsc_trader::strategy::load_position_from_file``）。
+
+        参数:
+            files: JSON 文件路径列表
+            check: 是否校验文件中的 ``checksum`` 字段；默认开启。
+                   - 新格式（PR-G+）``checksum`` 缺失或不匹配时抛 ``ValueError``；
+                   - 旧格式 ``md5`` 字段（CPython repr，无法跨语言复现）静默跳过；
+                   - 既无 ``checksum`` 也无 ``md5`` 的手写 JSON 也跳过校验。
+
+        返回:
+            list[Position]
         """
-        positions = []
-        for file in files:
-            pos = read_json(file)
-            md5 = pos.pop("md5")
-            if check:
-                assert md5 == hashlib.md5(str(pos).encode()).hexdigest()
-            pos["symbol"] = self.symbol
-            positions.append(Position.load(pos))
-        return positions
+        return [_strategy_load_position_impl(file, self.symbol, check) for file in files]
+
+    def _build_runtime_strategy(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        """
+        把 self + overrides 拼装为 Rust 端可以直接消费的运行时 strategy dict
+
+        参数:
+            overrides: 调用 backtest/replay 时传入的临时覆盖参数
+
+        返回:
+            一份完整的策略字典，positions 与 signals_config 已转为运行时格式
+        """
+        # sdt 解析顺序：调用时显式传 > 实例 kwargs > None（不带 sdt 字段）
+        sdt = overrides.get("sdt", self.kwargs.get("sdt"))
+        strategy = {
+            "name": self.kwargs.get("name", self.__class__.__name__),
+            "symbol": self.symbol,
+            "base_freq": self.base_freq,
+            # PR-2 / PR-4：signals_config 与 Position dump 的归一化已由 Rust 处理，直接透传
+            "signals_config": list(self.signals_config),
+            "positions": [pos.dump(with_data=False) for pos in self.positions],
+            "market": self.kwargs.get("market", "默认"),
+            "bg_max_count": int(self.kwargs.get("bg_max_count", 5000)),
+            # 仅当 sdt 存在时才注入字段，避免显式写 None 触发 Rust 端 schema 错误
+            **({"sdt": sdt} if sdt else {}),
+        }
+        # include_sdt_bar 行为说明：
+        #   - 默认走 CzscStrategyBase 语义：bars_right 从 ``dt > sdt`` 开始（不包含起始那根）
+        #   - 调用方显式传 True 时，切到 generate_czsc_signals 风格 ``dt >= sdt``（包含起始那根）
+        #   - 显式传 False 同样会写入字段，让 Rust 端按指定语义运行
+        include_sdt_bar = overrides.get(
+            "include_sdt_bar",
+            self.kwargs.get("include_sdt_bar"),
+        )
+        if include_sdt_bar is not None:
+            strategy["include_sdt_bar"] = bool(include_sdt_bar)
+        return strategy
+
+    @staticmethod
+    def _build_run_opts(kwargs: dict[str, Any]) -> dict[str, Any] | None:
+        """
+        从用户 kwargs 中提取 Rust 端 opts 字段
+
+        当前仅暴露 ``emit_signals`` 一个开关，控制是否把信号产物写入结果。
+        未传入时返回 None，让 Rust 端使用默认行为，避免发送空 dict 引起歧义。
+        """
+        if "emit_signals" not in kwargs:
+            return None
+        return {"emit_signals": bool(kwargs["emit_signals"])}
+
+    def _normalize_bars_input(self, bars):
+        """
+        把多种 K 线输入统一为 Rust 可接受的形式
+
+        - bytes / bytearray: 视为已就绪的 Arrow 字节，直接透传
+        - 其他（DataFrame / list[RawBar]）: 走 ``bars_to_dataframe`` 强制规范，
+          关键是把所有数值列转为 Float64（Rust IPC 读取器对类型严格匹配）
+        """
+        if isinstance(bars, (bytes, bytearray)):
+            return bytes(bars)
+        # 即便已经是 DataFrame，也要走一次 bars_to_dataframe，
+        # 以确保数值列被强制转为 Float64（Rust IPC 读取器对此严格要求）。
+        return bars_to_dataframe(bars, symbol=self.symbol)
 
 
 class CzscJsonStrategy(CzscStrategyBase):
-    """仅传入Json配置的Positions就完成策略创建
+    """
+    直接从 JSON 文件加载持仓定义的策略包装器
 
-    执行逻辑:
+    使用场景:
+        策略配置由外部工具（GUI / 管理后台 / 优化结果）落盘为 JSON 后，
+        Python 侧只需指定文件路径即可装载并执行回测/回放。
 
-    1. 定义CzscJsonStrategy类，并继承自CzscStrategyBase。这个类可以通过仅传入Json配置的Positions来完成策略创建。
-    2. 类中定义了一个名为positions的属性，使用@property装饰器将其标记为只读属性。
-    3. 在positions属性的getter方法中，执行以下操作：
-        - 从self.kwargs字典中获取键为"files_position"的值，并将其赋值给变量files。
-            这里的self.kwargs可能是通过在实例化该类时传入的参数或其他方式设置的一个字典，其中包含了策略配置文件的路径列表。
-        - 使用self.kwargs.get方法获取键为"check_position"的值，并设置默认值为True，将其赋值给变量check。这个值用于确定是否对JSON持仓策略进行MD5校验。
-        - 调用self.load_positions(files, check)方法，并返回其结果。这个方法可能是从父类CzscStrategyBase中继承的方法，
-            用于从配置文件中加载持仓策略。将文件列表和校验标志作为参数传递给该方法，并返回加载的持仓策略列表。
-
-    必须参数：
-        files_position: 以 json 文件配置的策略，每个json文件对应一个持仓策略配置
-        check_position: 是否对 json 持仓策略进行 MD5 校验，默认为 True
+    初始化关键参数（通过 kwargs 传入）:
+        - files_position: JSON 文件路径列表
+        - check_position: 是否做 md5 校验；默认 True
+        - 其余同 :class:`CzscStrategyBase`
     """
 
     @property
     def positions(self):
-        files = self.kwargs["files_position"]
-        check = self.kwargs.get("check_position", True)
-        return self.load_positions(files, check)
+        """从 ``files_position`` 加载并返回 Position 列表，受 ``check_position`` 控制是否校验"""
+        return self.load_positions(self.kwargs["files_position"], self.kwargs.get("check_position", True))

@@ -1,220 +1,265 @@
-# -*- coding: utf-8 -*-
-"""
-author: zengbin93
-email: zeng_bin8888@163.com
-create_dt: 2019/10/29 15:01
-"""
-# 尝试从 rs_czsc 导入，失败则使用 Python 版本
-try:
-    from rs_czsc import (
-        daily_performance,
-        top_drawdowns,
-        # python版本：from czsc.traders.weight_backtest import WeightBacktest
-        WeightBacktest,
-    )
-except ImportError:
-    # 回退到 Python 版本
-    from czsc.core import WeightBacktest
-    # daily_performance 和 top_drawdown 在 Python 版本中的位置
-    from czsc.utils import daily_performance, top_drawdowns
+"""CZSC（缠中说禅）量化分析框架——顶层包入口。
 
-from czsc import envs
-from czsc import fsa
-from czsc import utils
-from czsc import traders
-from czsc import sensors
-from czsc import aphorism
-from czsc import svc
-from czsc import mock
-from czsc.traders import rwc
-from czsc.traders import cwc
-from czsc.core import CZSC, Freq, Operate, Direction, Signal, Event, RawBar, NewBar, Position, ZS, format_standard_kline
-from czsc.strategies import CzscStrategyBase, CzscJsonStrategy
-from czsc.sensors import holds_concepts_effect, CTAResearch, EventMatchSensor
-from czsc.sensors.feature import FixedNumberSelector
-from czsc.utils import ta
-from czsc.traders import (
-    CzscTrader,
+按 spec §3.1，所有公共 API 在导入期一次性 import；不再使用 PEP 562 lazy loading。
+- ``czsc._native``：Rust 扩展（PyO3），提供缠论核心类型、信号、交易器、TA 算子。
+- ``czsc.{connectors,traders,utils,fsa,aphorism,mock,envs}``：Python 子包。
+- ``czsc.{ema,sma,...,ultimate_smoother,...}``：Rust TA 算子的顶层别名。
+- ``czsc.{WeightBacktest,daily_performance,top_drawdowns}``：来自硬依赖 ``wbt``。
+
+作者: zengbin93 <zeng_bin8888@163.com>，创建于 2019/10/29。
+"""
+
+# isort: skip_file
+# 顶层包的 import 顺序经过手工设计以处理子包间的循环依赖，
+# 不要让 isort/ruff 重排——会触发 partially-initialized module 错误。
+
+# 第一批：纯薄壳子包（不会回头 import czsc 顶层符号）。
+# fsa/aphorism/mock 中含 ``from czsc import top_drawdowns`` 等回环 import，
+# 必须放到 wbt / .traders / .utils 之后再加载，避免循环 import。
+from . import _native as _native  # noqa: F401  # 通过 czsc._native.* 暴露
+from . import connectors, envs, traders, utils
+
+# === 缠论核心数据类型与算法（来自 Rust 扩展 czsc._native）===
+# === wbt（硬依赖，提供回测/绩效组件）===
+from wbt import WeightBacktest, daily_performance, top_drawdowns
+
+# format_standard_kline: Python 适配层，把 DataFrame -> List[RawBar]（详见模块 docstring）
+from czsc._format_standard_kline import format_standard_kline
+
+# === 之前的 lazy 属性，改为静态 import（spec §3.1 移除 lazy loading）===
+from czsc.utils.kline_quality import check_kline_quality
+from czsc.utils.log import log_strategy_info
+from czsc.utils.trade import adjust_holding_weights
+from czsc.utils.warning_capture import capture_warnings, execute_with_warning_capture
+
+# 第二批：会回头 import czsc 顶层符号（如 ``from czsc import top_drawdowns``）的重型子包。
+# 必须放在所有顶层符号都已经绑定之后，否则会触发 partially-initialized module 循环 import。
+from . import aphorism, fsa, mock
+from ._native import (
+    BI,
+    CZSC,
+    FX,
+    ZS,
+    BarGenerator,
+    Direction,
+    Event,
+    FakeBI,
+    Freq,
+    Mark,
+    NewBar,
+    Operate,
+    ParsedSignalDoc,
+    Position,
+    RawBar,
+    Signal,
+    boll_positions,
+    check_bi,
+    check_fx,
+    check_fxs,
+    ema,
+    freq_end_time,
+    is_trading_time,
+    parse_signal_doc,
+    remove_include,
+    rolling_rank,
+    sma,
+    ultimate_smoother,
+)
+
+# === EDA 工具 ===
+# 2026-05-17 PR-B：``mark_cta_periods`` / ``mark_volatility`` 已迁到 czsc.utils 独立文件。
+# 2026-05-17 PR-D：``monotonicity`` 已改为 Rust 实现（czsc._native），与 scipy.stats.spearmanr 等价。
+from ._native import monotonicity
+from .utils.mark_cta_periods import mark_cta_periods
+from .utils.mark_volatility import mark_volatility
+
+# === 研究/优化入口（czsc.research，Rust 后端）===
+from .research import (
+    build_exit_optim_positions,
+    build_open_optim_positions,
+    run_optimize_batch,
+    run_replay,
+    run_research,
+)
+
+# === 策略门面（czsc.strategies；Python 层对 Rust Trader 的薄封装）===
+from .strategies import CzscJsonStrategy, CzscStrategyBase
+
+# === 交易器与信号管理 API（czsc.traders）===
+from .traders import (
     CzscSignals,
+    CzscTrader,
+    derive_signals_config,
+    derive_signals_freqs,
     generate_czsc_signals,
-    check_signals_acc,
-    get_unique_signals,
-    PairsPerformance,
-    combine_holds_and_pairs,
-    combine_dates_and_pairs,
-    DummyBacktest,
-    SignalsParser,
     get_signals_config,
     get_signals_freqs,
-    stoploss_by_direction,
-    get_ensemble_weight,
-    OpensOptimize,
-    ExitsOptimize,
+    get_unique_signals,
 )
 
-from czsc.traders.rwc import (
-    RedisWeightsClient,
-    get_strategy_mates,
-    get_strategy_names,
-    get_heartbeat_time,
-    clear_strategy,
-    get_strategy_weights,
-    get_strategy_latest,
-)
-
-from czsc.utils import (
-    timeout_decorator,
-    mac_address,
-    overlap,
-    to_arrow,
-    # format_standard_kline,
-    # BarGenerator,
-    # freq_end_time,
-    # resample_bars,
-    # is_trading_time,
-    # get_intraday_times,
-    # check_freq_and_market,
-    dill_dump,
-    dill_load,
-    read_json,
-    save_json,
-    get_sub_elements,
-    get_py_namespace,
-    code_namespace,
-    freqs_sorted,
-    x_round,
-    import_by_name,
-    create_grid_params,
-    update_bbars,
-    update_tbars,
-    update_nxb,
-    risk_free_returns,
-    resample_to_daily,
-    cross_sectional_ranker,
-    cross_sectional_ic,
-    rolling_daily_performance,
-    holds_performance,
-    psi,
-    home_path,
+# === 通用工具函数（czsc.utils）===
+from .utils import (
+    DataClient,
     DiskCache,
-    disk_cache,
     clear_cache,
     clear_expired_cache,
-    get_dir_size,
+    code_namespace,
+    cross_sectional_ic,
+    dill_dump,
+    dill_load,
+    disk_cache,
     empty_cache_path,
-    print_df_sample,
-    index_composition,
-    AliyunOSS,
-    DataClient,
-    set_url_token,
+    freqs_sorted,
+    get_dir_size,
+    get_py_namespace,
     get_url_token,
-    generate_fernet_key,
-    fernet_encrypt,
-    fernet_decrypt,
+    home_path,
+    import_by_name,
+    index_composition,
+    print_df_sample,
+    read_json,
+    resample_to_daily,
+    risk_free_returns,
+    save_json,
+    set_url_token,
+    to_arrow,
+    update_bbars,
+    update_nxb,
+    update_tbars,
 )
 
-# 警告信息捕获工具
-from czsc.utils.warning_capture import (
-    capture_warnings,
-    execute_with_warning_capture,
-)
+# === 包元信息 ===
+# 版本号唯一来源是 Cargo.toml [workspace.package].version；maturin 在打 wheel
+# 时把它写进 dist-info，这里通过 importlib.metadata 反查，杜绝硬编码漂移。
+# 本文件顶部 `# isort: skip_file` 禁止重排，importlib.metadata 必须放在
+# 前面 from . import _native 等 import 之后，因此带 noqa: E402 抑制。
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError  # noqa: E402
+from importlib.metadata import version as _pkg_version  # noqa: E402
 
-# 交易日历工具
-from czsc.py.calendar import (
-    is_trading_date,
-    next_trading_date,
-    prev_trading_date,
-    get_trading_dates,
-)
-
-from czsc.utils.trade import (
-    adjust_holding_weights,
-)
-
-from czsc.utils.log import (
-    log_strategy_info,
-)
-
-from czsc.utils.bi_info import (
-    calculate_bi_info,
-    symbols_bi_infos,
-)
-
-from czsc.utils.features import (
-    normalize_feature,
-    normalize_ts_feature,
-    feature_cross_layering,
-    find_most_similarity,
-)
-
-from czsc.features.utils import (
-    is_event_feature,
-    rolling_corr,
-    rolling_rank,
-    rolling_norm,
-    rolling_qcut,
-    rolling_compare,
-    rolling_scale,
-    rolling_slope,
-    rolling_tanh,
-    normalize_corr,
-    feature_returns,
-    feature_sectional_corr,
-)
-
-from czsc.utils.plotly_plot import (
-    plot_czsc_chart,
-    KlineChart
-)
-
-from czsc.utils.kline_quality import check_kline_quality
-from czsc.traders import cwc
-
-
-from czsc.eda import (
-    remove_beta_effects,
-    vwap,
-    twap,
-    cross_sectional_strategy,
-    judge_factor_direction,
-    monotonicity,
-    min_max_limit,
-    rolling_layers,
-    cal_symbols_factor,
-    weights_simple_ensemble,
-    unify_weights,
-    sma_long_bear,
-    dif_long_bear,
-    tsf_type,
-    limit_leverage,
-    cal_trade_price,
-    mark_cta_periods,
-    mark_volatility,
-    cal_yearly_days,
-    turnover_rate,
-    make_price_features,
-)
-
-
-__version__ = "0.10.8"
+try:
+    __version__ = _pkg_version("czsc")
+except _PackageNotFoundError:
+    # 未安装（如直接从源码 tree 运行）时退化为占位值，避免 import 失败
+    __version__ = "0.0.0+unknown"
 __author__ = "zengbin93"
 __email__ = "zeng_bin8888@163.com"
-__date__ = "20251226"
+__date__ = "20260520"
+
+# === 公共 API 契约 ===
+# 修改本列表等价于修改公共契约；新增/移除符号必须在 release notes 与 MIGRATION_NOTES 中说明。
+__all__ = [
+    # 缠论核心
+    "BI",
+    "CZSC",
+    "FX",
+    "ZS",
+    "BarGenerator",
+    "Direction",
+    "Event",
+    "FakeBI",
+    "Freq",
+    "Mark",
+    "NewBar",
+    "Operate",
+    "ParsedSignalDoc",
+    "Position",
+    "RawBar",
+    "Signal",
+    "boll_positions",
+    "check_bi",
+    "check_fx",
+    "check_fxs",
+    "ema",
+    "format_standard_kline",
+    "freq_end_time",
+    "is_trading_time",
+    "parse_signal_doc",
+    "remove_include",
+    "rolling_rank",
+    "sma",
+    "ultimate_smoother",
+    # 来自 wbt
+    "WeightBacktest",
+    "daily_performance",
+    "top_drawdowns",
+    # 始终预加载的子包
+    "connectors",
+    "envs",
+    "traders",
+    "utils",
+    "fsa",
+    "aphorism",
+    "mock",
+    # 交易器 / 信号 API
+    "CzscSignals",
+    "CzscTrader",
+    "derive_signals_config",
+    "derive_signals_freqs",
+    "generate_czsc_signals",
+    "get_signals_config",
+    "get_signals_freqs",
+    "get_unique_signals",
+    # 策略门面
+    "CzscStrategyBase",
+    "CzscJsonStrategy",
+    # 研究/优化入口
+    "build_exit_optim_positions",
+    "build_open_optim_positions",
+    "run_optimize_batch",
+    "run_replay",
+    "run_research",
+    # 通用工具
+    "DataClient",
+    "DiskCache",
+    "clear_cache",
+    "clear_expired_cache",
+    "code_namespace",
+    "cross_sectional_ic",
+    "dill_dump",
+    "dill_load",
+    "disk_cache",
+    "empty_cache_path",
+    "freqs_sorted",
+    "get_dir_size",
+    "get_py_namespace",
+    "get_url_token",
+    "home_path",
+    "import_by_name",
+    "index_composition",
+    "print_df_sample",
+    "read_json",
+    "resample_to_daily",
+    "risk_free_returns",
+    "save_json",
+    "set_url_token",
+    "to_arrow",
+    "update_bbars",
+    "update_nxb",
+    "update_tbars",
+    # 静态 import 的高频符号（曾经走 _LAZY_ATTRS）
+    "capture_warnings",
+    "execute_with_warning_capture",
+    "adjust_holding_weights",
+    "log_strategy_info",
+    "check_kline_quality",
+    # EDA
+    "monotonicity",
+    "mark_cta_periods",
+    "mark_volatility",
+    # 元信息
+    "__version__",
+    "__author__",
+    "__email__",
+    "__date__",
+    "welcome",
+]
 
 
 def welcome():
-    from czsc import aphorism, envs
-    from czsc.utils import get_dir_size, home_path
-
+    """打印 CZSC 版本号、随机格言与缓存目录提示，用于 CLI/交互式环境。"""
     print(f"欢迎使用CZSC！当前版本标识为 {__version__}@{__date__}\n")
     aphorism.print_one()
-
-    print(
-        f"CZSC环境变量：" f"czsc_min_bi_len = {envs.get_min_bi_len()}; " f"czsc_max_bi_num = {envs.get_max_bi_num()}; "
-    )
+    print(f"CZSC环境变量：czsc_min_bi_len = {envs.get_min_bi_len()}; czsc_max_bi_num = {envs.get_max_bi_num()}; ")
+    # 1 GiB 阈值：超出即提示用户主动清理，避免缓存目录无限膨胀。
     if get_dir_size(home_path) > pow(1024, 3):
         print(f"{home_path} 目录缓存超过1GB，请适当清理。调用 czsc.empty_cache_path() 可以直接清空缓存")
-
-
-if get_dir_size(home_path) > pow(1024, 3):
-    print(f"{home_path} 目录缓存超过1GB，请适当清理。调用 czsc.empty_cache_path() 可以直接清空缓存")
