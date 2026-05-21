@@ -1430,6 +1430,132 @@ pub fn tas_ma_system_v230513(czsc: &CZSC, params: &ParamView, cache: &mut TaCach
     make_kline_signal_v1(&k1, &k2, k3, v1)
 }
 
+fn bars_since(last_idx: Option<usize>, idx: usize) -> usize {
+    last_idx.map_or(usize::MAX, |x| idx.saturating_sub(x))
+}
+
+/// tas_ma_joint_V260520：均线联合发散状态
+///
+/// 参数模板：`"{freq}_D{di}SMA{ma_seq}_均线联合发散V260520"`
+///
+/// 信号逻辑：
+/// 1. 计算 `ma_seq` 中各周期 SMA，默认 `5#10#20#40#60#120#250`；
+/// 2. 逐根计算 `HH = max(MA*)`、`LL = min(MA*)`；
+/// 3. 复刻通达信公式：
+///    - `A1 = close > HH AND MA60 > MA120`
+///    - `A2 = MA60 < MA120 OR close < LL`
+///    - `B1 = close < LL AND MA60 < MA120`
+///    - `B2 = MA60 > MA120 OR close > HH`
+/// 4. 若 `BARSLAST(A1) < BARSLAST(A2)` 判 `看多`；若
+///    `BARSLAST(B1) < BARSLAST(B2)` 判 `看空`；否则 `其他`。
+///
+/// 信号列表示例：
+/// - `Signal('日线_D1SMA5#10#20#40#60#120#250_均线联合发散V260520_看多_任意_任意_0')`
+/// - `Signal('日线_D1SMA5#10#20#40#60#120#250_均线联合发散V260520_看空_任意_任意_0')`
+///
+/// 参数说明：
+/// - `di`：倒数第 `di` 根K线，默认 `1`；
+/// - `ma_seq`：参与最高/最低均线计算的周期串，默认 `5#10#20#40#60#120#250`。
+#[signal(
+    category = "kline",
+    name = "tas_ma_joint_V260520",
+    template = "{freq}_D{di}SMA{ma_seq}_均线联合发散V260520",
+    opcode = "TasMaJointV260520",
+    param_kind = "TasMaJointV260520"
+)]
+pub fn tas_ma_joint_v260520(czsc: &CZSC, params: &ParamView, cache: &mut TaCache) -> Vec<Signal> {
+    let di = get_usize_param(params, "di", 1);
+    let ma_seq_str = get_str_param(params, "ma_seq", "5#10#20#40#60#120#250");
+    let ma_seq: Vec<usize> = ma_seq_str
+        .split('#')
+        .filter_map(|x| x.parse::<usize>().ok())
+        .collect();
+
+    let k1 = czsc.freq.to_string();
+    let k2 = format!("D{}SMA{}", di, ma_seq_str);
+    let k3 = "均线联合发散V260520";
+    let mut v1 = "其他";
+
+    if ma_seq.is_empty() || di == 0 || di > czsc.bars_raw.len() {
+        return make_kline_signal_v1(&k1, &k2, k3, v1);
+    }
+    if !ma_seq.contains(&60) || !ma_seq.contains(&120) {
+        return make_kline_signal_v1(&k1, &k2, k3, v1);
+    }
+
+    let ma_keys: Vec<String> = ma_seq.iter().map(|ma| format!("SMA#{}", ma)).collect();
+    for (ma, key) in ma_seq.iter().zip(ma_keys.iter()) {
+        update_ma_cache(czsc, key, "SMA", *ma, cache);
+    }
+
+    let idx = czsc.bars_raw.len() - di;
+    let max_ma = *ma_seq.iter().max().unwrap_or(&0);
+    if idx + 1 < max_ma {
+        return make_kline_signal_v1(&k1, &k2, k3, v1);
+    }
+
+    let ma60 = cache.series.get("SMA#60").unwrap();
+    let ma120 = cache.series.get("SMA#120").unwrap();
+    let mut last_a1: Option<usize> = None;
+    let mut last_a2: Option<usize> = None;
+    let mut last_b1: Option<usize> = None;
+    let mut last_b2: Option<usize> = None;
+
+    for i in 0..=idx {
+        let mut hh = f64::NEG_INFINITY;
+        let mut ll = f64::INFINITY;
+        let mut all_finite = true;
+
+        for key in &ma_keys {
+            let val = cache
+                .series
+                .get(key)
+                .and_then(|s| s.get(i))
+                .copied()
+                .unwrap_or(f64::NAN);
+            if !val.is_finite() {
+                all_finite = false;
+                break;
+            }
+            hh = hh.max(val);
+            ll = ll.min(val);
+        }
+
+        let m60 = ma60[i];
+        let m120 = ma120[i];
+        if !all_finite || !m60.is_finite() || !m120.is_finite() {
+            continue;
+        }
+
+        let close = czsc.bars_raw[i].close;
+        let a1 = close > hh && m60 > m120;
+        let a2 = m60 < m120 || close < ll;
+        let b1 = close < ll && m60 < m120;
+        let b2 = m60 > m120 || close > hh;
+
+        if a1 {
+            last_a1 = Some(i);
+        }
+        if a2 {
+            last_a2 = Some(i);
+        }
+        if b1 {
+            last_b1 = Some(i);
+        }
+        if b2 {
+            last_b2 = Some(i);
+        }
+    }
+
+    if bars_since(last_a1, idx) < bars_since(last_a2, idx) {
+        v1 = "看多";
+    } else if bars_since(last_b1, idx) < bars_since(last_b2, idx) {
+        v1 = "看空";
+    }
+
+    make_kline_signal_v1(&k1, &k2, k3, v1)
+}
+
 /// tas_ma_cohere_V230512：均线系统粘合/扩散状态
 ///
 /// 参数模板：`"{freq}_D{di}SMA{ma_seq}_均线系统V230512"`
@@ -5111,4 +5237,61 @@ pub fn tas_macd_bc_ubi_v230804(
     }
 
     make_kline_signal_v1(&k1, k2, k3, v1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, TimeZone, Utc};
+    use czsc_core::objects::bar::RawBarBuilder;
+    use czsc_core::objects::freq::Freq;
+
+    fn make_trend_czsc(len: usize, start: f64, step: f64) -> CZSC {
+        let dt0 = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let bars = (0..len)
+            .map(|i| {
+                let close = start + step * i as f64;
+                RawBarBuilder::default()
+                    .symbol("000001")
+                    .dt(dt0 + Duration::minutes(i as i64))
+                    .freq(Freq::D)
+                    .id(i as i32)
+                    .open(close)
+                    .close(close)
+                    .high(close + 0.5)
+                    .low(close - 0.5)
+                    .vol(1000.0)
+                    .amount(close * 1000.0)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        CZSC::new(bars, 50)
+    }
+
+    fn ma_joint_signal(czsc: &CZSC) -> String {
+        let params = HashMap::new();
+        let view = ParamView::new(&params);
+        let mut cache = TaCache::default();
+        let signals = tas_ma_joint_v260520(czsc, &view, &mut cache);
+        signals[0].to_string()
+    }
+
+    #[test]
+    fn test_tas_ma_joint_v260520_bullish() {
+        let czsc = make_trend_czsc(320, 10.0, 1.0);
+        assert_eq!(
+            ma_joint_signal(&czsc),
+            "日线_D1SMA5#10#20#40#60#120#250_均线联合发散V260520_看多_任意_任意_0"
+        );
+    }
+
+    #[test]
+    fn test_tas_ma_joint_v260520_bearish() {
+        let czsc = make_trend_czsc(320, 400.0, -1.0);
+        assert_eq!(
+            ma_joint_signal(&czsc),
+            "日线_D1SMA5#10#20#40#60#120#250_均线联合发散V260520_看空_任意_任意_0"
+        );
+    }
 }
