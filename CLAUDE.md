@@ -246,6 +246,7 @@ czsc_obj = CZSC(bars)
 - 策略要素：品种参数、K线周期、信号配置、持仓策略
 - 支持策略序列化和反序列化
 - 研究入口统一指向 `czsc.research.run_research / run_replay / run_optimize_batch`（Rust 后端）
+- **回测路径优先级**：能使用 `Signal -> Event -> Position` 体系表达的策略，尽量使用 `Position/Event` 体系进行回测，并通过 `CzscStrategyBase.backtest / replay` 产出 `holds / pairs / signals`；仅在纯权重时序、组合调仓、探索性研究等不适合表达为 `Position/Event` 的场景，才优先使用 `WeightBacktest` 或自定义权重序列回测。
 
 ### 信号函数体系（`czsc._native.signals`）
 - 信号函数由 Rust 实现，通过 PyO3 暴露为 `czsc._native.signals.*`
