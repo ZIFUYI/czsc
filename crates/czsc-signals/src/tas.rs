@@ -1434,9 +1434,9 @@ fn bars_since(last_idx: Option<usize>, idx: usize) -> usize {
     last_idx.map_or(usize::MAX, |x| idx.saturating_sub(x))
 }
 
-/// tas_ma_joint_V260520：均线联合发散状态
+/// tas_ma_joint_V260520：均线粘合发散状态
 ///
-/// 参数模板：`"{freq}_D{di}SMA{ma_seq}_均线联合发散V260520"`
+/// 参数模板：`"{freq}_D{di}SMA{ma_seq}_均线粘合发散V260520"`
 ///
 /// 信号逻辑：
 /// 1. 计算 `ma_seq` 中各周期 SMA，默认 `5#10#20#40#60#120#250`；
@@ -1450,8 +1450,8 @@ fn bars_since(last_idx: Option<usize>, idx: usize) -> usize {
 ///    `BARSLAST(B1) < BARSLAST(B2)` 判 `看空`；否则 `其他`。
 ///
 /// 信号列表示例：
-/// - `Signal('日线_D1SMA5#10#20#40#60#120#250_均线联合发散V260520_看多_任意_任意_0')`
-/// - `Signal('日线_D1SMA5#10#20#40#60#120#250_均线联合发散V260520_看空_任意_任意_0')`
+/// - `Signal('日线_D1SMA5#10#20#40#60#120#250_均线粘合发散V260520_看多_任意_任意_0')`
+/// - `Signal('日线_D1SMA5#10#20#40#60#120#250_均线粘合发散V260520_看空_任意_任意_0')`
 ///
 /// 参数说明：
 /// - `di`：倒数第 `di` 根K线，默认 `1`；
@@ -1459,7 +1459,7 @@ fn bars_since(last_idx: Option<usize>, idx: usize) -> usize {
 #[signal(
     category = "kline",
     name = "tas_ma_joint_V260520",
-    template = "{freq}_D{di}SMA{ma_seq}_均线联合发散V260520",
+    template = "{freq}_D{di}SMA{ma_seq}_均线粘合发散V260520",
     opcode = "TasMaJointV260520",
     param_kind = "TasMaJointV260520"
 )]
@@ -1473,7 +1473,7 @@ pub fn tas_ma_joint_v260520(czsc: &CZSC, params: &ParamView, cache: &mut TaCache
 
     let k1 = czsc.freq.to_string();
     let k2 = format!("D{}SMA{}", di, ma_seq_str);
-    let k3 = "均线联合发散V260520";
+    let k3 = "均线粘合发散V260520";
     let mut v1 = "其他";
 
     if ma_seq.is_empty() || di == 0 || di > czsc.bars_raw.len() {
@@ -1554,6 +1554,96 @@ pub fn tas_ma_joint_v260520(czsc: &CZSC, params: &ParamView, cache: &mut TaCache
     }
 
     make_kline_signal_v1(&k1, &k2, k3, v1)
+}
+
+/// tas_ds_ma60_support_V260521：双顺均线支撑/压制
+///
+/// 参数模板：`"{freq}_D{di}{ma_type}#{timeperiod}T{th}_双顺均线支撑V260521"`
+///
+/// 信号逻辑：
+/// 1. 计算指定均线，默认 `SMA60`；
+/// 2. 最新收盘在均线上方且均线向上，输出 `看多`；在均线下方且均线向下，输出 `看空`；
+/// 3. `v2` 标记价格与均线的关系：`支撑/压制/上破/跌破/多头/空头`；
+/// 4. `v3` 标记均线方向：`向上/向下`。
+///
+/// 信号列表示例：
+/// - `Signal('5分钟_D1SMA#60T50_双顺均线支撑V260521_看多_支撑_向上_0')`
+/// - `Signal('5分钟_D1SMA#60T50_双顺均线支撑V260521_看空_压制_向下_0')`
+///
+/// 参数说明：
+/// - `di`：倒数第 `di` 根 K 线，默认 `1`；
+/// - `ma_type`：均线类型，默认 `SMA`；
+/// - `timeperiod`：均线周期，默认 `60`；
+/// - `th`：触碰均线的容差，单位 BP，默认 `50`。
+#[signal(
+    category = "kline",
+    name = "tas_ds_ma60_support_V260521",
+    template = "{freq}_D{di}{ma_type}#{timeperiod}T{th}_双顺均线支撑V260521",
+    opcode = "TasDsMa60SupportV260521",
+    param_kind = "TasDsMa60SupportV260521"
+)]
+pub fn tas_ds_ma60_support_v260521(
+    czsc: &CZSC,
+    params: &ParamView,
+    cache: &mut TaCache,
+) -> Vec<Signal> {
+    let di = get_usize_param(params, "di", 1);
+    let ma_type = get_str_param(params, "ma_type", "SMA").to_uppercase();
+    let timeperiod = get_usize_param(params, "timeperiod", 60);
+    let th = get_usize_param(params, "th", 50) as f64;
+    let k1 = czsc.freq.to_string();
+    let k2 = format!("D{}{}#{}T{}", di, ma_type, timeperiod, th as i32);
+    let k3 = "双顺均线支撑V260521";
+
+    if di == 0 || czsc.bars_raw.len() < timeperiod + di + 1 {
+        return make_kline_signal_v3(&k1, &k2, k3, "其他", "任意", "任意");
+    }
+
+    let cache_key = format!("{}#{}", ma_type, timeperiod);
+    update_ma_cache(czsc, &cache_key, &ma_type, timeperiod, cache);
+    let Some(ma) = cache.series.get(&cache_key) else {
+        return make_kline_signal_v3(&k1, &k2, k3, "其他", "任意", "任意");
+    };
+
+    let idx = czsc.bars_raw.len() - di;
+    if idx == 0 || idx >= ma.len() {
+        return make_kline_signal_v3(&k1, &k2, k3, "其他", "任意", "任意");
+    }
+    let ma_now = ma[idx];
+    let ma_prev = ma[idx - 1];
+    if !ma_now.is_finite() || !ma_prev.is_finite() {
+        return make_kline_signal_v3(&k1, &k2, k3, "其他", "任意", "任意");
+    }
+
+    let bar = &czsc.bars_raw[idx];
+    let prev_bar = &czsc.bars_raw[idx - 1];
+    let v3 = if ma_now >= ma_prev { "向上" } else { "向下" };
+    let tol = th / 10000.0;
+    let v2 = if prev_bar.close <= ma_prev && bar.close > ma_now {
+        "上破"
+    } else if prev_bar.close >= ma_prev && bar.close < ma_now {
+        "跌破"
+    } else if bar.close >= ma_now && bar.low <= ma_now * (1.0 + tol) {
+        "支撑"
+    } else if bar.close <= ma_now && bar.high >= ma_now * (1.0 - tol) {
+        "压制"
+    } else if bar.close > ma_now {
+        "多头"
+    } else if bar.close < ma_now {
+        "空头"
+    } else {
+        "贴合"
+    };
+
+    let v1 = if bar.close > ma_now && ma_now >= ma_prev {
+        "看多"
+    } else if bar.close < ma_now && ma_now < ma_prev {
+        "看空"
+    } else {
+        "其他"
+    };
+
+    make_kline_signal_v3(&k1, &k2, k3, v1, v2, v3)
 }
 
 /// tas_ma_cohere_V230512：均线系统粘合/扩散状态
@@ -5277,12 +5367,20 @@ mod tests {
         signals[0].to_string()
     }
 
+    fn ma60_support_signal(czsc: &CZSC) -> String {
+        let params = HashMap::new();
+        let view = ParamView::new(&params);
+        let mut cache = TaCache::default();
+        let signals = tas_ds_ma60_support_v260521(czsc, &view, &mut cache);
+        signals[0].to_string()
+    }
+
     #[test]
     fn test_tas_ma_joint_v260520_bullish() {
         let czsc = make_trend_czsc(320, 10.0, 1.0);
         assert_eq!(
             ma_joint_signal(&czsc),
-            "日线_D1SMA5#10#20#40#60#120#250_均线联合发散V260520_看多_任意_任意_0"
+            "日线_D1SMA5#10#20#40#60#120#250_均线粘合发散V260520_看多_任意_任意_0"
         );
     }
 
@@ -5291,7 +5389,25 @@ mod tests {
         let czsc = make_trend_czsc(320, 400.0, -1.0);
         assert_eq!(
             ma_joint_signal(&czsc),
-            "日线_D1SMA5#10#20#40#60#120#250_均线联合发散V260520_看空_任意_任意_0"
+            "日线_D1SMA5#10#20#40#60#120#250_均线粘合发散V260520_看空_任意_任意_0"
+        );
+    }
+
+    #[test]
+    fn test_tas_ds_ma60_support_v260521_bullish() {
+        let czsc = make_trend_czsc(120, 10.0, 1.0);
+        assert_eq!(
+            ma60_support_signal(&czsc),
+            "日线_D1SMA#60T50_双顺均线支撑V260521_看多_多头_向上_0"
+        );
+    }
+
+    #[test]
+    fn test_tas_ds_ma60_support_v260521_bearish() {
+        let czsc = make_trend_czsc(120, 200.0, -1.0);
+        assert_eq!(
+            ma60_support_signal(&czsc),
+            "日线_D1SMA#60T50_双顺均线支撑V260521_看空_空头_向下_0"
         );
     }
 }

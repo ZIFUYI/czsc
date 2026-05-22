@@ -8,7 +8,7 @@ use crate::utils::cxt::{
 use crate::utils::math::{linreg_predict, max_amplitude_pct, mean, overlap};
 use crate::utils::sig::{
     bar_index_map, get_sub_elements, get_usize_param, make_kline_signal_v1, make_kline_signal_v2,
-    qcut_last_label,
+    make_kline_signal_v3, qcut_last_label,
 };
 use crate::utils::ta::{
     ma_snapshot_value, macd_snapshot_field_value, update_ma_cache, update_macd_cache, MacdField,
@@ -21,6 +21,7 @@ use czsc_core::objects::direction::Direction;
 use czsc_core::objects::fx::FX;
 use czsc_core::objects::mark::Mark;
 use czsc_core::objects::signal::Signal;
+use czsc_core::objects::zs::ZS;
 use std::collections::HashMap;
 
 /// cxt_bi_base_V230228：笔基础状态信号
@@ -76,6 +77,85 @@ pub fn cxt_bi_base_v230228(
     };
 
     make_kline_signal_v2(&k1, &k2, k3, v1, v2)
+}
+
+/// cxt_ds_midline_break_V260521：双顺中线突破确认
+///
+/// 参数模板：`"{freq}_D{di}N{n}M{m}_双顺中线突破V260521"`
+///
+/// 信号逻辑：
+/// 1. 取最近 `n` 笔构造有效中枢，使用中枢中轴 `ZS.zz` 作为动态中线；
+/// 2. 最新收盘上破/下破中线时输出 `看多/看空`；
+/// 3. 最近 `m` 根 K 线收盘连续位于中线上方/下方时输出确认状态；
+/// 4. `v2` 标记最新收盘相对中枢区间的位置：`上方/下方/区间`。
+///
+/// 信号列表示例：
+/// - `Signal('15分钟_D1N3M3_双顺中线突破V260521_看多_区间_上破中线_0')`
+/// - `Signal('15分钟_D1N3M3_双顺中线突破V260521_看空_下方_向下确认_0')`
+///
+/// 参数说明：
+/// - `di`：从倒数第 `di` 笔开始取样，默认 `1`；
+/// - `n`：构造中枢的笔数，默认 `3`，最小值 `3`；
+/// - `m`：连续确认的 K 线数量，默认 `3`。
+#[signal(
+    category = "kline",
+    name = "cxt_ds_midline_break_V260521",
+    template = "{freq}_D{di}N{n}M{m}_双顺中线突破V260521",
+    opcode = "CxtDsMidlineBreakV260521",
+    param_kind = "CxtDsMidlineBreakV260521"
+)]
+pub fn cxt_ds_midline_break_v260521(
+    c: &CZSC,
+    params: &ParamView,
+    _cache: &mut TaCache,
+) -> Vec<Signal> {
+    let di = get_usize_param(params, "di", 1);
+    let n = get_usize_param(params, "n", 3).max(3);
+    let m = get_usize_param(params, "m", 3).max(1);
+    let k1 = c.freq.to_string();
+    let k2 = format!("D{}N{}M{}", di, n, m);
+    let k3 = "双顺中线突破V260521";
+
+    if di == 0 || c.bi_list.len() < n + di - 1 || c.bars_raw.len() < m + 1 {
+        return make_kline_signal_v3(&k1, &k2, k3, "其他", "任意", "任意");
+    }
+
+    let bis = get_sub_elements(&c.bi_list, di, n);
+    if bis.len() != n {
+        return make_kline_signal_v3(&k1, &k2, k3, "其他", "任意", "任意");
+    }
+    let zs = ZS::new(bis.to_vec());
+    if !zs.is_valid() || !zs.zz.is_finite() {
+        return make_kline_signal_v3(&k1, &k2, k3, "其他", "任意", "任意");
+    }
+
+    let last_bar = c.bars_raw.last().unwrap();
+    let prev_bar = &c.bars_raw[c.bars_raw.len() - 2];
+    let v2 = if last_bar.close > zs.zg {
+        "上方"
+    } else if last_bar.close < zs.zd {
+        "下方"
+    } else {
+        "区间"
+    };
+
+    let bars = get_sub_elements(&c.bars_raw, 1, m);
+    let all_above = bars.iter().all(|x| x.close > zs.zz);
+    let all_below = bars.iter().all(|x| x.close < zs.zz);
+
+    let (v1, v3) = if prev_bar.close <= zs.zz && last_bar.close > zs.zz {
+        ("看多", "上破中线")
+    } else if prev_bar.close >= zs.zz && last_bar.close < zs.zz {
+        ("看空", "下破中线")
+    } else if all_above {
+        ("看多", "向上确认")
+    } else if all_below {
+        ("看空", "向下确认")
+    } else {
+        ("其他", "未确认")
+    };
+
+    make_kline_signal_v3(&k1, &k2, k3, v1, v2, v3)
 }
 
 /// cxt_bi_status_V230101：笔表里关系信号
@@ -2965,4 +3045,105 @@ pub fn cxt_overlap_v240612(c: &CZSC, params: &ParamView, _cache: &mut TaCache) -
         }
     }
     make_kline_signal_v2(&k1, &k2, k3, v1, v2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, TimeZone, Utc};
+    use czsc_core::objects::bar::RawBarBuilder;
+    use czsc_core::objects::bi::BIBuilder;
+    use czsc_core::objects::freq::Freq;
+    use czsc_core::objects::fx::FXBuilder;
+
+    fn raw_bar(id: i32, close: f64) -> RawBar {
+        let dt0 = Utc.with_ymd_and_hms(2024, 1, 1, 9, 30, 0).unwrap();
+        RawBarBuilder::default()
+            .symbol("TEST")
+            .dt(dt0 + Duration::minutes(id as i64))
+            .freq(Freq::F15)
+            .id(id)
+            .open(close)
+            .close(close)
+            .high(close + 1.0)
+            .low(close - 1.0)
+            .vol(1000.0)
+            .amount(close * 1000.0)
+            .build()
+            .unwrap()
+    }
+
+    fn fx(id: i32, mark: Mark, low: f64, high: f64) -> FX {
+        let dt0 = Utc.with_ymd_and_hms(2024, 1, 1, 9, 30, 0).unwrap();
+        let fx_price = if mark == Mark::D { low } else { high };
+        FXBuilder::default()
+            .symbol("TEST")
+            .dt(dt0 + Duration::minutes(id as i64))
+            .mark(mark)
+            .high(high)
+            .low(low)
+            .fx(fx_price)
+            .build()
+            .unwrap()
+    }
+
+    fn bi(id: i32, direction: Direction, low: f64, high: f64) -> BI {
+        let (fx_a, fx_b) = if direction == Direction::Up {
+            (fx(id * 2, Mark::D, low, low + 1.0), fx(id * 2 + 1, Mark::G, high - 1.0, high))
+        } else {
+            (fx(id * 2, Mark::G, high - 1.0, high), fx(id * 2 + 1, Mark::D, low, low + 1.0))
+        };
+        BIBuilder::default()
+            .symbol("TEST")
+            .fx_a(fx_a.clone())
+            .fx_b(fx_b.clone())
+            .fxs(vec![fx_a, fx_b])
+            .direction(direction)
+            .bars(Vec::new())
+            .build()
+            .unwrap()
+    }
+
+    fn make_czsc(closes: &[f64]) -> CZSC {
+        let bars_raw = closes
+            .iter()
+            .enumerate()
+            .map(|(i, close)| raw_bar(i as i32, *close))
+            .collect();
+        let bi_list = vec![
+            bi(1, Direction::Up, 90.0, 110.0),
+            bi(2, Direction::Down, 95.0, 112.0),
+            bi(3, Direction::Up, 92.0, 108.0),
+        ];
+        let mut c = CZSC::new(bars_raw, 50);
+        c.bars_ubi = Vec::new();
+        c.bi_list = bi_list;
+        c.freq = Freq::F15;
+        c
+    }
+
+    fn ds_midline_signal(czsc: &CZSC) -> String {
+        let params = HashMap::new();
+        let view = ParamView::new(&params);
+        let mut cache = TaCache::default();
+        cxt_ds_midline_break_v260521(czsc, &view, &mut cache)[0].to_string()
+    }
+
+    #[test]
+    fn test_cxt_ds_midline_break_v260521_bullish_cross() {
+        let czsc = make_czsc(&[100.0, 100.0, 100.0, 104.0]);
+        assert_eq!(
+            ds_midline_signal(&czsc),
+            "15分钟_D1N3M3_双顺中线突破V260521_看多_区间_上破中线_0"
+        );
+    }
+
+    #[test]
+    fn test_cxt_ds_midline_break_v260521_bearish_confirm() {
+        let czsc = make_czsc(&[100.0, 99.0, 98.0, 97.0]);
+        assert_eq!(
+            ds_midline_signal(&czsc),
+            "15分钟_D1N3M3_双顺中线突破V260521_看空_区间_向下确认_0"
+        );
+    }
 }
