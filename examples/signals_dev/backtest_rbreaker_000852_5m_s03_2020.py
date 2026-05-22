@@ -23,7 +23,7 @@ for mod in [
 ]:
     sys.modules.setdefault(mod, MagicMock())
 
-from czsc.core import Freq
+from czsc import Freq
 from backtest_rbreaker_000852_5m import bars_to_frame, make_rbreaker_levels, make_yearly_summary, simulate_rbreaker
 from test_zdy_macd_bc_000852 import read_jq_sdk_bars
 

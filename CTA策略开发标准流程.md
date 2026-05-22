@@ -1,12 +1,14 @@
 # CTA 策略开发标准流程
 
-本文档整理一套适用于本项目的 CTA 策略开发流程，核心思路是：
+本文档面向 CZSC 1.0 之后的项目结构。1.0 开始，缠论核心、信号注册、交易器和策略回测主路径已经迁移到 Rust，通过 `czsc._native` 暴露给 Python；Python 侧主要负责数据接入、策略配置、研究编排和结果分析。
+
+核心流程仍然是：
 
 ```text
-信号开发 -> 信号验证 -> 信号缓存 / 入库 -> 因子组合 -> 事件触发 -> 策略回测 -> 策略回放 -> 绩效评估
+策略规格 -> 数据准备 -> 信号选择/开发 -> 信号验证 -> 事件/持仓配置 -> 回测/回放 -> 绩效分析
 ```
 
-该流程遵循项目的系统化交易框架：
+交易体系仍然遵循：
 
 ```text
 Signal -> Factor -> Event -> Position -> Trader
@@ -14,548 +16,384 @@ Signal -> Factor -> Event -> Position -> Trader
 
 ## 1. 明确策略规格
 
-开发策略前，先把策略规则写清楚，不要直接进入编码。
+开发策略前，先把规则写清楚，不要直接进入编码。
 
-需要明确以下内容：
+需要明确：
 
-- 交易标的：指数、ETF、股票、期货等
+- 交易标的：指数、ETF、股票、期货、数字货币等
 - 基础周期：`1分钟`、`5分钟`、`30分钟`、`日线` 等
 - 是否多周期联立：例如日线定方向，5分钟找入场
-- 开仓逻辑：什么条件开多 / 开空
+- 开仓逻辑：什么信号组合触发开多 / 开空
 - 平仓逻辑：反向信号、固定时间、止损、止盈、超时等
-- 风控规则：止损比例、是否允许 T0、是否允许隔夜、单日最多交易次数
+- 风控规则：是否 T0、是否隔夜、单日最多交易次数、冷却间隔
 - 回测区间：`bar_sdt`、`sdt`、`edt`
-- 数据源：聚宽、research、Tushare、天勤等
+- 数据源：本地缓存、聚宽、Tushare、天勤、CCXT 等
 
 示例：
 
 ```text
 标的：000852.XSHG
-基础周期：1分钟
-开仓：9:35 相对当日开盘价涨跌决定多空
-平仓：14:55 或 1% 止损
+基础周期：5分钟
+开仓：RBreaker 突破价位触发趋势开仓
+平仓：14:55 强制平仓
 隔夜：不允许
 单日重复开仓：不允许
 ```
 
-## 2. 准备数据接口
+## 2. 准备数据
 
-项目标准数据输入是 `List[RawBar]`。建议所有策略都提供统一的 `read_bars` 函数：
-
-```python
-def read_bars(symbol, freq, sdt, edt, fq="前复权", **kwargs):
-    """读取 K 线数据，返回 List[RawBar]"""
-    ...
-    return bars
-```
-
-这个签名可以直接接入 `CTAResearch`：
-
-```text
-(symbol, freq, sdt, edt, fq='前复权', **kwargs) -> List[RawBar]
-```
-
-如果使用聚宽数据源，可以参考：
+项目标准输入是 `list[RawBar]`。从 DataFrame 转换时，优先使用顶层 API：
 
 ```python
-from czsc.connectors.jq_connector import get_kline_period, freq_cn2jq
+from czsc import Freq, RawBar, format_standard_kline
 
-def read_bars(symbol, freq, sdt, edt, fq="前复权", **kwargs):
-    jq_freq = freq_cn2jq[str(freq)]
-    fq_flag = fq == "前复权"
-    return get_kline_period(symbol=symbol, start_date=sdt, end_date=edt, freq=jq_freq, fq=fq_flag)
+bars = format_standard_kline(df, freq=Freq.F5)
 ```
 
-注意事项：
-
-- 分钟数据建议传完整时间，例如 `2026-04-16 15:00:00`
-- 指数观察可使用不复权
-- 股票 / ETF 通常需要考虑前复权
-- 聚宽 token 建议通过环境变量或 `set_token` 初始化，不要提交敏感信息
-
-## 3. 开发信号 Signal
-
-信号是最小判断单元，只回答“当前市场状态是什么”。
-
-项目信号函数应放在 `czsc/signals/` 下，并按类别组织：
-
-- `bar.py`：K线基础信号
-- `cxt.py`：缠论上下文信号
-- `tas.py`：技术指标信号
-- `vol.py`：成交量信号
-- `pos.py`：持仓管理信号
-
-信号函数命名应带版本号，例如：
-
-```text
-bar_intraday_direction_V260424
-bar_intraday_exit_V260424
-```
-
-信号字符串格式示例：
-
-```text
-1分钟_D1T0935_日内方向V260424_看多_任意_任意_0
-1分钟_D1T0935_日内方向V260424_看空_任意_任意_0
-1分钟_D1T1455_日内平仓V260424_平仓_任意_任意_0
-```
-
-信号开发完成后，需要验证：
-
-- 是否只在目标条件下触发
-- 非目标状态是否返回 `其他`
-- 信号取值是否符合预期
-- 边界条件是否正确
-
-## 4. 生成信号
-
-使用 `generate_czsc_signals` 批量生成信号序列。
+如果使用模拟数据：
 
 ```python
-from czsc.traders.base import generate_czsc_signals
+from czsc import CZSC, Freq, format_standard_kline
+from czsc.mock import generate_symbol_kines
 
-sigs = generate_czsc_signals(
+df = generate_symbol_kines("000001", "30分钟", "20240101", "20240601", seed=42)
+bars = format_standard_kline(df, freq=Freq.F30)
+c = CZSC(bars)
+```
+
+如果使用聚宽 JQData，先安装可选依赖：
+
+```bash
+uv sync --extra jq
+```
+
+或临时运行：
+
+```bash
+uv run --extra jq python examples/signals_dev/backtest_rbreaker_000852_5m.py
+```
+
+账号密码通过环境变量读取：
+
+```text
+JQDATA_USERNAME=...
+JQDATA_PASSWORD=...
+```
+
+不要把真实账号密码提交到 Git。
+
+## 3. 选择或开发信号
+
+CZSC 1.0 后，信号函数主体位于 Rust：
+
+```text
+crates/czsc-signals/src/
+```
+
+常见模块：
+
+- `bar.rs`：原始 K 线特征、涨跌停、时间段、RBreaker 等
+- `cxt.rs`：分型、笔、中枢、一二三类买卖点等缠论结构
+- `tas.rs`：均线、MACD、KDJ、BOLL、RSI、ATR 等技术指标
+- `vol.rs`：成交量特征
+- `zdy.rs`：自定义指标
+- `pos.rs` / `cat.rs` / `cxt_trader.rs` / `zdy_trader.rs`：依赖 Trader 或持仓状态的信号
+
+新增信号应在 Rust 侧实现，并用 `#[signal(...)]` 宏注册。Python 侧不要再新增 `czsc/signals/*.py` 形式的信号函数。
+
+查看当前信号模块速查：
+
+```bash
+uv run --no-sync python scripts/dump_signal_catalog.py
+```
+
+查看详细信号元信息：
+
+```bash
+uv run --no-sync python scripts/dump_signal_details.py --format json
+```
+
+## 4. 调用单个 K 线信号
+
+K 线类信号可以通过统一分发器直接调用：
+
+```python
+from czsc import CZSC
+from czsc._native.signals import call_signal
+
+c = CZSC(bars)
+sig = call_signal("bar_r_breaker_V230326", c, {})[0]
+print(sig.key, sig.value)
+```
+
+带参数的例子：
+
+```python
+sig = call_signal("zdy_macd_bc_V230422", c, {"di": 1, "th": 50})[0]
+print(sig.to_string())
+```
+
+注意：依赖 `CzscTrader` 或持仓状态的 Trader 类信号，不应通过 `call_signal` 直接调度，应放入 `signals_config` 由 `CzscSignals` / `CzscTrader` 计算。
+
+## 5. 批量生成信号
+
+研究和特征工程中，使用 `generate_czsc_signals`：
+
+```python
+from czsc.traders import generate_czsc_signals
+
+signals_config = [
+    {"name": "cxt_bi_status_V230101", "freq": "30分钟"},
+    {"name": "bar_zdt_V230331", "freq": "30分钟", "di": 1},
+]
+
+df = generate_czsc_signals(
     bars,
-    signals_config=strategy.signals_config,
-    sdt="20260101",
+    signals_config=signals_config,
+    sdt="2024-01-01",
     df=True,
 )
 ```
 
-生成结果通常用于：
-
-- 检查信号分布
-- 定位信号触发时间
-- 保存信号缓存
-- 供 `DummyBacktest` 快速回测
-- 后续因子和事件匹配分析
-
-## 5. 验证信号
-
-项目已有信号验证工具 `check_signals_acc`。
+流式场景中，使用 `CzscSignals`：
 
 ```python
-from czsc.traders.base import check_signals_acc
+from czsc import BarGenerator
+from czsc.traders import CzscSignals
 
-check_signals_acc(
+bg = BarGenerator(base_freq="1分钟", freqs=["1分钟", "5分钟", "30分钟"], max_count=5000)
+cs = CzscSignals(bg, signals_config=signals_config)
+
+for bar in bars:
+    cs.update_signals(bar)
+
+print(cs.s)
+```
+
+## 6. 验证信号
+
+信号验证重点：
+
+- 非目标状态是否稳定返回 `其他`
+- 目标状态是否不漏触发
+- 触发频率是否合理
+- 信号 key / value 是否符合事件匹配规则
+- 多周期信号是否对齐正确
+
+推荐验证方式：
+
+```python
+from czsc.traders import generate_czsc_signals
+
+df = generate_czsc_signals(bars, signals_config=signals_config, df=True, sdt="2024-01-01")
+sig_cols = [c for c in df.columns if len(c.split("_")) == 3]
+
+for col in sig_cols:
+    print(col, df[col].value_counts().head(10))
+```
+
+需要图形检查时，优先使用 lightweight HTML：
+
+```python
+from czsc.utils.plotting.lightweight import plot_czsc_signals
+
+plot_czsc_signals(
     bars,
-    signals_config=strategy.signals_config,
-    delta_days=1,
-    height="780px",
+    signals_config=signals_config,
+    file_html="signals_check.html",
 )
 ```
 
-它会：
+## 7. 组合事件和持仓
 
-- 生成信号
-- 统计信号出现次数
-- 找出非 `其他` 的有效信号
-- 在信号触发时生成 HTML 快照
-- 方便人工检查信号是否符合 K 线图形和策略逻辑
-
-这一步重点检查：
-
-- 信号是否误触发
-- 信号是否漏触发
-- 信号出现频率是否合理
-- 信号触发时的图形是否符合预期
-
-## 6. 信号缓存或入库
-
-项目已有本地信号缓存能力，典型方式是保存为 parquet。
-
-```python
-sigs.to_parquet("signals/000852.XSHG.sigs")
-```
-
-`DummyBacktest` 中已经使用了这种模式：
+事件由信号组合形成。信号完整字符串格式通常是：
 
 ```text
-如果信号文件不存在：
-    生成信号
-    保存为 parquet
-否则：
-    读取 parquet
+{k1}_{k2}_{k3}_{v1}_{v2}_{v3}_{score}
 ```
-
-推荐目录结构：
-
-```text
-results/
-  strategy_name/
-    signals/
-      000852.XSHG.sigs
-    snapshots/
-    event_match/
-    backtest/
-```
-
-如果需要数据库入库，可以在此基础上增加自定义 `SignalStore`：
-
-```python
-def save_signals_to_db(sigs, table="czsc_signals"):
-    ...
-```
-
-当前项目没有统一的“信号验证通过后自动入库数据库”的标准模块；已有能力主要是本地缓存和回测复用。
-
-## 7. 组合因子 Factor
-
-因子是信号组合，代表某个可解释的交易条件。
-
-简单因子可以只包含一个信号：
-
-```python
-factor_long = {
-    "name": "0935方向看多",
-    "signals_all": ["1分钟_D1T0935_日内方向V260424_看多_任意_任意_0"],
-    "signals_any": [],
-    "signals_not": [],
-}
-```
-
-复杂因子可以组合多个信号：
-
-```python
-factor_long = {
-    "name": "0935方向看多且波动率过滤通过",
-    "signals_all": [
-        "1分钟_D1T0935_日内方向V260424_看多_任意_任意_0",
-        "1分钟_D1波动率Vxxxx_高波动_任意_任意_0",
-    ],
-    "signals_any": [],
-    "signals_not": [
-        "1分钟_D1涨跌停V230331_涨停_任意_任意_0",
-    ],
-}
-```
-
-因子层适合放：
-
-- 趋势过滤
-- 波动率过滤
-- 成交量过滤
-- 缠论结构过滤
-- 禁止交易条件
-
-## 8. 定义事件 Event
-
-事件是交易动作，由一个或多个因子触发。
-
-常见事件：
-
-- `开多`
-- `开空`
-- `平多`
-- `平空`
-
-事件配置示例：
-
-```python
-event_open_long = {
-    "operate": "开多",
-    "signals_all": [],
-    "signals_any": [],
-    "signals_not": [],
-    "factors": [factor_long],
-}
-```
-
-事件用于回答：
-
-```text
-当前是否应该执行某个交易动作？
-```
-
-## 9. 验证事件匹配
-
-当信号组合成事件后，可以使用 `EventMatchSensor` 验证事件在历史数据中的触发情况。
-
-```python
-from czsc.sensors.event import EventMatchSensor
-
-ems = EventMatchSensor(
-    events=[event_open_long, event_open_short],
-    symbols=["000852.XSHG"],
-    read_bars=read_bars,
-    results_path="results/event_match",
-    bar_sdt="20250101",
-    sdt="20260101",
-    edt="20260424",
-)
-```
-
-它会：
-
-- 读取 K 线
-- 生成信号
-- 对每个事件执行 `event.is_match`
-- 保存事件匹配结果
-- 输出截面匹配次数 `cross_section_counts.csv`
-
-这一步适合验证：
-
-- 事件触发频率是否合理
-- 开仓事件是否过多或过少
-- 多空事件是否互斥
-- 事件触发时间是否符合策略预期
-
-## 10. 定义持仓 Position
-
-`Position` 是策略的持仓规则单元。
-
-示例：
-
-```text
-多头 Position:
-- opens: 开多事件
-- exits: 平多事件
-- stop_loss: 100
-
-空头 Position:
-- opens: 开空事件
-- exits: 平空事件
-- stop_loss: 100
-```
-
-常用参数：
-
-- `interval`：同类开仓间隔
-- `timeout`：最多持仓 K 线数量
-- `stop_loss`：止损，单位 BP
-- `T0`：是否允许日内开平
-
-单位说明：
-
-```text
-100 BP = 1%
-300 BP = 3%
-500 BP = 5%
-```
-
-## 11. 封装 Strategy
-
-策略类继承 `CzscStrategyBase`。
-
-标准职责：
-
-- 定义 `positions`
-- 定义或推导 `signals_config`
-- 暴露策略参数
 
 示例：
 
 ```python
-from czsc.strategies import CzscStrategyBase
+from czsc import Event, Operate, Position
+
+open_long = Event.load(
+    {
+        "name": "30分钟表里向上开多",
+        "operate": "开多",
+        "signals_all": ["30分钟_D1_表里关系V230101_向上_任意_任意_0"],
+        "signals_not": ["30分钟_D1_涨跌停V230331_涨停_任意_任意_0"],
+    }
+)
+
+open_short = Event.load(
+    {
+        "name": "30分钟表里向下开空",
+        "operate": "开空",
+        "signals_all": ["30分钟_D1_表里关系V230101_向下_任意_任意_0"],
+        "signals_not": ["30分钟_D1_涨跌停V230331_跌停_任意_任意_0"],
+    }
+)
+
+pos = Position(
+    name="30分钟笔非多即空",
+    symbol="000001",
+    opens=[open_long, open_short],
+    exits=[],
+    interval=3600 * 4,
+    timeout=16 * 30,
+    stop_loss=500,
+)
+```
+
+## 8. 组织策略类
+
+推荐继承 `CzscStrategyBase`，只实现 `positions`：
+
+```python
+from czsc import CzscStrategyBase, Position
+
 
 class MyStrategy(CzscStrategyBase):
     @property
-    def positions(self):
-        return [...]
-
-    @property
-    def signals_config(self):
-        return [...]
+    def positions(self) -> list[Position]:
+        return [pos]
 ```
 
-如果信号函数文档模板完整，可以让框架从 `unique_signals` 自动解析；实验阶段也可以显式写 `signals_config`，方便控制和调试。
+框架会自动派生：
 
-## 12. 单标的回测验证
+- `base_freq`
+- `freqs`
+- `signals_config`
+- `unique_signals`
 
-不要一开始就批量回测。先做单标的验证。
+完整示例见：
 
-```python
-tactic = MyStrategy(symbol="000852.XSHG")
-bars = read_bars("000852.XSHG", tactic.base_freq, "20250101", "20260424")
-trader = tactic.init_trader(bars, sdt="20260101")
+```text
+docs/examples/07_strategy_backtest.py
+examples/intraday_0935_direction_strategy.py
 ```
 
-重点检查：
+## 9. 回测和回放
 
-- 是否有交易
-- 开仓时间是否正确
-- 平仓时间是否正确
-- 止损是否正确
-- 是否出现重复开仓
-- `pairs` 是否符合规则
-- `holds` 是否符合持仓状态
-
-常用检查：
+内存回测：
 
 ```python
-for pos in trader.positions:
-    print(pos.pairs)
-    print(pos.evaluate())
+tactic = MyStrategy(symbol="000001")
+res = tactic.backtest(bars, sdt="2024-01-01")
 ```
 
-## 13. 策略回放 Replay
-
-单标的交易记录正常后，用 `replay` 生成交易快照。
+回放落盘：
 
 ```python
-tactic.replay(
+replay_res = tactic.replay(
     bars,
-    res_path="examples/results/my_strategy_replay",
-    sdt="20260416",
+    res_path="results/my_strategy",
+    sdt="2024-01-01",
     refresh=True,
 )
 ```
 
-回放会在每次操作时生成 HTML 文件。
-
-重点检查：
-
-- 信号触发时 K 线是否正确
-- 买卖点是否标在正确位置
-- 进场价格和平仓价格是否合理
-- 止损是否提前于尾盘平仓
-- 多周期策略中，各周期图表是否一致
-
-## 14. 批量回测 CTAResearch
-
-单标的验证通过后，再使用 `CTAResearch` 做多标的回测。
+1.0 之后不再使用旧的 `CTAResearch` 入口。研究入口统一看：
 
 ```python
-from czsc import CTAResearch
+from czsc import run_research, run_replay, run_optimize_batch
+```
 
-bot = CTAResearch(
-    strategy=MyStrategy,
-    read_bars=read_bars,
-    results_path="examples/results/my_strategy",
-    signals_module_name="czsc.signals",
-)
+以及策略对象自身的：
 
-bot.backtest(
-    symbols=symbols,
-    max_workers=3,
-    bar_sdt="20250101",
-    sdt="20260101",
-    edt="20260424",
+```python
+tactic.backtest(...)
+tactic.replay(...)
+```
+
+## 10. 保存和复用策略
+
+`CzscStrategyBase` 支持保存 / 加载持仓配置：
+
+```python
+tactic.save_positions("results/my_strategy/positions")
+```
+
+重新加载：
+
+```python
+from czsc import CzscJsonStrategy
+
+tactic = CzscJsonStrategy(
+    symbol="000001",
+    files_position="results/my_strategy/positions",
 )
 ```
 
-参数说明：
+该路径的序列化和校验逻辑已经下沉到 Rust，Python 侧只做透传。
 
-- `bar_sdt`：加载历史 K 线的起点，用于初始化
-- `sdt`：正式统计开始时间
-- `edt`：回测结束时间
-- `max_workers`：多进程数量
+## 11. 绩效分析
 
-## 15. 结果分析
+策略回测产物通常包括：
 
-至少分析以下指标：
+- `signals`：逐根 K 线信号
+- `pairs`：完整开平仓交易对
+- `holds`：持仓权重序列
 
-- 交易次数
-- 胜率
-- 累计收益
-- 平均单笔收益
-- 盈亏比
-- 最大回撤
-- 持仓覆盖率
-- 多头 / 空头分别表现
-- 止损触发次数
-- 按月表现
-- 连续亏损次数
+可以用 `wbt` 或 `czsc.WeightBacktest` 分析权重序列：
 
-建议分别看：
+```python
+from czsc import WeightBacktest
+
+wb = WeightBacktest(dfw, digits=2)
+report = wb.stats
+```
+
+轻量研究脚本也可以直接从 `pairs` 或交易明细 CSV 计算净值曲线，例如 RBreaker 示例：
 
 ```text
-总表现
-多头表现
-空头表现
-按标的表现
-按年份 / 月份表现
-样本内 / 样本外表现
+examples/signals_dev/backtest_rbreaker_000852_5m.py
+examples/signals_dev/backtest_rbreaker_000852_5m_s03_2020.py
 ```
 
-## 16. 测试规范
+## 12. 测试规范
 
-测试文件放在 `test/` 目录，使用 `pytest`。
+测试文件放在 `tests/` 目录，使用 pytest。
 
-推荐至少写三类测试：
-
-1. 信号测试
-   - 验证特定 K 线时点输出正确的信号
-
-2. 交易路径测试
-   - 验证开仓、平仓、止损、禁止重复开仓
-
-3. 数据接口测试
-   - 验证 `read_bars` 返回 `RawBar` 且时间有序
-
-运行：
+推荐命令：
 
 ```bash
-uv run pytest test/test_xxx.py -v
+uv run --no-sync pytest tests/test_xxx.py -v
 ```
 
-测试数据优先使用 `czsc.mock.generate_symbol_kines`，对精确时点策略，可以在 mock 数据基础上定向修改关键 K 线。
+测试数据优先使用 `czsc.mock.generate_symbol_kines`：
 
-## 17. 推荐迭代顺序
+```python
+from czsc import Freq, format_standard_kline
+from czsc.mock import generate_symbol_kines
 
-每轮迭代尽量只改一个变量。
-
-推荐顺序：
-
-1. 跑通最小策略
-2. 验证信号
-3. 缓存或入库信号
-4. 组合因子
-5. 验证事件匹配
-6. 加止损
-7. 加止盈
-8. 加过滤条件
-9. 加多周期
-10. 加仓位管理
-11. 批量回测
-12. 样本外验证
-13. 回放人工检查
-14. 再考虑实盘化
-
-## 18. 标准开发清单
-
-```text
-[ ] 写清楚策略规则
-[ ] 确定 symbol / freq / sdt / edt / fq
-[ ] 实现 read_bars
-[ ] 在 czsc/signals/ 中实现信号函数
-[ ] 写出 signal 字符串
-[ ] 使用 generate_czsc_signals 生成信号
-[ ] 使用 check_signals_acc 验证信号
-[ ] 将验证后的信号保存为 parquet 或入库
-[ ] 组合 factor
-[ ] 定义 open / exit event
-[ ] 使用 EventMatchSensor 验证事件匹配
-[ ] 创建 position
-[ ] 封装 CzscStrategyBase
-[ ] 单标的 init_trader 回测
-[ ] 检查 pairs / holds / evaluate
-[ ] 生成 replay 快照
-[ ] 写 pytest 测试
-[ ] 使用 CTAResearch 批量回测
-[ ] 汇总绩效并分析风险
-[ ] 再进入策略优化
+df = generate_symbol_kines("000001", "30分钟", "20240101", "20240601", seed=42)
+bars = format_standard_kline(df, freq=Freq.F30)
 ```
 
-## 总结
+涉及外部数据源的测试不要默认进主测试集，避免依赖账号、网络和行情服务状态。
 
-本项目中 CTA 策略开发的关键不是写一个独立的 if-else 回测脚本，而是把交易逻辑拆解为：
+## 13. 旧文档迁移对照
 
-```text
-Signal -> Factor -> Event -> Position -> Trader
-```
+| 旧路径 / 旧入口 | 1.0 后替代方式 |
+|---|---|
+| `from czsc.core import CZSC, RawBar, Freq` | `from czsc import CZSC, RawBar, Freq` |
+| `from czsc.traders.base import generate_czsc_signals` | `from czsc.traders import generate_czsc_signals` |
+| `czsc.signals.*` Python 信号函数 | `crates/czsc-signals/src/*.rs` + `czsc._native.signals` |
+| `CTAResearch` | `CzscStrategyBase.backtest/replay` 或 `czsc.run_research/run_replay` |
+| `czsc.sensors.*` | 按需求改用 `czsc.traders`、`czsc.research` 或本地研究脚本 |
+| `test/` | `tests/` |
 
-推荐的工程闭环是：
+## 14. 开发检查清单
 
-```text
-信号开发
--> 信号验证
--> 信号缓存 / 入库
--> 因子组合
--> 事件匹配验证
--> 策略回测
--> 策略回放
--> 绩效评估
--> 策略迭代
-```
-
+- [ ] 策略规格已经写清楚
+- [ ] 数据函数返回 `list[RawBar]`
+- [ ] 信号来自 Rust 注册名，或新增信号已在 `crates/czsc-signals` 实现
+- [ ] `signals_config` 能被 `generate_czsc_signals` 正常调度
+- [ ] 关键非 `其他` 信号经过分布统计和图形检查
+- [ ] 事件字符串与信号 key/value 完整匹配
+- [ ] `Position` 的开平仓、冷却、止损、超时配置明确
+- [ ] 回测和回放路径跑通
+- [ ] 结果文件和外部账号密钥没有误提交
+- [ ] 新增逻辑有聚焦测试覆盖

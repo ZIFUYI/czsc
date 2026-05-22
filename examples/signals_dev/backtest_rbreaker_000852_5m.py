@@ -28,7 +28,7 @@ for mod in [
 ]:
     sys.modules.setdefault(mod, MagicMock())
 
-from czsc.core import Freq
+from czsc import Freq
 from test_zdy_macd_bc_000852 import read_jq_sdk_bars
 
 

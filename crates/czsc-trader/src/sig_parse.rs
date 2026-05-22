@@ -163,6 +163,13 @@ fn tokenize_template_segment(segment: &str) -> Option<Vec<TemplateToken>> {
     Some(tokens)
 }
 
+fn parse_placeholder_value(name: &str, raw: &str) -> Value {
+    if matches!(name, "decision_time" | "exit_time") {
+        return Value::String(raw.to_string());
+    }
+    parse_scalar_value(raw)
+}
+
 fn parse_scalar_value(raw: &str) -> Value {
     if let Ok(v) = raw.parse::<i64>() {
         return Value::from(v);
@@ -261,7 +268,7 @@ fn parse_template_tokens(
                     return None;
                 }
                 let mut next_params = params;
-                next_params.insert(name.clone(), parse_scalar_value(captured));
+                next_params.insert(name.clone(), parse_placeholder_value(name, captured));
                 return Some(next_params);
             }
 
@@ -276,7 +283,7 @@ fn parse_template_tokens(
                             continue;
                         };
                         let mut next_params = params.clone();
-                        next_params.insert(name.clone(), parse_scalar_value(captured));
+                        next_params.insert(name.clone(), parse_placeholder_value(name, captured));
                         if let Some(parsed) = parse_template_tokens(
                             tokens,
                             raw,
@@ -306,7 +313,7 @@ fn parse_template_tokens(
                             continue;
                         };
                         let mut next_params = params.clone();
-                        next_params.insert(name.clone(), parse_scalar_value(captured));
+                        next_params.insert(name.clone(), parse_placeholder_value(name, captured));
                         if let Some(parsed) =
                             parse_template_tokens(tokens, raw, token_idx + 1, end, next_params)
                         {
@@ -403,6 +410,21 @@ mod tests {
         assert_eq!(cfg.params.get("freq1"), Some(&Value::from("日线")));
         assert_eq!(cfg.params.get("freq2"), Some(&Value::from("60分钟")));
         assert!(!cfg.params.contains_key("k2"));
+    }
+
+    #[test]
+    fn test_from_signal_str_preserves_intraday_time_params_as_strings() {
+        let sig = "15分钟_D1T0945_日内方向V260424_看多_任意_任意_0";
+        let cfg = SignalConfig::from_signal_str(sig).expect("should parse signal config");
+        assert_eq!(cfg.name, "bar_intraday_direction_V260424");
+        assert_eq!(cfg.freq.as_deref(), Some("15分钟"));
+        assert_eq!(cfg.params.get("decision_time"), Some(&Value::from("0945")));
+
+        let sig = "15分钟_D1T1500_日内平仓V260424_平仓_任意_任意_0";
+        let cfg = SignalConfig::from_signal_str(sig).expect("should parse signal config");
+        assert_eq!(cfg.name, "bar_intraday_exit_V260424");
+        assert_eq!(cfg.freq.as_deref(), Some("15分钟"));
+        assert_eq!(cfg.params.get("exit_time"), Some(&Value::from("1500")));
     }
 
     #[test]

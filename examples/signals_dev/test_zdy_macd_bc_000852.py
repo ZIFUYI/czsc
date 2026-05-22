@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Test zdy_macd_bc_V230422 on CSI 1000 index data.
 
 The script uses JoinQuant JQData SDK for 000852.XSHG and scans the MACD area
@@ -12,7 +11,6 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
-
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -28,9 +26,8 @@ for mod in [
 ]:
     sys.modules.setdefault(mod, MagicMock())
 
-from czsc.core import CZSC, RawBar
-from czsc.core import Freq
-from czsc.signals.zdy import zdy_macd_bc_V230422
+from czsc import CZSC, Freq, RawBar  # noqa: E402
+from czsc._native.signals import call_signal  # noqa: E402
 
 
 def load_jq_credentials():
@@ -57,9 +54,11 @@ def read_jq_sdk_bars(
     czsc_freq: Freq,
     sdt: str = "20240101",
     edt: str = "20260430",
+    symbol: str = "000852.XSHG",
 ) -> list[RawBar]:
-    """Read 000852.XSHG bars from JoinQuant SDK."""
+    """Read bars from JoinQuant SDK."""
     import os
+
     import jqdatasdk as jq
 
     load_jq_credentials()
@@ -70,7 +69,7 @@ def read_jq_sdk_bars(
 
     jq.auth(user, password)
     df = jq.get_price(
-        "000852.XSHG",
+        symbol,
         start_date=pd.to_datetime(sdt).strftime("%Y-%m-%d"),
         end_date=pd.to_datetime(edt).strftime("%Y-%m-%d"),
         frequency=freq,
@@ -85,7 +84,7 @@ def read_jq_sdk_bars(
     for dt, row in df.iterrows():
         bars.append(
             RawBar(
-                symbol="000852.XSHG",
+                symbol=symbol,
                 dt=pd.to_datetime(dt),
                 id=len(bars),
                 freq=czsc_freq,
@@ -117,11 +116,11 @@ def scan_macd_area_bc(label: str, bars: list[RawBar], th: int = 50, init_n: int 
     key = None
     for bar in bars[init_n:]:
         c.update(bar)
-        signal = zdy_macd_bc_V230422(c, di=1, th=th)
+        signal = call_signal("zdy_macd_bc_V230422", c, {"di": 1, "th": th})[0]
         if key is None:
-            key = next(iter(signal.keys()))
+            key = signal.key
 
-        value = next(iter(signal.values()))
+        value = signal.value
         if "其他" in value:
             continue
 

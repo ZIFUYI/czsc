@@ -31,8 +31,8 @@ for mod in [
 ]:
     sys.modules.setdefault(mod, MagicMock())
 
-from czsc.core import CZSC, Freq
-from czsc.signals.zdy import zdy_macd_bc_V230422
+from czsc import CZSC, Freq
+from czsc._native.signals import call_signal
 from test_zdy_macd_bc_000852 import read_jq_sdk_bars
 
 
@@ -46,11 +46,11 @@ def scan_signals(bars, th: int = 50, init_n: int = 300) -> tuple[pd.DataFrame, s
     signal_key = ""
     for i, bar in enumerate(bars[init_n:], start=init_n):
         c.update(bar)
-        signal = zdy_macd_bc_V230422(c, di=1, th=th)
+        signal = call_signal("zdy_macd_bc_V230422", c, {"di": 1, "th": th})[0]
         if not signal_key:
-            signal_key = next(iter(signal.keys()))
+            signal_key = signal.key
 
-        value = next(iter(signal.values()))
+        value = signal.value
         if "其他" in value:
             continue
 

@@ -75,6 +75,19 @@ pip install czsc -U
 uv pip install czsc
 ```
 
+数据源可选依赖按需安装：
+
+```bash
+# 聚宽 JQData
+uv sync --extra jq
+
+# 天勤 TQSdk
+uv sync --extra tq
+
+# 开发环境全量依赖
+uv sync --extra all
+```
+
 从源码构建（需要 Rust 工具链和 maturin）：
 
 ```bash
@@ -232,6 +245,7 @@ generate_backtest_report(df=dfw, output_path="report.html", weight_type="ts")
 
 | 模块 | 数据源 | 说明 |
 |------|--------|------|
+| `jq_connector.py` | 聚宽 JQData | A股、指数、ETF 行情；需 `uv sync --extra jq` |
 | `tq_connector.py` | 天勤（TQSdk） | 期货实时/历史行情 |
 | `ts_connector.py` | Tushare | A股历史数据 |
 | `ccxt_connector.py` | CCXT | 数字货币交易所 |
