@@ -46,8 +46,8 @@ from examples.signals_dev.test_zdy_macd_bc_000852 import read_jq_sdk_bars  # noq
 SYMBOL = "000852.XSHG"
 DATA_SDT = "20180101"
 STAT_SDT = "20200101"
-STAT_EDT = "20260520"
-FETCH_EDT = "20260521"
+STAT_EDT = "20260529"
+FETCH_EDT = "20260530"
 FEE_RATE = 0.0002
 RISK_SCALE = 0.9
 DEFAULT_OUTPUT_DIR = ROOT / "examples" / "results" / "multilevel_resonance_000852"
