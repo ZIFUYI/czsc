@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
 
 from czsc import CzscStrategyBase, Event, Freq, Position, format_standard_kline  # noqa: E402
 from examples.signals_dev.backtest_conditional_resonance_000852 import (  # noqa: E402
+    DEFAULT_STAT_EDT,
     ENTRY_COL,
     EXIT_COL,
     LONG_FILTER_COL,
@@ -248,6 +249,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", choices=["cache", "jq"], default="cache")
     parser.add_argument("--symbol", default=SYMBOL)
+    parser.add_argument(
+        "--edt",
+        default=DEFAULT_STAT_EDT,
+        help="statistics end date, e.g. 20260723; default uses latest data",
+    )
+    parser.add_argument(
+        "--fetch-edt",
+        default=None,
+        help="JQData fetch end date; intraday end_date is exclusive, default uses tomorrow",
+    )
     parser.add_argument("--use-signal-cache", action="store_true")
     args = parser.parse_args()
 
@@ -255,7 +266,13 @@ def main() -> None:
     custom_output_dir = get_output_dir(symbol)
     output_dir = get_position_event_output_dir(symbol)
 
-    ohlc = load_ohlc(args.source, symbol, custom_output_dir)
+    ohlc = load_ohlc(
+        args.source,
+        symbol,
+        custom_output_dir,
+        stat_edt=args.edt,
+        fetch_edt=args.fetch_edt,
+    )
     sig = build_signal_frame(ohlc, use_cache=args.use_signal_cache, output_dir=custom_output_dir)
     custom_dfw = build_condition_weights(sig)
     custom_stats, _, _ = evaluate_weight_df(custom_dfw)

@@ -52,8 +52,8 @@ from examples.signals_dev.test_zdy_macd_bc_000852 import read_jq_sdk_bars  # noq
 SYMBOL = "000852.XSHG"
 DATA_SDT = "20180101"
 STAT_SDT = "20200101"
-STAT_EDT = "20260520"
-FETCH_EDT = "20260521"
+DEFAULT_STAT_EDT = None
+DEFAULT_FETCH_EDT = (pd.Timestamp.today().normalize() + pd.Timedelta(days=1)).strftime("%Y%m%d")
 FEE_RATE = 0.0002
 OUTPUT_DIR = ROOT / "examples" / "results" / "conditional_resonance_000852"
 LOCAL_CACHE_FILE = ROOT / "examples" / "results" / "multilevel_resonance_000852" / "000852_XSHG_15m_ohlc.csv"
@@ -89,7 +89,13 @@ def get_output_dir(symbol: str) -> Path:
     return ROOT / "examples" / "results" / f"conditional_resonance_{symbol.replace('.', '_')}"
 
 
-def load_ohlc(source: str, symbol: str, output_dir: Path) -> pd.DataFrame:
+def load_ohlc(
+    source: str,
+    symbol: str,
+    output_dir: Path,
+    stat_edt: str | None = DEFAULT_STAT_EDT,
+    fetch_edt: str | None = None,
+) -> pd.DataFrame:
     """Load 15-minute OHLCV data from local cache or JQData."""
     if source == "cache":
         cache_file = output_dir / f"{symbol.replace('.', '_')}_15m_ohlc.csv"
@@ -98,7 +104,8 @@ def load_ohlc(source: str, symbol: str, output_dir: Path) -> pd.DataFrame:
             raise FileNotFoundError(f"Local 15m cache not found: {source_file}; rerun with --source jq")
         data = pd.read_csv(source_file, parse_dates=["dt"])
     else:
-        bars = read_jq_sdk_bars(freq="15m", czsc_freq=Freq.F15, sdt=DATA_SDT, edt=FETCH_EDT, symbol=symbol)
+        fetch_edt = fetch_edt or DEFAULT_FETCH_EDT
+        bars = read_jq_sdk_bars(freq="15m", czsc_freq=Freq.F15, sdt=DATA_SDT, edt=fetch_edt, symbol=symbol)
         data = pd.DataFrame(
             [
                 {
@@ -116,11 +123,20 @@ def load_ohlc(source: str, symbol: str, output_dir: Path) -> pd.DataFrame:
         )
 
     data["dt"] = pd.to_datetime(data["dt"]).dt.tz_localize(None)
-    stat_edt = pd.Timestamp(STAT_EDT) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
-    data = data[(data["dt"] >= pd.Timestamp(DATA_SDT)) & (data["dt"] <= stat_edt)].copy()
+    data = data[data["dt"] >= pd.Timestamp(DATA_SDT)].copy()
+    if stat_edt:
+        stat_edt_ts = pd.Timestamp(stat_edt) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+        data = data[data["dt"] <= stat_edt_ts].copy()
     data = data.drop_duplicates("dt").sort_values("dt").reset_index(drop=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     data.to_csv(output_dir / f"{symbol.replace('.', '_')}_15m_ohlc.csv", index=False, encoding="utf-8-sig")
+    if not data.empty:
+        end_tag = data["dt"].max().strftime("%Y%m%d")
+        data.to_csv(
+            output_dir / f"{symbol.replace('.', '_')}_15m_ohlc_{DATA_SDT}_{end_tag}.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     return data
 
 
@@ -227,7 +243,9 @@ def period_stats(daily: pd.DataFrame, stats: dict) -> pd.DataFrame:
             "return_drawdown": stats["return_drawdown"],
         }
     ]
-    for period, sdt in [("2020_2022", "2020-01-01"), ("2023_2024", "2023-01-01"), ("last_2y", "2024-05-20")]:
+    end_date = pd.Timestamp(stats["end"])
+    last_2y_sdt = (end_date - pd.DateOffset(years=2)).strftime("%Y-%m-%d")
+    for period, sdt in [("2020_2022", "2020-01-01"), ("2023_2024", "2023-01-01"), ("last_2y", last_2y_sdt)]:
         data = daily[daily.index >= pd.Timestamp(sdt)].copy()
         if period == "2020_2022":
             data = data[data.index <= pd.Timestamp("2022-12-31")]
@@ -310,12 +328,20 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", choices=["cache", "jq"], default="cache")
     parser.add_argument("--symbol", default=SYMBOL)
+    parser.add_argument(
+        "--edt", default=DEFAULT_STAT_EDT, help="statistics end date, e.g. 20260723; default uses latest data"
+    )
+    parser.add_argument(
+        "--fetch-edt",
+        default=None,
+        help="JQData fetch end date; intraday end_date is exclusive, default uses tomorrow",
+    )
     parser.add_argument("--use-signal-cache", action="store_true")
     args = parser.parse_args()
 
     symbol = normalize_symbol(args.symbol)
     output_dir = get_output_dir(symbol)
-    ohlc = load_ohlc(args.source, symbol, output_dir)
+    ohlc = load_ohlc(args.source, symbol, output_dir, stat_edt=args.edt, fetch_edt=args.fetch_edt)
     print(f"ohlc rows: {len(ohlc)} | {ohlc['dt'].iloc[0]} -> {ohlc['dt'].iloc[-1]}")
 
     sig = build_signal_frame(ohlc, use_cache=args.use_signal_cache, output_dir=output_dir)

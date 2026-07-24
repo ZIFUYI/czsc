@@ -21,14 +21,19 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 SYMBOL = "000852.XSHG"
 STAT_SDT = "20200101"
-STAT_EDT = "20260529"
 FEE_RATE = 0.0002
 TARGET_VOL = 0.40
 VOL_WINDOW = 30
 LEVERAGE_CAP = 4.0
-DATA_FILE = ROOT / "examples" / "results" / "daily_holding_000852" / "000852_XSHG_daily_20100101_20260529.csv"
 OUTPUT_DIR = ROOT / "examples" / "results" / "daily_holding_000852"
+DATA_FILE = OUTPUT_DIR / "000852_XSHG_daily_20100101_20260529.csv"
 STRATEGY_NAME = "DailyCTA_AVG5_MA_MOM_DON_VT40_C4"
+
+
+def latest_data_file() -> Path:
+    """Find the latest 000852 daily OHLCV cache."""
+    files = sorted(OUTPUT_DIR.glob("000852_XSHG_daily_20100101_*.csv"))
+    return files[-1] if files else DATA_FILE
 
 
 def load_daily_bars(file_csv: Path = DATA_FILE) -> pd.DataFrame:
@@ -79,7 +84,7 @@ def build_direction_legs(data: pd.DataFrame) -> pd.DataFrame:
     return legs.fillna(0.0)
 
 
-def build_weight_frame(data: pd.DataFrame) -> pd.DataFrame:
+def build_weight_frame(data: pd.DataFrame, stat_edt: str | None = None) -> pd.DataFrame:
     """Build daily target weights from selected direction legs."""
     out = data[["dt", "symbol", "close"]].copy()
     legs = build_direction_legs(data)
@@ -93,8 +98,9 @@ def build_weight_frame(data: pd.DataFrame) -> pd.DataFrame:
     out["weight"] = out["score_avg"] * out["leverage"]
     out["price"] = out["close"].astype(float)
 
-    stat_edt = pd.Timestamp(STAT_EDT) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
-    mask = (out["dt"] >= pd.Timestamp(STAT_SDT)) & (out["dt"] <= stat_edt)
+    edt = pd.Timestamp(stat_edt) if stat_edt else out["dt"].max()
+    stat_edt_ts = edt + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    mask = (out["dt"] >= pd.Timestamp(STAT_SDT)) & (out["dt"] <= stat_edt_ts)
     return out.loc[mask].reset_index(drop=True)
 
 
@@ -176,6 +182,36 @@ def period_stats(daily: pd.DataFrame, stats: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def yearly_stats(daily: pd.DataFrame) -> pd.DataFrame:
+    """Calculate calendar-year strategy performance."""
+    rows = []
+    for year, group in daily.groupby(daily["dt"].dt.year):
+        data = group.copy()
+        nav = (1 + data["ret"]).cumprod()
+        drawdown = nav / nav.cummax() - 1
+        years = (data["dt"].iloc[-1] - data["dt"].iloc[0]).days / 365.25
+        final_nav = float(nav.iloc[-1])
+        annual_return = final_nav ** (1 / years) - 1 if years > 0 and final_nav > 0 else final_nav - 1
+        max_drawdown = float(drawdown.min())
+        rows.append(
+            {
+                "year": int(year),
+                "start": str(data["dt"].iloc[0].date()),
+                "end": str(data["dt"].iloc[-1].date()),
+                "days": int(len(data)),
+                "return": final_nav - 1,
+                "annual_return": annual_return,
+                "max_drawdown": max_drawdown,
+                "calmar": annual_return / abs(max_drawdown) if max_drawdown < 0 else float("nan"),
+                "win_rate": float((data["ret"] > 0).mean()),
+                "turnover": float(data["turnover"].sum()),
+                "avg_abs_weight": float(data["weight"].abs().mean()),
+                "max_abs_weight": float(data["weight"].abs().max()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def write_equity_svg(daily: pd.DataFrame, stats: dict, output_dir: Path) -> None:
     """Write a self-contained SVG/HTML equity chart."""
     width, height = 1120, 680
@@ -235,21 +271,25 @@ def save_outputs(weights: pd.DataFrame, daily: pd.DataFrame, stats: dict, output
     daily.to_csv(output_dir / "daily_cta_daily.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame([stats]).to_csv(output_dir / "daily_cta_summary.csv", index=False, encoding="utf-8-sig")
     period_stats(daily, stats).to_csv(output_dir / "daily_cta_period_stats.csv", index=False, encoding="utf-8-sig")
+    yearly_stats(daily).to_csv(output_dir / "daily_cta_yearly_stats.csv", index=False, encoding="utf-8-sig")
     write_equity_svg(daily, stats, output_dir)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--file", type=Path, default=DATA_FILE)
+    parser.add_argument("--file", type=Path, default=None)
+    parser.add_argument("--edt", default=None, help="Statistics end date. Empty means the latest date in the data file.")
     args = parser.parse_args()
 
-    data = load_daily_bars(args.file)
-    weights = build_weight_frame(data)
+    data = load_daily_bars(args.file or latest_data_file())
+    weights = build_weight_frame(data, stat_edt=args.edt)
     stats, daily = evaluate(weights)
     save_outputs(weights, daily, stats)
     print(pd.DataFrame([stats]).to_string(index=False))
     print("\nperiod stats:")
     print(period_stats(daily, stats).to_string(index=False))
+    print("\nyearly stats:")
+    print(yearly_stats(daily).to_string(index=False))
     print(f"\noutputs: {OUTPUT_DIR}")
 
 
