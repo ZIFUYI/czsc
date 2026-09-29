@@ -28,9 +28,20 @@ __all__ = [
     "RawBar",
     "Signal",
     "ZS",
+    "check_bi",
+    "check_fx",
+    "check_fxs",
+    "check_gap_info",
     "chip_distribution_triangle",
+    "create_fake_bis",
+    "format_standard_kline",
+    "get_zs_seq",
+    "is_bis_down",
+    "is_bis_up",
+    "is_symmetry_zs",
     "monotonicity",
     "parse_signal_doc",
+    "remove_include",
 ]
 
 @typing.final
@@ -218,6 +229,8 @@ class CZSC:
     @property
     def max_bi_num(self) -> builtins.int: ...
     @property
+    def min_bi_len(self) -> builtins.int: ...
+    @property
     def bi_list(self) -> builtins.list[BI]: ...
     @property
     def bars_raw(self) -> builtins.list[RawBar]:
@@ -238,6 +251,11 @@ class CZSC:
     def finished_bis(self) -> builtins.list[BI]:
         r"""
         获取已完成的笔列表（与 bi_list 相同，为兼容 czsc 库）
+        """
+    @property
+    def zs_list(self) -> builtins.list[ZS]:
+        r"""
+        基于已完成笔计算的中枢序列。
         """
     @property
     def fx_list(self) -> builtins.list[FX]:
@@ -276,9 +294,9 @@ class CZSC:
         最后一笔延伸情况（与 czsc 库兼容）
         判断最后一笔是否在延伸中，True 表示延伸中
         """
-    def __new__(cls, bars_raw: typing.Sequence[RawBar], max_bi_num: builtins.int = 50) -> CZSC: ...
+    def __new__(cls, bars_raw: typing.Sequence[RawBar], max_bi_num: builtins.int = 0, min_bi_len: builtins.int = 0) -> CZSC: ...
     @staticmethod
-    def from_dataframe(df_bytes: bytes, freq: Freq, max_bi_num: builtins.int = 50) -> CZSC:
+    def from_dataframe(df_bytes: bytes, freq: Freq, max_bi_num: builtins.int = 0, min_bi_len: builtins.int = 0) -> CZSC:
         r"""
         直接从Arrow格式的DataFrame创建CZSC对象，避免中间转换
         这是高性能的批量创建接口，适用于大量数据的初始化
@@ -376,7 +394,10 @@ class CzscSignals:
     def __new__(cls, bg: BarGenerator, signals_config: list) -> CzscSignals: ...
     def update_signals(self, bar: RawBar) -> None:
         r"""
-        更新信号
+        更新信号。
+        
+        BarGenerator 现在会对 NaN OHLCV / freq mismatch 等硬错返回 Err，
+        这里 propagate 成 Python ValueError，避免吞 Err 让信号链路用 stale 状态。
         """
     def get_signals_by_conf(self) -> typing.Any:
         r"""
@@ -458,7 +479,10 @@ class CzscTrader:
     def __new__(cls, bg: BarGenerator, positions: list, signals_config: list, ensemble_method: builtins.str = 'mean') -> CzscTrader: ...
     def update(self, bar: RawBar) -> None:
         r"""
-        更新信号和仓位
+        更新信号和仓位。
+        
+        BarGenerator 现在会对 NaN OHLCV / freq mismatch 等硬错返回 Err，
+        这里 propagate 成 Python ValueError 避免吞 Err 让信号 / 仓位用 stale 状态。
         """
     def on_bar(self, bar: RawBar) -> None:
         r"""
@@ -482,7 +506,23 @@ class CzscTrader:
         """
     def update_signals(self, bar: RawBar) -> None:
         r"""
-        仅更新信号（不更新仓位）
+        仅更新信号（不更新仓位）。
+        
+        同 update：BarGenerator 硬错 propagate 成 Python ValueError。
+        """
+    def dump_state(self) -> bytes:
+        r"""
+        导出完整状态快照为 bytes（热启动用，零重放）。
+        
+        快照含缠论计算状态（bg/kas/ta_cache 全历史）、仓位配置与运行时决策状态
+        （pos/operates/holds 等）、信号配置与集成方式，可经 ``restore_state`` 单参还原。
+        """
+    @staticmethod
+    def restore_state(data: bytes) -> CzscTrader:
+        r"""
+        从 ``dump_state`` 产生的 bytes 还原 trader（零重放热启动）。
+        
+        信号配置与集成方式从快照内读回，无需额外参数。
         """
     def __reduce__(self) -> typing.Any:
         r"""
@@ -707,6 +747,13 @@ class Operate:
     def value(self) -> builtins.str:
         r"""
         兼容性属性：返回操作类型的中文字符串值
+        """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        返回 Rust variant 名（"HL" / "HS" / "HO" / "LO" / "LE" / "SO" / "SE"），
+        对齐 Python `enum.Enum.name`：英文标识符稳定且与序列化路径
+        (`from_str` / `to_string`) 一致，适合做配置 key / 日志短码。
         """
     @classmethod
     def hl(cls) -> Operate: ...
@@ -1074,6 +1121,11 @@ class Direction(enum.Enum):
         r"""
         获取方向的字符串值（与 czsc 库兼容）
         """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        返回 Rust variant 名（"Up" / "Down"），对齐 Python `enum.Enum.name`。
+        """
     def __deepcopy__(self, _memo: typing.Any) -> Direction:
         r"""
         支持深拷贝
@@ -1085,6 +1137,10 @@ class Direction(enum.Enum):
     def __new__(cls, value: builtins.str) -> Direction: ...
     def __str__(self) -> builtins.str: ...
     def __repr__(self) -> builtins.str: ...
+    def __hash__(self) -> builtins.int:
+        r"""
+        显式实现 `__hash__`，原因见 freq.rs 中同名方法的说明。
+        """
     def __richcmp__(self, other: typing.Any, op: int) -> builtins.bool: ...
 
 @typing.final
@@ -1180,6 +1236,13 @@ class Freq(enum.Enum):
     __members__: typing.Any
     @property
     def value(self) -> builtins.str: ...
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        返回 Rust variant 名（"F30" / "D" / "Tick" / ...），
+        对齐 Python `enum.Enum.name` 的习惯——便于在序列化、日志、
+        配置文件里使用稳定且语言无关的英文标识符。
+        """
     def __deepcopy__(self, _memo: typing.Any) -> Freq:
         r"""
         支持深拷贝
@@ -1191,6 +1254,14 @@ class Freq(enum.Enum):
     def __new__(cls, value: builtins.str) -> Freq: ...
     def __str__(self) -> builtins.str: ...
     def __repr__(self) -> builtins.str: ...
+    def __hash__(self) -> builtins.int:
+        r"""
+        用 derived `Hash` 暴露 `__hash__`：PyO3 不会自动从 Rust 端
+        `#[derive(Hash)]` 派生 Python `__hash__`，且一旦写了 `__richcmp__`
+        又不显式给 `__hash__`，PyO3 会把 `__hash__` 显式设为 `None`，导致
+        实例不可哈希（无法做 dict/set 的 key）。这里显式实现以恢复
+        与 Python `enum.Enum` 一致的可哈希语义。
+        """
     def __richcmp__(self, other: typing.Any, op: int) -> builtins.bool: ...
 
 @typing.final
@@ -1212,8 +1283,32 @@ class Mark(enum.Enum):
         r"""
         获取标记的字符串值（与 czsc 库兼容）
         """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        返回 Rust variant 名（"G" / "D"），对齐 Python `enum.Enum.name`。
+        """
+    def __deepcopy__(self, _memo: typing.Any) -> Mark:
+        r"""
+        支持深拷贝
+        """
+    def __reduce__(self) -> tuple[typing.Any, typing.Any]:
+        r"""
+        支持 pickle 序列化：参考 Direction 的实现，通过 `__reduce__`
+        把实例还原成 `Mark("G")` / `Mark("D")` 的构造调用。
+        """
+    def __new__(cls, value: builtins.str) -> Mark:
+        r"""
+        支持从字符串构造（接受 Rust variant 名或中文显示串）。
+        """
     def __str__(self) -> builtins.str: ...
     def __repr__(self) -> builtins.str: ...
+    def __hash__(self) -> builtins.int:
+        r"""
+        显式实现 `__hash__`，原因见 freq.rs 中同名方法的说明：PyO3 不会
+        自动从 Rust `Hash` derive 派生 Python `__hash__`，且写了 `__richcmp__`
+        后会把 `__hash__` 置 None。
+        """
     def __richcmp__(self, other: typing.Any, op: int) -> builtins.bool: ...
 
 @typing.final
@@ -1232,6 +1327,27 @@ class Market(enum.Enum):
     """
 
     def __new__(cls, ob: typing.Any) -> Market: ...
+
+def check_bi(bars: typing.Sequence[NewBar], min_bi_len: builtins.int = 0) -> typing.Optional[BI]:
+    r"""
+    对 `analyze::utils::check_bi` 的 Python 友好的薄 wrapper。
+    丢弃未使用的剩余切片；Python 调用方只消费可选的 BI 值。
+    """
+
+def check_fx(k1: NewBar, k2: NewBar, k3: NewBar) -> typing.Optional[FX]:
+    r"""
+    对 `analyze::utils::check_fx` 的 Python 友好的薄 wrapper。
+    """
+
+def check_fxs(bars: typing.Sequence[NewBar]) -> builtins.list[FX]:
+    r"""
+    对 `analyze::utils::check_fxs` 的 Python 友好的薄 wrapper。
+    """
+
+def check_gap_info(bars: typing.Sequence[RawBar]) -> builtins.list[builtins.dict[builtins.str, typing.Any]]:
+    r"""
+    返回与历史 Python API 兼容的缺口字典列表。
+    """
 
 def chip_distribution_triangle(data: numpy.typing.NDArray[numpy.float64], price_step: builtins.float, decay_factor: builtins.float) -> tuple[numpy.typing.NDArray[numpy.float64], numpy.typing.NDArray[numpy.float64]]:
     r"""
@@ -1266,6 +1382,39 @@ def chip_distribution_triangle(data: numpy.typing.NDArray[numpy.float64], price_
     返回的两个数组长度相同，可用于绘制筹码分布图或进一步分析。
     """
 
+def create_fake_bis(fxs: typing.Sequence[FX]) -> builtins.list[FakeBI]:
+    r"""
+    将分型序列转换为虚拟笔；非法的非交替分型返回 ValueError。
+    """
+
+def format_standard_kline(bars: typing.Sequence[RawBar]) -> builtins.list[RawBar]:
+    r"""
+    对 `analyze::utils::format_standard_kline` 的 Python 友好的薄 wrapper。
+    Polars DataFrame 通过标准的 pyo3-polars / arrow 路径桥接；目前
+    我们接受一个预构建好的 RawBar 列表，以避免在 D.A 阶段引入 polars/python 的耦合。
+    完整的 DataFrame 入口会等到 Phase E/F 接入 polars Python 桥时再添加（详见 design doc §2.3）。
+    """
+
+def get_zs_seq(bis: typing.Sequence[BI]) -> builtins.list[ZS]:
+    r"""
+    将连续笔划分为中枢序列。
+    """
+
+def is_bis_down(bis: typing.Sequence[BI]) -> builtins.bool:
+    r"""
+    判断连续奇数笔是否构成向下结构。
+    """
+
+def is_bis_up(bis: typing.Sequence[BI]) -> builtins.bool:
+    r"""
+    判断连续奇数笔是否构成向上结构。
+    """
+
+def is_symmetry_zs(bis: typing.Sequence[BI], th: builtins.float = 0.3) -> builtins.bool:
+    r"""
+    判断一组连续笔是否构成对称中枢。
+    """
+
 def monotonicity(sequence: typing.Sequence[builtins.float]) -> builtins.float:
     r"""
     `czsc.monotonicity(sequence)` → float。
@@ -1278,5 +1427,10 @@ def monotonicity(sequence: typing.Sequence[builtins.float]) -> builtins.float:
 def parse_signal_doc(doc: builtins.str) -> ParsedSignalDoc:
     r"""
     解析文档中的Signal信息
+    """
+
+def remove_include(k1: NewBar, k2: NewBar, k3: RawBar) -> tuple[builtins.bool, NewBar]:
+    r"""
+    对 `analyze::utils::remove_include` 的 Python 友好的薄 wrapper。
     """
 

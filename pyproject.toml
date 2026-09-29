@@ -59,7 +59,7 @@ dependencies = [
     # - czsc._native 由 crates/czsc-python 通过 maturin 直接产出，无需 rs-czsc
     # - wbt 为硬依赖，提供 WeightBacktest / daily_performance / top_drawdowns / mock 等
     # - talib-rs 见 [project.optional-dependencies].test，运行时代码不依赖它
-    "wbt",
+    "wbt>=0.2.1",
     # 图表和可视化（czsc 的所有可视化统一由 plotly 实现，
     # fig.show() 在浏览器打开或 plot_*(to_html=True) 写 HTML 文件）
     "plotly",
@@ -68,7 +68,11 @@ dependencies = [
     "loguru",
     "dill",
     "tenacity",
+    "typer>=0.12.0",
 ]
+
+[project.scripts]
+czsc = "czsc.cli:app"
 
 [[tool.uv.index]]
 url = "https://pypi.python.org/simple"
@@ -156,6 +160,10 @@ extend-exclude = ["czsc/_native/__init__.pyi"]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
 ignore = ["E501", "SIM112"]
 extend-safe-fixes = ["UP"]
+
+[tool.ruff.lint.flake8-bugbear]
+# typer 的惯用法：Argument/Option 作为参数默认值的工厂调用，B008 应放行
+extend-immutable-calls = ["typer.Argument", "typer.Option"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["czsc"]

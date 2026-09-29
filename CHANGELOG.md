@@ -7,6 +7,64 @@
 
 ---
 
+## [Unreleased]
+
+## [1.0.1] — 2026-08-09
+
+### Added
+
+- **公开缠论结构分析链 API**：新增 `create_fake_bis`、`get_zs_seq`、`is_symmetry_zs`、`is_bis_up`、`is_bis_down`、`check_gap_info`，并新增基于 `finished_bis` 计算的 `CZSC.zs_list` 属性。Python 顶层、`czsc._native` 类型桩和 Rust `czsc` facade 同步暴露。
+
+### Fixed
+
+- **`CZSC_MIN_BI_LEN` 现在真正作用于 Rust 端成笔逻辑**（[waditu/czsc#328](https://github.com/waditu/czsc/issues/328)）：此前 `crates/czsc-core/src/analyze/utils.rs` 的 `check_bi` 硬编码 `let min_bi_len = 6;`，且 `CZSC` 构造函数签名只有 `(bars_raw, max_bi_num)`，导致 `CZSC_MIN_BI_LEN` 只影响 `czsc.envs.get_min_bi_len()` 的返回值、对 `bi_list` / `finished_bis` 毫无作用。修复：
+  - `CZSC` 增加 `min_bi_len` 字段；`check_bi(bars, min_bi_len)` 改为接收阈值参数，移除硬编码。
+  - PyO3 构造函数 `CZSC(bars_raw, max_bi_num=0, min_bi_len=0)` / `from_dataframe(...)` 新增 `min_bi_len` 形参；显式参数 >0 时优先，否则读 `CZSC_MIN_BI_LEN`（大小写不敏感），再否则默认 6（与 `czsc.envs` 约定一致）。`max_bi_num` 同理改为 env-aware（默认 0 → 读 `CZSC_MAX_BI_NUM` → 50）。
+  - Rust 构造入口统一为 `CZSC::new(bars, max_bi_num, min_bi_len)`；`CzscSignals` 内部重建 `kas` 时也会读取同一套环境变量。
+  - 新增 `CZSC.min_bi_len` getter；pickle (`__reduce__`) 现在保留 `min_bi_len`。
+  - 回归测试 `min_bi_len_affects_bi_count` 锁定"更大阈值产出更少/更长的笔"。
+
+### Fixed
+
+- **Rust 发布依赖图**：workspace 内部 `czsc-*` 依赖改为严格 `=<version>` 锁定；`czsc-signals` 与 `czsc-trader` 仅在 Python 构建路径启用 `czsc-core/python`，纯 Rust 用户不再被强制拉入 PyO3 工具链。
+
+### Documentation
+
+- 真实数据 Tushare 案例已补入案例索引，并明确其 `TUSHARE_TOKEN` 前置条件；发布自检只检查已删除模块路径，保留有效的兼容性说明。
+
+---
+
+---
+
+## [1.0.0-rc.8] — 2026-05-29
+
+### Added
+
+- **`czsc.resample_bars`**：把基础周期 K 线（`pandas.DataFrame` 或 `list[RawBar]`）聚合到目标周期。Rust 实现位于 `crates/czsc-utils/src/resample.rs`，通过 `czsc._native.resample_bars` 透传；Python 端 `czsc/_resample_bars.py` 仅做 DataFrame ↔ `list[RawBar]` 边界胶水。复用 `BarGenerator` 单桶聚合 + `infer_market_from_bars` 自动推断市场。
+- **PyO3 enum 暴露 `.name` getter**（`Freq` / `Mark` / `Direction` / `Operate`）：与 Python 标准库 `enum.Enum.name` 对齐，返回 Rust variant 英文名（如 `Freq.F30.name == "F30"`、`Operate.HL.name == "HL"`），便于在序列化、日志、配置文件里使用语言无关的稳定标识符。`.value`（中文显示串）行为不变。Rust 实现位于 `crates/czsc-core/src/objects/{freq,mark,direction,operate}.rs`。
+- **PyO3 enum 全部可哈希**（`Freq` / `Mark` / `Direction` —— `Operate` 此前已可哈希）：显式实现 `__hash__`，让实例可作为 `dict` / `set` 的 key。此前 PyO3 因 `__richcmp__` 存在而把 `__hash__` 强制设为 `None`，即使 Rust 端 `#[derive(Hash)]` 也透不到 Python。`Mark` / `Direction` derive 列表补 `Eq, Hash`；`Operate` derive 补 `Eq`。
+- **`Mark` 补齐 `__new__` / `__reduce__` / `__deepcopy__`**：之前不能 pickle、不能从字符串构造（"G" / "顶分型"），是与 `Freq` / `Direction` 不对齐的 pre-existing gap，本次一并补完。`Mark("G") == Mark.G`、`pickle.loads(pickle.dumps(Mark.G)) == Mark.G` 现已可工作。
+
+### Breaking changes
+
+- **`RawBar` 构造拒绝 tz-aware datetime**（`crates/czsc-core/src/utils/common.rs::parse_python_datetime`）：历史上 tz-aware 入参走 `.timestamp()` 静默转 UTC（如 `09:31 Asia/Shanghai → 01:31 UTC`），下游 `freq_end_time` 桶定位全部错位。现改为 `PyValueError`，调用方需先 `df['dt'] = df['dt'].dt.tz_localize(None)`。同时 `parse_python_datetime` 的所有失败路径统一返回 `PyValueError`（历史混用 `PyException` + `PyValueError`），方便 Python 端 `except ValueError` 一次性捕获。
+- **`BarGenerator.update_bar` / `init_freq_with_bars` 拒绝 NaN OHLCV**（`crates/czsc-utils/src/bar_generator.rs`）：历史上 `last.vol + bar.vol` 会让 NaN 沿桶传染（与 pandas `sum(skipna=True)` 不一致）。现改为显式 Err，沿 `signals.update_signals` / `trader.update` 等调用链 propagate，避免 trader 路径吞 Err 后用 stale 状态算出"幻象"信号。
+- **`CzscTrader.update` / `on_bar` / `update_signals`、`CzscSignals.update_signals`**（`crates/czsc-python/src/trader/`）：PyO3 method 改返回 `PyResult<()>`，NaN / freq mismatch 等硬错 fail-loud 上抛 `ValueError`。Python 端调用方需准备好 `try/except` 或让异常冒泡。
+
+### Fixed
+
+- **`czsc/connectors/tq_connector.py::get_raw_bars`**：调用 `czsc.resample_bars` 时显式传 `base_freq=freq`，修复默认 `Freq.F1` 误标导致的 silent 时间漂移（review finding C5）。
+- **`czsc.resample_bars` 边界**：空输入 + `raw_bars=False` 现在返回 8 列 + 与非空一致 dtype 的空 DataFrame（`symbol=object` / `dt=datetime64[ns]` / OHLCV=`float64`），避免 `pd.DataFrame([])` 退化成 0 列 KeyError，以及 dtype 全 `object` 让 `df["dt"].dt` accessor 抛 AttributeError。
+- **`PyOperate.__repr__` 一致性**（`crates/czsc-core/src/objects/operate.rs`）：此前返回 `"PyOperate::HL"`，泄漏内部 Rust 结构名；现修正为 `"Operate.HL"`，与三个兄弟 enum（`Freq` / `Mark` / `Direction`）的 `EnumName.Variant` 形式一致，对齐 Python `enum.Enum` 约定。
+
+### Notes
+
+- 本批改动有两项**已知限制**（已 docstring 标注，留单独 PR 处理）：
+  - `resample_bars` 的 `drop_unfinished=True` 对非分钟 target（D/W/M/S/Y）实际是 no-op，因 `freq_end_time` 把日级以上桶 dt 归到 `00:00:00`。
+  - `BarGenerator::new` 为 base 桶也预分配 `bars.len()+1` 容量，单次大输入（百万级）会有一倍内存浪费。
+
+---
+
 ## [1.0.0-rc.5] — 2026-05-18
 
 > **1.0.0-rc.4 的紧急重发**。rc.4 wheel build + smoke 全部 6 平台都成功，但 `publish-to-pypi` step 的 `Verify version consistency` 检查写错了：把 Cargo `1.0.0-rc.4` (SemVer) 与 wheel filename `1.0.0rc4` (PEP 440) 直接字符串对比——maturin 必然要把 SemVer 的 `-rc.N` 翻译成 PEP 440 的 `rcN`，所以这个检查在任何 prerelease tag 上都会必然失败。
@@ -352,6 +410,7 @@ fig.show()
   bump `Cargo.toml [workspace.package].version` 即可，pyproject.toml 自动同步。
 - 旧 Python 实现可在 `v0.9.69` tag 或 [0.9.X 分支](https://github.com/waditu/czsc/tree/v0.9.69) 查看。
 
+[1.0.1]: https://github.com/waditu/czsc/compare/v1.0.0-rc.8...v1.0.1
 [1.0.0-rc.5]: https://github.com/waditu/czsc/releases/tag/v1.0.0-rc.5
 [1.0.0-rc.5]: https://github.com/waditu/czsc/releases/tag/v1.0.0-rc.5
 [1.0.0-rc.4]: https://github.com/waditu/czsc/releases/tag/v1.0.0-rc.4

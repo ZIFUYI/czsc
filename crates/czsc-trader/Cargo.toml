@@ -17,7 +17,7 @@ name = "czsc_trader"
 path = "src/lib.rs"
 
 [dependencies]
-czsc-core     = { workspace = true, features = ["python"] }
+czsc-core     = { workspace = true }
 czsc-utils    = { workspace = true }
 czsc-signals  = { workspace = true }
 czsc-derive   = { workspace = true }
@@ -31,6 +31,7 @@ md5           = "0.8"
 polars        = { workspace = true, features = ["lazy", "ipc", "parquet"] }
 polars-plan   = { version = "0.52" }
 rayon         = { workspace = true }
+rmp-serde     = "1"
 serde         = { workspace = true }
 serde_json    = "1"
 sha2          = "0.11"
@@ -40,6 +41,9 @@ thiserror     = "2"
 tracing       = "0.1"
 arrayvec      = "0.7"
 csv           = "1"
+
+[features]
+python = ["czsc-core/python", "czsc-signals/python"]
 
 [dev-dependencies]
 tempfile      = "3"

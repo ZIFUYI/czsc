@@ -19,7 +19,7 @@
 检查范围与方法：
 
 - [ ] **`README.md`**：安装命令、最小示例、API 调用片段、特性列表都能跑通；版本徽章/截图同步
-- [ ] **`CLAUDE.md`**：模块路径、已删除/重命名的符号、目录结构描述、引用的环境变量名（如 `CZSC_USE_PYTHON` 等是否已退役）
+- [ ] **`CLAUDE.md`**：模块路径、目录结构描述与环境变量名均与当前代码一致
 - [ ] **`docs/examples/*.py`**：每个示例真实可运行（至少 `python -c` import 不报错）；删除的示例同步从 `docs/examples.md` 索引里删掉
 - [ ] **`docs/migration/`**：历史迁移说明里引用的旧 API/路径，与当前实际"已删除/已改名"的事实对齐
 - [ ] **公开 docstring**：`czsc/` 顶层导出对象、`crates/*/src/lib.rs` 公开 item 的 docstring 中的代码示例可执行
@@ -41,15 +41,19 @@ for r in refs:
         print('MISSING in czsc:', r)
 "
 
-# 2) 找 md 里残留的"已被删掉"的关键字（按本仓库历史踩坑点扩充）
-rg -n 'czsc\.svc|czsc\.signals\.|streamlit|CZSC_USE_PYTHON|SignalsParser|czsc\.core\b' \
-   README.md CLAUDE.md docs/ \
-   && echo "::error:: 上述命中均为已删除/已退役项，需从文档中清理"
+# 2) 确认面向用户文档没有引用已删除的模块路径
+rg -n 'czsc\.svc|czsc\.signals\.|czsc\.core\b' README.md docs/ \
+   && echo "::error:: 上述命中均为已删除模块路径，需从文档中清理"
 
-# 3) 找 md 里引用的文件路径是否仍存在
-rg -nIo '[a-zA-Z0-9_/.-]+\.(py|rs|toml|md)\b' README.md CLAUDE.md docs/ \
-   | awk -F: '{print $NF}' | sort -u \
-   | while read p; do [ -e "$p" ] || echo "MISSING path: $p"; done
+# 3) 校验案例索引与 docs/examples/ 实际文件一致
+python - <<'PY'
+from pathlib import Path
+import re
+files = {p.name for p in Path("docs/examples").glob("*.py")}
+listed = set(re.findall(r"\]\(\./examples/([^)]*\.py)\)", Path("docs/examples.md").read_text()))
+for name in sorted(files ^ listed):
+    print("MISSING example index entry:", name)
+PY
 ```
 
 - [ ] 以上三段命令均无输出（或所有命中都已修正）
@@ -168,7 +172,16 @@ CI smoke 仅覆盖 Linux x86_64 / macOS x86_64 / macOS arm64 / Windows x64。**L
   pip install czsc==<X.Y.Z>
   python -c "import czsc; print(czsc.__version__)"
   ```
-- [ ] `cargo add czsc@<X.Y.Z>` 在干净 Rust 项目中可解析
+- [ ] **`cargo add czsc@=<X.Y.Z>` 在干净 Rust 项目里能 `cargo check` 真编通过**（注意：仅"可解析"不够 —— 1.0.0-rc.8 发版时踩过坑，下游 cargo add 后解析成功但 cargo check 失败。完整命令：
+  ```bash
+  TMPD=$(mktemp -d); cd "$TMPD"
+  cargo init --name release_smoke --quiet
+  cargo add 'czsc@=<X.Y.Z>' --quiet
+  cargo check 2>&1 | tail -20   # 必须 0 错误
+  cargo tree -i polars-core 2>&1 | head -10   # 必须单一版本，无 0.42/0.52 双版本冲突
+  cd - && rm -rf "$TMPD"
+  ```
+  常见失败：(a) **SemVer prerelease 解析**：crates.io 同时有 `1.0.0` stable 与 `1.0.0-rc.*` 时，cargo 会优先选 stable，造成依赖图错位 —— 必须用 `=` 严格匹配 + `cargo yank` 误发 stable；(b) **pyo3 / pyo3-stub-gen / numpy 被无条件依赖** —— 纯 Rust 用户也被强制拉 Python 工具链，撞上游兼容性 bug，必须 feature-gate。详见 §8 雷达表）
 - [ ] 至少跑一个最小 CZSC + 信号配置的 demo（如 `docs/examples/13_lightweight_charts_html.py`）确认运行时无回归
 
 ---
@@ -187,6 +200,8 @@ CI smoke 仅覆盖 Linux x86_64 / macOS x86_64 / macOS arm64 / Windows x64。**L
 | crates.io rate-limit | 新 crate 创建 ~1/10min | `start_layer`/`end_layer` 断点续发 |
 | PyPI 已存在版本无法覆盖 | 发布失败后误以为可重发 | §6 step 5：bump patch 重发，不要 yank |
 | 下游升级炸裂 | breaking change 没写迁移说明 | §1 CHANGELOG + `docs/migration/` |
+| **SemVer prerelease 被 stable 抢解析** | crates.io 同时有 `1.0.0` 与 `1.0.0-rc.*`，下游 `cargo add czsc` 会解析到 stable 而非 rc，导致依赖图错位（rc.8 实战遇到）| **必须** workspace.dependencies 全用 `version = "=<X.Y.Z>"` 严格匹配；**误发的 stable 必须 `cargo yank`**；§7 cargo check ratchet 抓得到 |
+| **pyo3 / pyo3-stub-gen / numpy 无条件硬依赖** | 纯 Rust 下游被强制拉 Python 工具链，撞上游兼容性 bug 编不出（rc.8 实战遇到） | czsc-core / czsc-utils / czsc-signals / czsc-trader 把 pyo3 系列 dep 改 `optional = true` + `[features] python = [...]`；§7 cargo check ratchet 抓得到 |
 
 ---
 
@@ -208,6 +223,13 @@ uv run --no-sync ruff format --check czsc/ tests/
 uv run --no-sync ruff check czsc/ tests/
 uv run --no-sync pytest --run-slow
 uv run python -c "import czsc; print('version:', czsc.__version__)"
+
+# §7 cargo check ratchet（rc.8 教训）—— 模拟下游纯 Rust 用户拉发布产物
+# 注意：本地 cargo check --workspace 会因 path = "..." 短路，看不到
+# crates.io 上的版本解析问题；必须在干净项目里 cargo add 才能复现。
+# 这一段建议在 PR push tag **之后**、cargo publish dispatch **之前**
+# 跑一次（用 dry-run 产物或 TestPyPI/crates.io-staging 镜像）。
+
 echo "✅ 本地预检全部通过"
 ```
 
