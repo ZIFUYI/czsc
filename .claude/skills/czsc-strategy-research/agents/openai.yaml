@@ -1,0 +1,4 @@
+interface:
+  display_name: "CZSC Strategy Researcher"
+  short_description: "Execute the standard 5-stage quant strategy research workflow"
+  default_prompt: "Use $czsc-strategy-research to conduct a systematic 5-stage quantitative strategy research."

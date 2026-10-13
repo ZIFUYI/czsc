@@ -292,6 +292,26 @@ czsc_obj = CZSC(bars)
 - 研究入口统一指向 `czsc.research.run_research / run_replay / run_optimize_batch`（Rust 后端）
 - **回测路径优先级**：能使用 `Signal -> Event -> Position` 体系表达的策略，尽量使用 `Position/Event` 体系进行回测，并通过 `CzscStrategyBase.backtest / replay` 产出 `holds / pairs / signals`；仅在纯权重时序、组合调仓、探索性研究等不适合表达为 `Position/Event` 的场景，才优先使用 `WeightBacktest` 或自定义权重序列回测。
 
+### 标准量化策略研究 5 阶段工作流（SOP）
+
+量化策略与信号研发必须遵循系统化投研流程，严禁跳过统计检验进行盲目回测与暴力参数拟合。标准作业规范详见 `.claude/skills/czsc-strategy-research/SKILL.md`，完整代码母本见 `examples/ma_joint_study/`：
+
+1. **阶段一：单信号事件验证（Signal Event Study）**
+   - 提取信号未来 $T+1 \sim T+N$ 前向持有期收益分布、胜率与 95% 置信区间。
+   - **门禁**：样本数 $N \ge 30$，胜率 $> 50\%$，置信区间下界大于 0。
+2. **阶段二：截面并发与多周期共振（Event CSC & Multi-timeframe Resonance）**
+   - 封装 `Signal` 为 `Event`（`signals_all/any/not`），统计跨品种截面并发率（CSC），检验大级别顺势 + 小级别共振增益。
+   - **门禁**：截面无极端拥挤并发，共振过滤带来明确胜率/盈亏改善。
+3. **阶段三：基准持仓状态机检验（Minimal Position Baseline & Pairs）**
+   - 建立单进单出的最小状态机（`interval` + `timeout` + `stop_loss`），提取交易对 `pairs`。
+   - **门禁**：交易笔数 $\ge 30$，盈亏比 $R > 1.5$，**安全边际 $\Delta W = W - \frac{1}{1+R} > +10\%$**。
+4. **阶段四：完整策略与组合回测（CzscStrategyBase & WeightBacktest）**
+   - 继承 `CzscStrategyBase` 封装策略，生成多标的持仓权重，调用 `WeightBacktest` 产出独立 HTML 报告。
+   - **门禁**：单标的 Sharpe $\ge 0.5$，多资产组合 Sharpe $\ge 1.0$，年化收益回撤比 $\ge 1.0$。
+5. **阶段五：边际优化与摩擦压力测试（Marginal Optimize & Friction Stress Test）**
+   - 增量优化 `opens`/`exits` 条件，扫描止损敏感性高原，进行 0~10 BP 滑点与手续费衰减测试。
+   - **门禁**：高摩擦（10 BP）下保持正收益，Sharpe 衰减 $< 60\%$。
+
 ### 自动研究脚本（`scripts/auto-czsc-quant/`）
 
 - 脚本级实验编排器，复用 CZSC 的 Position/Event 回测；运行入口、数据源和候选协议见该目录的 `README.md`
