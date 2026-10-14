@@ -297,7 +297,7 @@ def run_gate2_3d_complementarity_audit(
     port_sub = current_portfolio_w_30m[is_mask]
     gap_fill_pct = float(np.mean(np.abs(port_sub[active_cand]) <= 0.25) * 100.0) if np.sum(active_cand) > 0 else 0.0
 
-    # 无未来函数的空仓期/組合回撤期雪中送炭指标 (以时刻 t 已知的组合回撤状态或空仓状态为条件)
+    # 无未来函数的空仓期/组合回撤期雪中送炭指标 (以时刻 t 已知的组合回撤状态或空仓状态为条件)
     bar_ret = df_30m["close"].pct_change().fillna(0.0).values[is_mask]
     port_cum_nav = np.cumprod(1.0 + port_sub * bar_ret)
     port_peak = np.maximum.accumulate(port_cum_nav)
@@ -305,8 +305,12 @@ def run_gate2_3d_complementarity_audit(
 
     fwd_bar_ret = df_30m["close"].pct_change().shift(-1).fillna(0.0).values[is_mask]
     rescue_window_mask = ((np.abs(port_sub) <= 0.20) | (port_dd_state <= -0.015)) & active_cand
+    # 若主网格为 5m (约 78,672 根)，将单根 5m 救援超额折算为等效 30m 窗口 (×6) 以保持物理量纲一致
+    bp_scale = 6.0 if len(df_30m) > 40000 else 1.0
     if np.sum(rescue_window_mask) >= 5:
-        dd_rescue_alpha_bp = float(np.mean(c_sub[rescue_window_mask] * fwd_bar_ret[rescue_window_mask]) * 10000.0)
+        dd_rescue_alpha_bp = float(
+            np.mean(c_sub[rescue_window_mask] * fwd_bar_ret[rescue_window_mask]) * 10000.0 * bp_scale
+        )
     else:
         dd_rescue_alpha_bp = 0.0
 
@@ -329,50 +333,80 @@ def run_gate2_3d_complementarity_audit(
     }
 
 
-def map_tf_weight_to_30m_grid(
+TF_TO_5M_GROUP_SIZE: dict[str, int] = {
+    "1d": 48,
+    "60m": 12,
+    "30m": 6,
+    "15m": 3,
+    "5m": 1,
+}
+
+
+def map_tf_weight_to_5m_grid(
     df_source: pd.DataFrame,
     w_source: np.ndarray,
-    df_30m: pd.DataFrame,
+    df_target: pd.DataFrame,
     timeframe: str,
 ) -> np.ndarray:
     """
-    将任意周期 (1d / 60m / 30m / 15m / 5m) 的持仓权重无未来函数映射到 30m 主时间轴上：
-    - 30m: 直接返回
-    - 1d / 60m: 在收盘时刻 dt 对齐并向后 ffill
-    - 15m: 每个 30m K线由 2 根 15m K线组成，按索引分组取均值映射到对应 30m K线
-    - 5m: 每个 30m K线由 6 根 5m K线组成，取该 30m K线收盘时刻 (第6根5m) 的已知持仓状态以消除高频碎步换手磨损
+    将任意周期 (1d / 60m / 30m / 15m / 5m) 的持仓权重无未来函数、零延迟地映射到 5m 原生主时间轴上：
+    - 5m: 原生 1:1 即时生效，彻底消除旧版 30m 网格下采样导致的盘中持仓坍缩与最高 25 分钟入场延迟
+    - 15m / 30m / 60m / 1d: 严格在该周期 K 线收盘时刻 (即对应第 g 根 5m 收盘 dt) 生效，并向后阶梯保持 (Step-Hold ffill)
     """
-    if timeframe == "30m":
+    if timeframe not in TF_TO_5M_GROUP_SIZE:
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+    n_target = len(df_target)
+    g = TF_TO_5M_GROUP_SIZE[timeframe]
+    if g == 1 and len(w_source) == n_target:
         return w_source.copy()
-    elif timeframe in ("1d", "60m"):
-        s_src = pd.Series(w_source, index=df_source["dt"])
-        return df_30m["dt"].map(s_src).ffill().fillna(0.0).values
-    elif timeframe == "15m":
-        # 每 2 根 15m K 线精确对应 1 根 30m K 线
-        n30 = len(df_30m)
-        if len(w_source) == 2 * n30:
-            return 0.5 * (w_source[0::2] + w_source[1::2])
-        s_src = pd.Series(w_source, index=df_source["dt"])
-        return df_30m["dt"].map(s_src).ffill().fillna(0.0).values
-    elif timeframe == "5m":
-        n30 = len(df_30m)
-        if len(w_source) == 6 * n30:
-            return w_source[5::6].copy()
-        s_src = pd.Series(w_source, index=df_source["dt"])
-        return df_30m["dt"].map(s_src).ffill().fillna(0.0).values
-    raise ValueError(f"Unsupported timeframe: {timeframe}")
+    if len(w_source) * g == n_target:
+        out = np.zeros(n_target, dtype=np.float64)
+        out[g - 1 : -1] = np.repeat(w_source[:-1], g)
+        out[-1] = w_source[-1]
+        return out
+
+    s_src = pd.Series(w_source, index=df_source["dt"])
+    return df_target["dt"].map(s_src).ffill().fillna(0.0).values
+
+
+# 兼容旧函数名调用，自动对齐到传入的主时间轴 (5m 或 30m)
+map_tf_weight_to_30m_grid = map_tf_weight_to_5m_grid
+
+
+def apply_rebalance_deadzone(w: np.ndarray, deadzone: float = 0.06) -> np.ndarray:
+    """
+    最小调仓死区滤波器 (Rebalance Deadzone Filter)：
+    - 当目标仓位归零 (|target| < 1e-4) 或多空方向反转 (cur * target < 0) 时，立即无延迟执行；
+    - 当同向微调幅度 |target - cur| < deadzone 时，保持原持仓不变，消除 5m 主网格上的碎步换手磨损。
+    """
+    if deadzone <= 0.0:
+        return w
+    out = np.empty_like(w)
+    cur = 0.0
+    for i in range(len(w)):
+        target = w[i]
+        if abs(target) < 1e-4:
+            cur = 0.0
+        elif cur * target < 0.0 or abs(target - cur) >= deadzone:
+            cur = target
+        out[i] = cur
+    return out
 
 
 def synthesize_atomic_units_portfolio(
-    df_30m: pd.DataFrame,
-    unit_weights_on_30m: dict[str, np.ndarray],
+    df_grid: pd.DataFrame,
+    unit_weights_on_grid: dict[str, np.ndarray],
     unit_alloc_map: dict[str, float],
+    rebalance_deadzone: float = 0.06,
 ) -> np.ndarray:
     """
-    按原子单元 (sig_id@tf) 独立合成五周期复合持仓权重：
-    先在各周期层内部 (1d, 60m, 30m, 15m, 5m) 聚合截断，再按五周期分形共振系数叠加。
+    按原子单元 (sig_id@tf) 在 5m 原生主时间轴上独立合成五周期复合持仓权重：
+    1. 先在各周期层内部 (1d, 60m, 30m, 15m, 5m) 聚合截断；
+    2. 按五周期分形共振系数叠加 (0.65*w1d + 0.55*w60 + 0.45*w30 + 0.35*w15 + 0.25*w5)；
+    3. 施加最小调仓死区 (rebalance_deadzone=0.06)，在保留 5m/15m 盘中零延迟爆发力的同时滤除碎步换手。
     """
-    n = len(df_30m)
+    n = len(df_grid)
     w_by_tf = {
         "1d": np.zeros(n, dtype=np.float64),
         "60m": np.zeros(n, dtype=np.float64),
@@ -383,7 +417,7 @@ def synthesize_atomic_units_portfolio(
 
     for unit_id, coeff in unit_alloc_map.items():
         tf = unit_id.split("@")[1]
-        w_by_tf[tf] += coeff * unit_weights_on_30m[unit_id]
+        w_by_tf[tf] += coeff * unit_weights_on_grid[unit_id]
 
     w1d = np.clip(w_by_tf["1d"], -1.0, 1.0)
     w60 = np.clip(w_by_tf["60m"], -1.0, 1.0)
@@ -392,7 +426,7 @@ def synthesize_atomic_units_portfolio(
     w5 = np.clip(w_by_tf["5m"], -1.0, 1.0)
 
     w_multi = np.clip(0.65 * w1d + 0.55 * w60 + 0.45 * w30 + 0.35 * w15 + 0.25 * w5, -1.0, 1.0)
-    return w_multi
+    return apply_rebalance_deadzone(w_multi, deadzone=rebalance_deadzone)
 
 
 def count_round_trips(w: np.ndarray) -> tuple[int, int, int]:

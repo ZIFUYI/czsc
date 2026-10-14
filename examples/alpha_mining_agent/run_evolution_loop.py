@@ -31,6 +31,7 @@ from plotly.subplots import make_subplots
 from examples.alpha_mining_agent.forensic_pipeline import (
     IS_END_DT,
     backtest_slice,
+    map_tf_weight_to_5m_grid,
     map_tf_weight_to_30m_grid,
     run_gate1_forensic_audit,
     run_gate2_3d_complementarity_audit,
@@ -367,6 +368,16 @@ def main() -> None:
     parser.add_argument(
         "--reset", action="store_true", help="清空历史账本，从基石种子开始重新运行完整 4×5 全周期生态位进化循环"
     )
+    parser.add_argument(
+        "--refresh-grid",
+        action="store_true",
+        help="在原生 5m 主执行时间轴 (零延迟映射 + 0.06 调仓死区) 上重算并同步 Step 0~N 全量进化账本与大屏",
+    )
+    parser.add_argument(
+        "--prune-and-replace",
+        action="store_true",
+        help="执行 LOO 后向修剪去冗余 + MAP-Elites 同生态位精英竞争替换与空位锦标赛补入",
+    )
     parser.add_argument("--max-candidates", type=int, default=999, help="本轮最多测试多少个原子候选单元")
     parser.add_argument("--status-only", action="store_true", help="仅打印当前持久态信号库与 4×5 全周期生态位矩阵")
     args = parser.parse_args()
@@ -386,13 +397,16 @@ def main() -> None:
     print("=" * 125)
     print("  【159915 4×5 全周期生态位矩阵 · 长期自主信号挖掘与多方向正交进化 Agent】")
     print("  四大战略方向 (趋势突破 / 背驰反转 / 震荡回归 / 日内微结构) × 五级独立周期 (1d / 60m / 30m / 15m / 5m)")
+    print("  [主时间轴] 原生 5m 无未来函数阶梯对齐网格 (消除 15m/5m 下采样坍缩与延迟 + 0.06 最小调仓死区)")
     print("=" * 125)
 
     tf_dfs = load_all_four_timeframes(REAL_5M_CSV)
-    df_1d, df_30m = tf_dfs["1d"], tf_dfs["30m"]
+    df_1d = tf_dfs["1d"]
+    # 将主回测与合成网格下沉至原生 5m 时间轴 (保持变量名 df_30m 兼容后续调用)
+    df_30m = tf_dfs["5m"]
     rng = np.random.default_rng(42)
 
-    # 预计算所有 (sig_id, tf) 原子单元在自身周期上的触发序列，以及映射到 30m 主时间轴上的持仓序列
+    # 预计算所有 (sig_id, tf) 原子单元在自身周期上的触发序列，以及无延迟映射到 5m 主时间轴上的持仓序列
     trig_by_unit: dict[str, np.ndarray] = {}
     w_on_30m_by_unit: dict[str, np.ndarray] = {}
 
@@ -401,7 +415,7 @@ def main() -> None:
             unit_id = f"{sid}@{tf}"
             t_arr, w_arr = compute_signal_triggers_and_weights(tf_dfs[tf], sid, scale=TF_SCALE_MAP[tf])
             trig_by_unit[unit_id] = t_arr
-            w_on_30m_by_unit[unit_id] = map_tf_weight_to_30m_grid(tf_dfs[tf], w_arr, df_30m, tf)
+            w_on_30m_by_unit[unit_id] = map_tf_weight_to_5m_grid(tf_dfs[tf], w_arr, df_30m, tf)
 
     # 1. 初始化 5 个基石信号在 (1d, 60m, 30m) 上的 15 个种子原子单元
     zoo = ledger.load_signal_zoo()
@@ -446,6 +460,96 @@ def main() -> None:
     w_base_multi = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, base_alloc)
     base_eval = evaluate_full_is_oos(df_30m, w_base_multi)
 
+    if args.refresh_grid and zoo:
+        print("\n[刷新主网格账本] 正在基于原生 5m 主执行网格重算 Step 0 ~ Step N 全量轨迹与互补指标 ...")
+        if ledger.history_path.exists():
+            ledger.history_path.unlink()
+        step_alloc = dict(base_alloc)
+        w_step_multi = w_base_multi.copy()
+        step_eval = base_eval
+        ledger.log_evolution_step(
+            {
+                "step": 0,
+                "added_unit": "Base5_基石五真金(仅突破簇)",
+                "archetype": "A_顺势突破簇",
+                "timeframe": "1d/60m/30m",
+                "zoo_size": len(step_alloc),
+                "full_trades": step_eval["full"]["trades"],
+                "trades_per_yr": round(step_eval["full"]["trades"] / 6.77, 1),
+                "full_active_pct": step_eval["full"]["active_pct"],
+                "is_sharpe": step_eval["is"]["sharpe"],
+                "is_calmar": step_eval["is"]["calmar"],
+                "oos_cum_ret_pct": step_eval["oos"]["cum_ret_pct"],
+                "oos_ann_ret_pct": step_eval["oos"]["ann_ret_pct"],
+                "oos_sharpe": step_eval["oos"]["sharpe"],
+                "oos_calmar": step_eval["oos"]["calmar"],
+                "full_cum_ret_pct": step_eval["full"]["cum_ret_pct"],
+                "full_ann_ret_pct": step_eval["full"]["ann_ret_pct"],
+                "full_sharpe": step_eval["full"]["sharpe"],
+                "full_mdd_pct": step_eval["full"]["mdd_pct"],
+                "full_calmar": step_eval["full"]["calmar"],
+            }
+        )
+        new_uids = [uid for uid, info in zoo.items() if not info["is_base_seed"]]
+        for s_idx, uid in enumerate(new_uids, start=1):
+            info = zoo[uid]
+            sid, tf = uid.split("@")
+            spec = ALL_SIGNAL_SPECS[sid]
+            ruler = ARCHETYPE_RULERS[spec.archetype]
+            same_dir_peers = {
+                p_uid: w_on_30m_by_unit[p_uid]
+                for p_uid in step_alloc
+                if int(zoo[p_uid]["direction"]) == int(info["direction"])
+            }
+            g2_ref = run_gate2_3d_complementarity_audit(
+                df_30m,
+                w_on_30m_by_unit[uid],
+                same_dir_peers,
+                w_step_multi,
+                archetype=spec.archetype,
+                current_archetype_new_count=0,
+                ruler=ruler,
+            )
+            prev_is_sh = step_eval["is"]["sharpe"]
+            prev_is_cal = step_eval["is"]["calmar"]
+
+            step_alloc[uid] = float(info["weight_alloc"])
+            w_step_multi = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, step_alloc)
+            step_eval = evaluate_full_is_oos(df_30m, w_step_multi)
+
+            info["max_corr_with_zoo"] = g2_ref["max_corr"]
+            info["max_corr_peer"] = g2_ref["max_corr_peer"]
+            info["gap_fill_ratio_pct"] = g2_ref["gap_fill_ratio_pct"]
+            info["dd_rescue_alpha_bp"] = g2_ref["dd_rescue_alpha_bp"]
+            info["marginal_sharpe_delta"] = round(step_eval["is"]["sharpe"] - prev_is_sh, 3)
+            info["marginal_calmar_delta"] = round(step_eval["is"]["calmar"] - prev_is_cal, 3)
+            ledger.save_signal_to_zoo(AdmittedSignalRecord(**info))
+
+            step_payload = {
+                "step": s_idx,
+                "added_unit": f"{spec.name}@{tf}",
+                "archetype": spec.archetype,
+                "timeframe": tf,
+                "zoo_size": len(step_alloc),
+                "full_trades": step_eval["full"]["trades"],
+                "trades_per_yr": round(step_eval["full"]["trades"] / 6.77, 1),
+                "full_active_pct": step_eval["full"]["active_pct"],
+                "is_sharpe": step_eval["is"]["sharpe"],
+                "is_calmar": step_eval["is"]["calmar"],
+                "oos_cum_ret_pct": step_eval["oos"]["cum_ret_pct"],
+                "oos_ann_ret_pct": step_eval["oos"]["ann_ret_pct"],
+                "oos_sharpe": step_eval["oos"]["sharpe"],
+                "oos_calmar": step_eval["oos"]["calmar"],
+                "full_cum_ret_pct": step_eval["full"]["cum_ret_pct"],
+                "full_ann_ret_pct": step_eval["full"]["ann_ret_pct"],
+                "full_sharpe": step_eval["full"]["sharpe"],
+                "full_mdd_pct": step_eval["full"]["mdd_pct"],
+                "full_calmar": step_eval["full"]["calmar"],
+            }
+            ledger.log_evolution_step(step_payload)
+            ledger.save_champion_portfolio({"alloc_map": step_alloc, "metrics_summary": step_payload})
+        zoo = ledger.load_signal_zoo()
+
     current_alloc = {uid: float(info["weight_alloc"]) for uid, info in zoo.items()}
     w_curr_multi = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, current_alloc)
     curr_eval = evaluate_full_is_oos(df_30m, w_curr_multi)
@@ -486,7 +590,7 @@ def main() -> None:
     atomic_candidates = atomic_candidates[: args.max_candidates]
 
     print(
-        f"\n[启动 4×4 生态位进化循环] 待检验原子候选单元 (sig@tf): {len(atomic_candidates)} 个 | "
+        f"\n[启动 4×5 生态位进化循环] 待检验原子候选单元 (sig@tf): {len(atomic_candidates)} 个 | "
         f"当前基线: 交易 {curr_eval['full']['trades']} 笔, 全周期收益 {curr_eval['full']['cum_ret_pct']:+.2f}%, "
         f"样本外收益 {curr_eval['oos']['cum_ret_pct']:+.2f}%"
     )
@@ -721,6 +825,356 @@ def main() -> None:
             f"-> 总笔数={curr_eval['full']['trades']}, 全周期={curr_eval['full']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['full']['sharpe']:.2f}), "
             f"样本外={curr_eval['oos']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['oos']['sharpe']:.2f})"
         )
+
+    # 3. 执行 LOO 后向修剪去冗余 + MAP-Elites 同生态位精英竞争替换与空位锦标赛补入
+    if args.prune_and_replace and zoo:
+        print("\n" + "=" * 125)
+        print("  [启动架构精炼] Phase 1: LOO 后向消融去冗余 | Phase 2: MAP-Elites 同生态位精英替换与锦标赛补位")
+        print("=" * 125)
+
+        def _calc_is_obj(ev: dict) -> float:
+            return ev["is"]["ann_ret_pct"] * 0.15 + ev["is"]["sharpe"] * 1.0 + ev["is"]["calmar"] * 0.4
+
+        pruned_uids: set[str] = set()
+        # --- Phase 1: 严格样本内 (2020-2023 IS) 迭代 LOO 后向修剪 ---
+        while True:
+            cur_obj = _calc_is_obj(curr_eval)
+            worst_uid = None
+            worst_contrib = 0.0
+            best_without_ev = None
+            best_without_w = None
+
+            for uid in [u for u, inf in zoo.items() if not inf["is_base_seed"]]:
+                t_alloc = {k: v for k, v in current_alloc.items() if k != uid}
+                w_t = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, t_alloc)
+                ev_t = evaluate_full_is_oos(df_30m, w_t)
+                c_obj = cur_obj - _calc_is_obj(ev_t)
+                c_ret = curr_eval["is"]["cum_ret_pct"] - ev_t["is"]["cum_ret_pct"]
+                c_sh = curr_eval["is"]["sharpe"] - ev_t["is"]["sharpe"]
+                if c_obj <= -0.05 and c_sh < 0 and c_ret <= 0.05:
+                    if c_obj < worst_contrib:
+                        worst_contrib = c_obj
+                        worst_uid = uid
+                        best_without_ev = ev_t
+                        best_without_w = w_t
+
+            if worst_uid is None:
+                break
+
+            rm_info = ledger.remove_signal_from_zoo(worst_uid)
+            zoo = ledger.load_signal_zoo()
+            del current_alloc[worst_uid]
+            w_curr_multi = best_without_w
+            curr_eval = best_without_ev
+            pruned_uids.add(worst_uid)
+            step_counter += 1
+
+            ledger.bury_rejected_signal(
+                worst_uid,
+                rm_info["sig_id"],
+                rm_info["timeframe"],
+                rm_info["name"],
+                rm_info["archetype"],
+                int(rm_info["direction"]),
+                failed_gate="LOO 后向消融修剪关",
+                reason=f"拔除后样本内综合得分提升 {-worst_contrib:+.4f}，消除跨轮次冗余",
+                metrics={"loo_contrib_is_obj": round(worst_contrib, 4)},
+            )
+            step_payload = {
+                "step": step_counter,
+                "added_unit": f"✂剔除冗余_{worst_uid}",
+                "archetype": rm_info["archetype"],
+                "timeframe": rm_info["timeframe"],
+                "zoo_size": len(current_alloc),
+                "full_trades": curr_eval["full"]["trades"],
+                "trades_per_yr": round(curr_eval["full"]["trades"] / 6.77, 1),
+                "full_active_pct": curr_eval["full"]["active_pct"],
+                "is_sharpe": curr_eval["is"]["sharpe"],
+                "is_calmar": curr_eval["is"]["calmar"],
+                "oos_cum_ret_pct": curr_eval["oos"]["cum_ret_pct"],
+                "oos_ann_ret_pct": curr_eval["oos"]["ann_ret_pct"],
+                "oos_sharpe": curr_eval["oos"]["sharpe"],
+                "oos_calmar": curr_eval["oos"]["calmar"],
+                "full_cum_ret_pct": curr_eval["full"]["cum_ret_pct"],
+                "full_ann_ret_pct": curr_eval["full"]["ann_ret_pct"],
+                "full_sharpe": curr_eval["full"]["sharpe"],
+                "full_mdd_pct": curr_eval["full"]["mdd_pct"],
+                "full_calmar": curr_eval["full"]["calmar"],
+            }
+            ledger.log_evolution_step(step_payload)
+            ledger.save_champion_portfolio({"alloc_map": current_alloc, "metrics_summary": step_payload})
+            print(
+                f"  [✂ LOO修剪 Step {step_counter:02d}] 拔除冗余单元 {worst_uid} ({rm_info['archetype']}) | "
+                f"IS得分净增={-worst_contrib:+.4f} -> IS夏普={curr_eval['is']['sharpe']:.2f}, "
+                f"全周期={curr_eval['full']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['full']['sharpe']:.2f}), "
+                f"样本外={curr_eval['oos']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['oos']['sharpe']:.2f})"
+            )
+
+        # --- Phase 2: MAP-Elites 同生态位 1-for-1 精英竞争替换与空位锦标赛补入 ---
+        challengers: list[tuple[str, Any, str, dict]] = []
+        for spec in CANDIDATE_HYPOTHESIS_POOL:
+            ruler = ARCHETYPE_RULERS[spec.archetype]
+            for tf in spec.eligible_tfs:
+                uid = f"{spec.sig_id}@{tf}"
+                if uid in zoo or uid in pruned_uids:
+                    continue
+                g1 = run_gate1_forensic_audit(tf_dfs[tf], trig_by_unit[uid], spec.direction, ruler, tf, rng)
+                if g1["passed"] and g1["is_n_purged"] >= 80:
+                    challengers.append((uid, spec, tf, g1))
+
+        # 按样本深度对数 × 样本内安全垫进行锦标赛种子排序 (完全无样本外信息泄露)
+        challengers.sort(key=lambda x: np.log(x[3]["is_n_purged"]) * x[3]["is_safety_margin_pct"], reverse=True)
+
+        for cand_uid, spec, tf, g1 in challengers:
+            if cand_uid in zoo:
+                continue
+            ruler = ARCHETYPE_RULERS[spec.archetype]
+            arch_new_uids = [
+                u for u, inf in zoo.items() if inf["archetype"] == spec.archetype and not inf["is_base_seed"]
+            ]
+            same_dir_new_uids = [u for u in arch_new_uids if int(zoo[u]["direction"]) == spec.direction]
+            max_same_dir = max(4, (ruler.quota_max_units + 1) // 2)
+            has_open_slot = len(arch_new_uids) < ruler.quota_max_units and len(same_dir_new_uids) < max_same_dir
+
+            if has_open_slot:
+                same_dir_zoo_w = {
+                    z_uid: w_on_30m_by_unit[z_uid]
+                    for z_uid, z_info in zoo.items()
+                    if int(z_info["direction"]) == spec.direction
+                }
+                g2 = run_gate2_3d_complementarity_audit(
+                    df_30m,
+                    w_on_30m_by_unit[cand_uid],
+                    same_dir_zoo_w,
+                    w_curr_multi,
+                    archetype=spec.archetype,
+                    current_archetype_new_count=len(arch_new_uids),
+                    ruler=ruler,
+                    current_arch_same_dir_new_count=len(same_dir_new_uids),
+                )
+                if not g2["passed"]:
+                    continue
+
+                best_cw = spec.default_weight
+                best_ev = None
+                best_w = None
+                best_d_obj = -999.0
+                best_rank_score = -999.0
+                for cw in (0.28, 0.40, 0.52) if tf == "5m" else (0.20, 0.28, 0.36):
+                    t_alloc = dict(current_alloc)
+                    t_alloc[cand_uid] = cw
+                    w_t = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, t_alloc)
+                    ev_t = evaluate_full_is_oos(df_30m, w_t)
+                    d_obj = _calc_is_obj(ev_t) - _calc_is_obj(curr_eval)
+                    d_ret_is = ev_t["is"]["cum_ret_pct"] - curr_eval["is"]["cum_ret_pct"]
+                    d_mdd_is = ev_t["is"]["mdd_pct"] - curr_eval["is"]["mdd_pct"]
+                    if d_obj >= 0.03 and d_ret_is >= 0.50 and d_mdd_is <= 0.15:
+                        rk = d_obj + 0.05 * d_ret_is
+                        if rk > best_rank_score:
+                            best_rank_score = rk
+                            best_d_obj = d_obj
+                            best_cw = cw
+                            best_ev = ev_t
+                            best_w = w_t
+
+                if best_ev is not None:
+                    prev_is_sh = curr_eval["is"]["sharpe"]
+                    prev_is_cal = curr_eval["is"]["calmar"]
+                    current_alloc[cand_uid] = best_cw
+                    w_curr_multi = best_w
+                    curr_eval = best_ev
+                    step_counter += 1
+
+                    admitted_rec = AdmittedSignalRecord(
+                        unit_id=cand_uid,
+                        sig_id=spec.sig_id,
+                        timeframe=tf,
+                        name=f"{spec.name}@{tf}",
+                        archetype=spec.archetype,
+                        ruler_desc=ruler.ruler_name,
+                        direction=spec.direction,
+                        weight_alloc=best_cw,
+                        is_base_seed=False,
+                        is_n_purged=g1["is_n_purged"],
+                        is_mean_pct=g1["is_mean_pct"],
+                        is_excess_alpha_pct=g1["is_excess_alpha_pct"],
+                        is_win_rate_pct=g1["is_win_rate_pct"],
+                        is_pl_ratio=g1["is_pl_ratio"],
+                        is_safety_margin_pct=g1["is_safety_margin_pct"],
+                        is_boot_pval=g1["is_boot_pval"],
+                        max_corr_with_zoo=g2["max_corr"],
+                        max_corr_peer=g2["max_corr_peer"],
+                        gap_fill_ratio_pct=g2["gap_fill_ratio_pct"],
+                        dd_rescue_alpha_bp=g2["dd_rescue_alpha_bp"],
+                        marginal_sharpe_delta=round(curr_eval["is"]["sharpe"] - prev_is_sh, 3),
+                        marginal_calmar_delta=round(curr_eval["is"]["calmar"] - prev_is_cal, 3),
+                        oos_mean_pct=g1["oos_mean_pct"],
+                        oos_excess_alpha_pct=g1["oos_excess_alpha_pct"],
+                        oos_safety_margin_pct=g1["oos_safety_margin_pct"],
+                    )
+                    ledger.save_signal_to_zoo(admitted_rec)
+                    zoo = ledger.load_signal_zoo()
+
+                    step_payload = {
+                        "step": step_counter,
+                        "added_unit": f"{spec.name}@{tf}",
+                        "archetype": spec.archetype,
+                        "timeframe": tf,
+                        "zoo_size": len(current_alloc),
+                        "full_trades": curr_eval["full"]["trades"],
+                        "trades_per_yr": round(curr_eval["full"]["trades"] / 6.77, 1),
+                        "full_active_pct": curr_eval["full"]["active_pct"],
+                        "is_sharpe": curr_eval["is"]["sharpe"],
+                        "is_calmar": curr_eval["is"]["calmar"],
+                        "oos_cum_ret_pct": curr_eval["oos"]["cum_ret_pct"],
+                        "oos_ann_ret_pct": curr_eval["oos"]["ann_ret_pct"],
+                        "oos_sharpe": curr_eval["oos"]["sharpe"],
+                        "oos_calmar": curr_eval["oos"]["calmar"],
+                        "full_cum_ret_pct": curr_eval["full"]["cum_ret_pct"],
+                        "full_ann_ret_pct": curr_eval["full"]["ann_ret_pct"],
+                        "full_sharpe": curr_eval["full"]["sharpe"],
+                        "full_mdd_pct": curr_eval["full"]["mdd_pct"],
+                        "full_calmar": curr_eval["full"]["calmar"],
+                    }
+                    ledger.log_evolution_step(step_payload)
+                    ledger.save_champion_portfolio({"alloc_map": current_alloc, "metrics_summary": step_payload})
+                    print(
+                        f"  [★ 锦标赛补位 Step {step_counter:02d}] [{spec.archetype} | {tf:3s}] {spec.name}@{tf} 入库! "
+                        f"| dIS_Obj={best_d_obj:+.4f} -> 总笔数={curr_eval['full']['trades']}, "
+                        f"全周期={curr_eval['full']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['full']['sharpe']:.2f}, 卡玛 {curr_eval['full']['calmar']:.2f}), "
+                        f"样本外={curr_eval['oos']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['oos']['sharpe']:.2f})"
+                    )
+            else:
+                # 生态位已满：检验同生态位 1-for-1 精英竞争替换 (要求挑战者样本量 >= 2倍被替换者，且替换后显著提升 IS 表现)
+                best_inc = None
+                best_cw = spec.default_weight
+                best_ev = None
+                best_w = None
+                best_g2 = None
+                best_d_obj = 0.0
+                for inc_uid in same_dir_new_uids:
+                    inc_n = int(zoo[inc_uid].get("is_n_purged", 999))
+                    if g1["is_n_purged"] < 2 * inc_n:
+                        continue
+                    same_dir_zoo_w = {
+                        z_uid: w_on_30m_by_unit[z_uid]
+                        for z_uid, z_info in zoo.items()
+                        if int(z_info["direction"]) == spec.direction and z_uid != inc_uid
+                    }
+                    alloc_no_inc = {k: v for k, v in current_alloc.items() if k != inc_uid}
+                    w_no_inc = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, alloc_no_inc)
+                    g2 = run_gate2_3d_complementarity_audit(
+                        df_30m,
+                        w_on_30m_by_unit[cand_uid],
+                        same_dir_zoo_w,
+                        w_no_inc,
+                        archetype=spec.archetype,
+                        current_archetype_new_count=len(arch_new_uids) - 1,
+                        ruler=ruler,
+                        current_arch_same_dir_new_count=len(same_dir_new_uids) - 1,
+                    )
+                    if not g2["passed"]:
+                        continue
+
+                    for cw in (0.28, 0.40, 0.52) if tf == "5m" else (0.20, 0.28, 0.36):
+                        t_alloc = dict(alloc_no_inc)
+                        t_alloc[cand_uid] = cw
+                        w_t = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, t_alloc)
+                        ev_t = evaluate_full_is_oos(df_30m, w_t)
+                        d_obj = _calc_is_obj(ev_t) - _calc_is_obj(curr_eval)
+                        d_ret_is = ev_t["is"]["cum_ret_pct"] - curr_eval["is"]["cum_ret_pct"]
+                        d_mdd_is = ev_t["is"]["mdd_pct"] - curr_eval["is"]["mdd_pct"]
+                        if d_obj > best_d_obj and d_ret_is >= 0.40 and d_mdd_is <= 0.15:
+                            best_d_obj = d_obj
+                            best_inc = inc_uid
+                            best_cw = cw
+                            best_ev = ev_t
+                            best_w = w_t
+                            best_g2 = g2
+
+                if best_inc is not None:
+                    prev_is_sh = curr_eval["is"]["sharpe"]
+                    prev_is_cal = curr_eval["is"]["calmar"]
+                    rm_inc = ledger.remove_signal_from_zoo(best_inc)
+                    del current_alloc[best_inc]
+                    pruned_uids.add(best_inc)
+
+                    current_alloc[cand_uid] = best_cw
+                    w_curr_multi = best_w
+                    curr_eval = best_ev
+                    step_counter += 1
+
+                    ledger.bury_rejected_signal(
+                        best_inc,
+                        rm_inc["sig_id"],
+                        rm_inc["timeframe"],
+                        rm_inc["name"],
+                        rm_inc["archetype"],
+                        int(rm_inc["direction"]),
+                        failed_gate="MAP-Elites 同生态位精英替换关",
+                        reason=f"被同生态位大样本优胜挑战者 {cand_uid} 替换 (dIS_Obj={best_d_obj:+.4f})",
+                        metrics={"replaced_by": cand_uid, "swap_d_is_obj": round(best_d_obj, 4)},
+                    )
+
+                    admitted_rec = AdmittedSignalRecord(
+                        unit_id=cand_uid,
+                        sig_id=spec.sig_id,
+                        timeframe=tf,
+                        name=f"{spec.name}@{tf}",
+                        archetype=spec.archetype,
+                        ruler_desc=ruler.ruler_name,
+                        direction=spec.direction,
+                        weight_alloc=best_cw,
+                        is_base_seed=False,
+                        is_n_purged=g1["is_n_purged"],
+                        is_mean_pct=g1["is_mean_pct"],
+                        is_excess_alpha_pct=g1["is_excess_alpha_pct"],
+                        is_win_rate_pct=g1["is_win_rate_pct"],
+                        is_pl_ratio=g1["is_pl_ratio"],
+                        is_safety_margin_pct=g1["is_safety_margin_pct"],
+                        is_boot_pval=g1["is_boot_pval"],
+                        max_corr_with_zoo=best_g2["max_corr"],
+                        max_corr_peer=best_g2["max_corr_peer"],
+                        gap_fill_ratio_pct=best_g2["gap_fill_ratio_pct"],
+                        dd_rescue_alpha_bp=best_g2["dd_rescue_alpha_bp"],
+                        marginal_sharpe_delta=round(curr_eval["is"]["sharpe"] - prev_is_sh, 3),
+                        marginal_calmar_delta=round(curr_eval["is"]["calmar"] - prev_is_cal, 3),
+                        oos_mean_pct=g1["oos_mean_pct"],
+                        oos_excess_alpha_pct=g1["oos_excess_alpha_pct"],
+                        oos_safety_margin_pct=g1["oos_safety_margin_pct"],
+                    )
+                    ledger.save_signal_to_zoo(admitted_rec)
+                    zoo = ledger.load_signal_zoo()
+
+                    step_payload = {
+                        "step": step_counter,
+                        "added_unit": f"⚔{spec.name}@{tf}(替{best_inc})",
+                        "archetype": spec.archetype,
+                        "timeframe": tf,
+                        "zoo_size": len(current_alloc),
+                        "full_trades": curr_eval["full"]["trades"],
+                        "trades_per_yr": round(curr_eval["full"]["trades"] / 6.77, 1),
+                        "full_active_pct": curr_eval["full"]["active_pct"],
+                        "is_sharpe": curr_eval["is"]["sharpe"],
+                        "is_calmar": curr_eval["is"]["calmar"],
+                        "oos_cum_ret_pct": curr_eval["oos"]["cum_ret_pct"],
+                        "oos_ann_ret_pct": curr_eval["oos"]["ann_ret_pct"],
+                        "oos_sharpe": curr_eval["oos"]["sharpe"],
+                        "oos_calmar": curr_eval["oos"]["calmar"],
+                        "full_cum_ret_pct": curr_eval["full"]["cum_ret_pct"],
+                        "full_ann_ret_pct": curr_eval["full"]["ann_ret_pct"],
+                        "full_sharpe": curr_eval["full"]["sharpe"],
+                        "full_mdd_pct": curr_eval["full"]["mdd_pct"],
+                        "full_calmar": curr_eval["full"]["calmar"],
+                    }
+                    ledger.log_evolution_step(step_payload)
+                    ledger.save_champion_portfolio({"alloc_map": current_alloc, "metrics_summary": step_payload})
+                    print(
+                        f"  [⚔ 精英替换 Step {step_counter:02d}] [{spec.archetype} | {tf:3s}] {cand_uid} 击败并替换 {best_inc}! "
+                        f"| dIS_Obj={best_d_obj:+.4f} -> 总笔数={curr_eval['full']['trades']}, "
+                        f"全周期={curr_eval['full']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['full']['sharpe']:.2f}, 卡玛 {curr_eval['full']['calmar']:.2f}), "
+                        f"样本外={curr_eval['oos']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['oos']['sharpe']:.2f})"
+                    )
 
     niche_df = build_niche_matrix_summary(zoo)
     ledger.save_niche_matrix(niche_df.to_dict(orient="records"))

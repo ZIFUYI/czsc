@@ -93,6 +93,14 @@ class AgentStateLedger:
         with open(self.zoo_path, "w", encoding="utf-8") as f:
             json.dump(zoo, f, ensure_ascii=False, indent=2)
 
+    def remove_signal_from_zoo(self, unit_id: str) -> dict[str, Any] | None:
+        zoo = self.load_signal_zoo()
+        removed = zoo.pop(unit_id, None)
+        if removed is not None:
+            with open(self.zoo_path, "w", encoding="utf-8") as f:
+                json.dump(zoo, f, ensure_ascii=False, indent=2)
+        return removed
+
     def save_niche_matrix(self, matrix_data: dict[str, Any]) -> None:
         with open(self.niche_path, "w", encoding="utf-8") as f:
             json.dump(matrix_data, f, ensure_ascii=False, indent=2)
