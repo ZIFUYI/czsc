@@ -86,19 +86,56 @@ def analyze_state_distribution(sigs_df: pd.DataFrame, sig_col: str) -> pd.DataFr
     return summary
 
 
-def run_event_study(sigs_df: pd.DataFrame, horizons: list[int] | None = None) -> dict:
-    """事件研究法（Event Study）：检验首次看多/看空后的未来累计收益率。
+def _purge_indices(indices: np.ndarray, cooldown: int) -> np.ndarray:
+    """剔除持有窗口重叠的触发点（Purged Non-Overlapping Sampling）。"""
+    selected = []
+    last_idx = -999999
+    for idx in indices:
+        if idx >= last_idx + cooldown:
+            selected.append(idx)
+            last_idx = idx
+    return np.array(selected, dtype=int)
 
-    首发触发点定义：
-    - 多头首发：前一根状态 != '看多' 且 当前状态 == '看多'
-    - 空头首发：前一根状态 != '看空' 且 当前状态 == '看空'
+
+def _newey_west_tstat(x: np.ndarray, max_lags: int = 5) -> tuple[float, float]:
+    """Newey-West HAC 自相关与异方差稳健 t 统计量及双侧 p 值。"""
+    n = len(x)
+    if n < 5:
+        return 0.0, 1.0
+    mean = float(np.mean(x))
+    u = x - mean
+    gamma0 = float(np.dot(u, u) / n)
+    var_hac = gamma0
+    lags = min(max_lags, n - 1)
+    for lag in range(1, lags + 1):
+        w = 1.0 - lag / (lags + 1.0)
+        cov = float(np.dot(u[lag:], u[:-lag]) / n)
+        var_hac += 2.0 * w * cov
+    var_hac = max(var_hac, 1e-12)
+    se_hac = np.sqrt(var_hac / n)
+    t_val = mean / se_hac
+    p_val = float(2.0 * (1.0 - stats.t.cdf(abs(t_val), df=n - 1)))
+    return t_val, p_val
+
+
+def run_event_study(
+    sigs_df: pd.DataFrame,
+    horizons: list[int] | None = None,
+    fee_bp: float = 2.0,
+) -> dict:
+    """事件研究法（Event Study，法医级修复版）：
+    1. 实战次根开盘成交（Open[t+1] 进 -> Open[t+1+h] 出）并扣除双边成本 fee_bp
+    2. Purged 非重叠去重抽样 + Newey-West HAC 稳健 p 值（消除重叠样本伪显著）
+    3. 扣除同期全市场无条件漂移（Benchmark Drift），计算纯粹超额 Alpha(BP)
+    4. 统计持仓期最大有利/不利偏离（MFE/MAE 比），避免固定跨度路径盲区
     """
     if horizons is None:
         horizons = [1, 2, 3, 5, 8, 10, 15, 20]
 
     df = sigs_df.copy()
     df["dt"] = pd.to_datetime(df["dt"])
-    df["close"] = df["close"].astype(float)
+    for col in ("open", "high", "low", "close"):
+        df[col] = df[col].astype(float)
     df = df.sort_values("dt").reset_index(drop=True)
 
     # 标记首发触发点（First Entry Trigger）
@@ -106,47 +143,80 @@ def run_event_study(sigs_df: pd.DataFrame, horizons: list[int] | None = None) ->
     df["is_long_trigger"] = (df["state"] == "看多") & (df["prev_state"] != "看多")
     df["is_short_trigger"] = (df["state"] == "看空") & (df["prev_state"] != "看空")
 
-    close = df["close"].values.astype(np.float64)
+    opn = df["open"].values.astype(np.float64)
+    high = df["high"].values.astype(np.float64)
+    low = df["low"].values.astype(np.float64)
     n = len(df)
 
-    # 计算各周期的未来收益率（基点 BP）
+    # 计算次根开盘进场的未来收益率（Open[t+1] -> Open[t+1+h]，单位 BP）
     for h in horizons:
         ret_forward = np.full(n, np.nan)
-        ret_forward[:-h] = (close[h:] / close[:-h] - 1.0) * 10000.0
+        if n > h + 1:
+            ret_forward[: n - h - 1] = (opn[1 + h :] / opn[1:-h] - 1.0) * 10000.0
         df[f"fwd_ret_{h}"] = ret_forward
 
     results = {}
-    for event_type, mask in [("多头首发触发", df["is_long_trigger"]), ("空头首发触发", df["is_short_trigger"])]:
-        event_df = df[mask].copy()
-        event_count = len(event_df)
+    for event_type, mask, direction in [
+        ("多头首发触发", df["is_long_trigger"], 1),
+        ("空头首发触发", df["is_short_trigger"], -1),
+    ]:
+        raw_indices = np.where(mask.values)[0]
+        event_count = len(raw_indices)
 
         stats_list = []
         for h in horizons:
-            rets = event_df[f"fwd_ret_{h}"].dropna().values
-            if len(rets) == 0:
+            # 1. Purged 非重叠去重（冷却窗口 = h）
+            purged_idx = _purge_indices(raw_indices, cooldown=h)
+            valid_idx = purged_idx[purged_idx + 1 + h < n]
+            if len(valid_idx) == 0:
                 continue
 
-            mean_bp = np.mean(rets)
-            median_bp = np.median(rets)
-            std_bp = np.std(rets, ddof=1)
-            se_bp = std_bp / np.sqrt(len(rets))
+            # 2. 净方向收益（扣除双边滑点手续费 fee_bp）
+            raw_rets = df[f"fwd_ret_{h}"].values[valid_idx]
+            dir_rets = direction * raw_rets - fee_bp
+
+            # 3. 同期市场基准漂移与超额 Alpha
+            all_valid = df[f"fwd_ret_{h}"].dropna().values
+            bench_drift = float(np.mean(direction * all_valid - fee_bp))
+            excess_rets = dir_rets - bench_drift
+
+            # 4. 路径 MFE / MAE 比率
+            mfe_list, mae_list = [], []
+            for idx in valid_idx:
+                entry_p = opn[idx + 1]
+                w_high = float(np.max(high[idx + 1 : idx + 1 + h]))
+                w_low = float(np.min(low[idx + 1 : idx + 1 + h]))
+                if direction == 1:
+                    mfe_list.append((w_high / entry_p - 1.0) * 10000.0)
+                    mae_list.append((1.0 - w_low / entry_p) * 10000.0)
+                else:
+                    mfe_list.append((1.0 - w_low / entry_p) * 10000.0)
+                    mae_list.append((w_high / entry_p - 1.0) * 10000.0)
+            mfe_mae_ratio = float(np.mean(mfe_list) / max(np.mean(mae_list), 1e-6))
+
+            mean_bp = float(np.mean(dir_rets))
+            alpha_bp = float(np.mean(excess_rets))
+            median_bp = float(np.median(dir_rets))
+            std_bp = float(np.std(dir_rets, ddof=1)) if len(dir_rets) > 1 else 0.0
+            se_bp = std_bp / np.sqrt(len(dir_rets))
             ci95_low = mean_bp - 1.96 * se_bp
             ci95_high = mean_bp + 1.96 * se_bp
 
-            win_rate = np.mean(rets > 0) * 100.0 if event_type == "多头首发触发" else np.mean(rets < 0) * 100.0
-
-            t_val, p_val = stats.ttest_1samp(rets, 0.0)
+            win_rate = float(np.mean(dir_rets > 0) * 100.0)
+            t_val, p_val = _newey_west_tstat(excess_rets, max_lags=min(5, h))
 
             stats_list.append(
                 {
                     "持有K线数": h,
+                    "独立样本数": int(len(valid_idx)),
                     "平均收益(BP)": round(mean_bp, 1),
+                    "超额Alpha(BP)": round(alpha_bp, 1),
                     "中位数(BP)": round(median_bp, 1),
                     "胜率(%)": round(win_rate, 2),
-                    "收益标准差(BP)": round(std_bp, 1),
+                    "MFE/MAE比": round(mfe_mae_ratio, 2),
                     "95%置信区间": f"[{ci95_low:.1f}, {ci95_high:.1f}]",
-                    "t统计量": round(t_val, 2),
-                    "p值": round(p_val, 4),
+                    "HAC_t统计量": round(t_val, 2),
+                    "HAC_p值": round(p_val, 4),
                 }
             )
 
