@@ -378,6 +378,11 @@ def main() -> None:
         action="store_true",
         help="执行 LOO 后向修剪去冗余 + MAP-Elites 同生态位精英竞争替换与空位锦标赛补入",
     )
+    parser.add_argument(
+        "--reweight",
+        action="store_true",
+        help="执行存量活跃单元样本内法医先验锚定 + 双半场 (2020-2021/2022-2023) L2 信赖域联合坐标重配权",
+    )
     parser.add_argument("--max-candidates", type=int, default=999, help="本轮最多测试多少个原子候选单元")
     parser.add_argument("--status-only", action="store_true", help="仅打印当前持久态信号库与 4×5 全周期生态位矩阵")
     args = parser.parse_args()
@@ -504,6 +509,10 @@ def main() -> None:
                 if added_label.startswith("✂剔除冗余_"):
                     rm_uid = added_label.split("✂剔除冗余_")[1].strip()
                     step_alloc.pop(rm_uid, None)
+                    w_step_multi = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, step_alloc)
+                    step_eval = evaluate_full_is_oos(df_30m, w_step_multi)
+                elif added_label.startswith("⚖"):
+                    step_alloc = {u: float(zoo[u]["weight_alloc"]) for u in step_alloc if u in zoo}
                     w_step_multi = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, step_alloc)
                     step_eval = evaluate_full_is_oos(df_30m, w_step_multi)
                 elif added_label.startswith("⚔") and "(替" in added_label:
@@ -1227,6 +1236,177 @@ def main() -> None:
                         f"全周期={curr_eval['full']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['full']['sharpe']:.2f}, 卡玛 {curr_eval['full']['calmar']:.2f}), "
                         f"样本外={curr_eval['oos']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['oos']['sharpe']:.2f})"
                     )
+
+    # 4. 执行存量活跃单元样本内法医先验锚定 + 双半场 (2020-2021/2022-2023) L2 信赖域联合坐标重配权
+    if (args.reweight or args.prune_and_replace) and zoo:
+        print("\n" + "=" * 125)
+        print("  [启动样本内联合重配权] 基石种子锚定 + 29 个新挖掘单元法医经验贝叶斯先验倾斜与双半场 (H1/H2) L2 坐标精调")
+        print("=" * 125)
+
+        is_mask = (df_30m["dt"] <= IS_END_DT).values
+        h1_mask = (df_30m["dt"] <= pd.Timestamp("2021-12-31 23:59:59")).values
+        h2_mask = ((df_30m["dt"] > pd.Timestamp("2021-12-31 23:59:59")) & (df_30m["dt"] <= IS_END_DT)).values
+
+        def _prep_fast_slice(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            sub = df_30m.iloc[mask].reset_index(drop=True)
+            c = sub["close"].values
+            r = np.zeros(len(c), dtype=np.float64)
+            r[:-1] = (c[1:] - c[:-1]) / c[:-1]
+            _, dids = np.unique(sub["dt"].dt.date.values, return_inverse=True)
+            return r, dids
+
+        def _fast_slice_stats(close_ret: np.ndarray, day_ids: np.ndarray, w_slice: np.ndarray) -> dict[str, float]:
+            dw = np.abs(np.diff(w_slice, prepend=0.0))
+            bar_net = w_slice * close_ret - dw * 0.0002
+            daily_net = np.bincount(day_ids, weights=bar_net)
+            cum_ret = float(daily_net.sum() * 100.0)
+            n_years = len(daily_net) / 252.0
+            ann_ret = float(cum_ret / max(n_years, 1e-6))
+            std_d = float(daily_net.std(ddof=1))
+            sharpe = float((daily_net.mean() / std_d) * np.sqrt(252.0)) if std_d > 1e-12 else 0.0
+            curve = np.cumsum(daily_net)
+            peak = np.maximum.accumulate(np.maximum(curve, 0.0))
+            mdd = float((peak - curve).max() * 100.0)
+            calmar = float(ann_ret / mdd) if mdd > 1e-6 else 0.0
+            return {
+                "cum_ret_pct": cum_ret,
+                "ann_ret_pct": ann_ret,
+                "sharpe": sharpe,
+                "mdd_pct": mdd,
+                "calmar": calmar,
+            }
+
+        ret_is, dids_is = _prep_fast_slice(is_mask)
+        ret_h1, dids_h1 = _prep_fast_slice(h1_mask)
+        ret_h2, dids_h2 = _prep_fast_slice(h2_mask)
+
+        alloc0 = dict(current_alloc)
+        base_budget = sum(alloc0.values())
+
+        raw_q: dict[str, float] = {}
+        for uid, info in zoo.items():
+            n_p = max(int(info.get("is_n_purged", 20)), 5)
+            saf = float(np.clip(float(info.get("is_safety_margin_pct", 4.0)), 1.0, 15.0))
+            dd_res = float(np.clip(float(info.get("dd_rescue_alpha_bp", 0.0)), -10.0, 30.0))
+            raw_q[uid] = float(np.log(n_p) * saf * (1.0 + 0.02 * dd_res))
+
+        non_seed_uids = [u for u in alloc0 if not zoo[u]["is_base_seed"]]
+        q_vals = np.array([raw_q[u] for u in non_seed_uids])
+        q_mean, q_std = float(q_vals.mean()), float(q_vals.std() + 1e-6)
+        z_q = {
+            u: (float(np.clip((raw_q[u] - q_mean) / q_std, -1.2, 1.6)) if not zoo[u]["is_base_seed"] else 0.0)
+            for u in alloc0
+        }
+
+        eb_prior = {
+            u: round(float(np.clip(alloc0[u] * (1.0 + 0.06 * z_q[u]), 0.15, 0.56)), 2)
+            for u in alloc0
+        }
+
+        def _eval_dual_regime(alloc: dict[str, float]) -> tuple[float, dict, dict, dict]:
+            w_full = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, alloc)
+            s_is = _fast_slice_stats(ret_is, dids_is, w_full[is_mask])
+            s_h1 = _fast_slice_stats(ret_h1, dids_h1, w_full[h1_mask])
+            s_h2 = _fast_slice_stats(ret_h2, dids_h2, w_full[h2_mask])
+            l2_pen = sum((alloc[u] - eb_prior[u]) ** 2 for u in alloc)
+            min_sh = min(s_h1["sharpe"], s_h2["sharpe"])
+            obj = (
+                s_is["sharpe"] * 1.15
+                + min_sh * 0.85
+                + s_is["calmar"] * 0.45
+                + s_is["ann_ret_pct"] * 0.12
+                - s_is["mdd_pct"] * 0.40
+                - 1.0 * l2_pen
+            )
+            return obj, s_is, s_h1, s_h2
+
+        opt_alloc = dict(eb_prior)
+        obj_cur, st_is_cur, st_h1_cur, st_h2_cur = _eval_dual_regime(opt_alloc)
+        ordered_uids = sorted(alloc0.keys(), key=lambda u: raw_q[u], reverse=True)
+        changed_units: list[str] = []
+
+        for _pass in range(2):
+            for uid in ordered_uids:
+                if bool(zoo[uid]["is_base_seed"]):
+                    continue
+                w_p = eb_prior[uid]
+                tf = uid.split("@")[1]
+                lo = max(0.16, round(w_p - 0.10, 2))
+                hi = min(0.58 if tf == "5m" else 0.48, round(w_p + 0.10, 2))
+                grid = sorted(set([lo, round(w_p - 0.05, 2), round(w_p, 2), round(w_p + 0.05, 2), hi]))
+
+                best_w = opt_alloc[uid]
+                best_obj = obj_cur
+                best_pack = (st_is_cur, st_h1_cur, st_h2_cur)
+
+                for cw in grid:
+                    if abs(cw - opt_alloc[uid]) < 1e-4:
+                        continue
+                    t_alloc = dict(opt_alloc)
+                    t_alloc[uid] = cw
+                    if sum(t_alloc.values()) > base_budget + 0.45:
+                        continue
+                    obj_t, s_is, s_h1, s_h2 = _eval_dual_regime(t_alloc)
+                    if s_is["mdd_pct"] > st_is_cur["mdd_pct"] + 0.01:
+                        continue
+                    if s_h1["sharpe"] < st_h1_cur["sharpe"] - 0.003 or s_h2["sharpe"] < st_h2_cur["sharpe"] - 0.003:
+                        continue
+                    if s_is["sharpe"] < st_is_cur["sharpe"] or s_is["cum_ret_pct"] < st_is_cur["cum_ret_pct"] - 0.02:
+                        continue
+                    if obj_t > best_obj + 0.004:
+                        best_obj = obj_t
+                        best_w = cw
+                        best_pack = (s_is, s_h1, s_h2)
+
+                if abs(best_w - opt_alloc[uid]) >= 1e-4:
+                    opt_alloc[uid] = best_w
+                    obj_cur = best_obj
+                    st_is_cur, st_h1_cur, st_h2_cur = best_pack
+
+        for uid in opt_alloc:
+            if abs(opt_alloc[uid] - alloc0[uid]) >= 1e-3:
+                changed_units.append(f"{uid}({alloc0[uid]:.2f}->{opt_alloc[uid]:.2f})")
+                info = zoo[uid]
+                info["weight_alloc"] = opt_alloc[uid]
+                ledger.save_signal_to_zoo(AdmittedSignalRecord(**info))
+
+        w_opt_multi = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, opt_alloc)
+        opt_eval = evaluate_full_is_oos(df_30m, w_opt_multi)
+        if opt_eval["is"]["sharpe"] > curr_eval["is"]["sharpe"] or opt_eval["is"]["calmar"] > curr_eval["is"]["calmar"]:
+            current_alloc = opt_alloc
+            w_curr_multi = w_opt_multi
+            curr_eval = opt_eval
+            zoo = ledger.load_signal_zoo()
+            step_counter += 1
+            step_payload = {
+                "step": step_counter,
+                "added_unit": "⚖样本内联合重配权_44单元法医先验双半场精调",
+                "archetype": "四簇联合重配",
+                "timeframe": "1d~5m",
+                "zoo_size": len(current_alloc),
+                "full_trades": curr_eval["full"]["trades"],
+                "trades_per_yr": round(curr_eval["full"]["trades"] / 6.77, 1),
+                "full_active_pct": curr_eval["full"]["active_pct"],
+                "is_sharpe": curr_eval["is"]["sharpe"],
+                "is_calmar": curr_eval["is"]["calmar"],
+                "oos_cum_ret_pct": curr_eval["oos"]["cum_ret_pct"],
+                "oos_ann_ret_pct": curr_eval["oos"]["ann_ret_pct"],
+                "oos_sharpe": curr_eval["oos"]["sharpe"],
+                "oos_calmar": curr_eval["oos"]["calmar"],
+                "full_cum_ret_pct": curr_eval["full"]["cum_ret_pct"],
+                "full_ann_ret_pct": curr_eval["full"]["ann_ret_pct"],
+                "full_sharpe": curr_eval["full"]["sharpe"],
+                "full_mdd_pct": curr_eval["full"]["mdd_pct"],
+                "full_calmar": curr_eval["full"]["calmar"],
+            }
+            ledger.log_evolution_step(step_payload)
+            ledger.save_champion_portfolio({"alloc_map": current_alloc, "metrics_summary": step_payload})
+            print(
+                f"  [⚖ 联合重配权 Step {step_counter:02d}] 微调单元 {len(changed_units)} 个 | "
+                f"IS夏普={curr_eval['is']['sharpe']:.2f}, IS回撤={curr_eval['is']['mdd_pct']:.2f}%, IS卡玛={curr_eval['is']['calmar']:.2f} | "
+                f"样本外={curr_eval['oos']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['oos']['sharpe']:.2f}, 卡玛 {curr_eval['oos']['calmar']:.2f}) | "
+                f"全周期={curr_eval['full']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['full']['sharpe']:.2f}, 回撤 {curr_eval['full']['mdd_pct']:.2f}%, 卡玛 {curr_eval['full']['calmar']:.2f})"
+            )
 
     niche_df = build_niche_matrix_summary(zoo)
     ledger.save_niche_matrix(niche_df.to_dict(orient="records"))
