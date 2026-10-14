@@ -461,7 +461,8 @@ def main() -> None:
     base_eval = evaluate_full_is_oos(df_30m, w_base_multi)
 
     if args.refresh_grid and zoo:
-        print("\n[刷新主网格账本] 正在基于原生 5m 主执行网格重算 Step 0 ~ Step N 全量轨迹与互补指标 ...")
+        print("\n[刷新主网格账本] 正在基于原生 5m 主执行网格与三支柱分层复合引擎重算 Step 0 ~ Step N 全量轨迹 ...")
+        old_hist = ledger.load_evolution_history()
         if ledger.history_path.exists():
             ledger.history_path.unlink()
         step_alloc = dict(base_alloc)
@@ -490,64 +491,115 @@ def main() -> None:
                 "full_calmar": step_eval["full"]["calmar"],
             }
         )
-        new_uids = [uid for uid, info in zoo.items() if not info["is_base_seed"]]
-        for s_idx, uid in enumerate(new_uids, start=1):
-            info = zoo[uid]
-            sid, tf = uid.split("@")
-            spec = ALL_SIGNAL_SPECS[sid]
-            ruler = ARCHETYPE_RULERS[spec.archetype]
-            same_dir_peers = {
-                p_uid: w_on_30m_by_unit[p_uid]
-                for p_uid in step_alloc
-                if int(zoo[p_uid]["direction"]) == int(info["direction"])
-            }
-            g2_ref = run_gate2_3d_complementarity_audit(
-                df_30m,
-                w_on_30m_by_unit[uid],
-                same_dir_peers,
-                w_step_multi,
-                archetype=spec.archetype,
-                current_archetype_new_count=0,
-                ruler=ruler,
-            )
-            prev_is_sh = step_eval["is"]["sharpe"]
-            prev_is_cal = step_eval["is"]["calmar"]
 
-            step_alloc[uid] = float(info["weight_alloc"])
-            w_step_multi = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, step_alloc)
-            step_eval = evaluate_full_is_oos(df_30m, w_step_multi)
+        if len(old_hist) > 1:
+            for row in old_hist[1:]:
+                s_idx = int(row["step"])
+                added_label = str(row["added_unit"])
+                tf = str(row["timeframe"])
+                arch = str(row["archetype"])
+                prev_is_sh = step_eval["is"]["sharpe"]
+                prev_is_cal = step_eval["is"]["calmar"]
 
-            info["max_corr_with_zoo"] = g2_ref["max_corr"]
-            info["max_corr_peer"] = g2_ref["max_corr_peer"]
-            info["gap_fill_ratio_pct"] = g2_ref["gap_fill_ratio_pct"]
-            info["dd_rescue_alpha_bp"] = g2_ref["dd_rescue_alpha_bp"]
-            info["marginal_sharpe_delta"] = round(step_eval["is"]["sharpe"] - prev_is_sh, 3)
-            info["marginal_calmar_delta"] = round(step_eval["is"]["calmar"] - prev_is_cal, 3)
-            ledger.save_signal_to_zoo(AdmittedSignalRecord(**info))
+                if added_label.startswith("✂剔除冗余_"):
+                    rm_uid = added_label.split("✂剔除冗余_")[1].strip()
+                    step_alloc.pop(rm_uid, None)
+                    w_step_multi = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, step_alloc)
+                    step_eval = evaluate_full_is_oos(df_30m, w_step_multi)
+                elif added_label.startswith("⚔") and "(替" in added_label:
+                    inc_uid = added_label.split("(替")[1].rstrip(")").strip()
+                    cand_sid = added_label[1:].split("_")[0].strip()
+                    uid = f"{cand_sid}@{tf}"
+                    step_alloc.pop(inc_uid, None)
+                    spec = ALL_SIGNAL_SPECS[cand_sid]
+                    ruler = ARCHETYPE_RULERS[spec.archetype]
+                    same_dir_peers = {
+                        p_uid: w_on_30m_by_unit[p_uid]
+                        for p_uid in step_alloc
+                        if int(ALL_SIGNAL_SPECS[p_uid.split("@")[0]].direction) == spec.direction
+                    }
+                    g2_ref = run_gate2_3d_complementarity_audit(
+                        df_30m,
+                        w_on_30m_by_unit[uid],
+                        same_dir_peers,
+                        w_step_multi,
+                        archetype=spec.archetype,
+                        current_archetype_new_count=0,
+                        ruler=ruler,
+                    )
+                    w_alloc = float(zoo[uid]["weight_alloc"]) if uid in zoo else spec.default_weight
+                    step_alloc[uid] = w_alloc
+                    w_step_multi = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, step_alloc)
+                    step_eval = evaluate_full_is_oos(df_30m, w_step_multi)
+                    if uid in zoo:
+                        info = zoo[uid]
+                        info["max_corr_with_zoo"] = g2_ref["max_corr"]
+                        info["max_corr_peer"] = g2_ref["max_corr_peer"]
+                        info["gap_fill_ratio_pct"] = g2_ref["gap_fill_ratio_pct"]
+                        info["dd_rescue_alpha_bp"] = g2_ref["dd_rescue_alpha_bp"]
+                        info["marginal_sharpe_delta"] = round(step_eval["is"]["sharpe"] - prev_is_sh, 3)
+                        info["marginal_calmar_delta"] = round(step_eval["is"]["calmar"] - prev_is_cal, 3)
+                        ledger.save_signal_to_zoo(AdmittedSignalRecord(**info))
+                else:
+                    sid = added_label.split("_")[0].strip()
+                    uid = f"{sid}@{tf}"
+                    spec = ALL_SIGNAL_SPECS[sid]
+                    ruler = ARCHETYPE_RULERS[spec.archetype]
+                    same_dir_peers = {
+                        p_uid: w_on_30m_by_unit[p_uid]
+                        for p_uid in step_alloc
+                        if int(ALL_SIGNAL_SPECS[p_uid.split("@")[0]].direction) == spec.direction
+                    }
+                    g2_ref = run_gate2_3d_complementarity_audit(
+                        df_30m,
+                        w_on_30m_by_unit[uid],
+                        same_dir_peers,
+                        w_step_multi,
+                        archetype=spec.archetype,
+                        current_archetype_new_count=0,
+                        ruler=ruler,
+                    )
+                    w_alloc = (
+                        float(zoo[uid]["weight_alloc"])
+                        if uid in zoo
+                        else (0.40 if tf == "5m" else spec.default_weight)
+                    )
+                    step_alloc[uid] = w_alloc
+                    w_step_multi = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, step_alloc)
+                    step_eval = evaluate_full_is_oos(df_30m, w_step_multi)
+                    if uid in zoo:
+                        info = zoo[uid]
+                        info["max_corr_with_zoo"] = g2_ref["max_corr"]
+                        info["max_corr_peer"] = g2_ref["max_corr_peer"]
+                        info["gap_fill_ratio_pct"] = g2_ref["gap_fill_ratio_pct"]
+                        info["dd_rescue_alpha_bp"] = g2_ref["dd_rescue_alpha_bp"]
+                        info["marginal_sharpe_delta"] = round(step_eval["is"]["sharpe"] - prev_is_sh, 3)
+                        info["marginal_calmar_delta"] = round(step_eval["is"]["calmar"] - prev_is_cal, 3)
+                        ledger.save_signal_to_zoo(AdmittedSignalRecord(**info))
 
-            step_payload = {
-                "step": s_idx,
-                "added_unit": f"{spec.name}@{tf}",
-                "archetype": spec.archetype,
-                "timeframe": tf,
-                "zoo_size": len(step_alloc),
-                "full_trades": step_eval["full"]["trades"],
-                "trades_per_yr": round(step_eval["full"]["trades"] / 6.77, 1),
-                "full_active_pct": step_eval["full"]["active_pct"],
-                "is_sharpe": step_eval["is"]["sharpe"],
-                "is_calmar": step_eval["is"]["calmar"],
-                "oos_cum_ret_pct": step_eval["oos"]["cum_ret_pct"],
-                "oos_ann_ret_pct": step_eval["oos"]["ann_ret_pct"],
-                "oos_sharpe": step_eval["oos"]["sharpe"],
-                "oos_calmar": step_eval["oos"]["calmar"],
-                "full_cum_ret_pct": step_eval["full"]["cum_ret_pct"],
-                "full_ann_ret_pct": step_eval["full"]["ann_ret_pct"],
-                "full_sharpe": step_eval["full"]["sharpe"],
-                "full_mdd_pct": step_eval["full"]["mdd_pct"],
-                "full_calmar": step_eval["full"]["calmar"],
-            }
-            ledger.log_evolution_step(step_payload)
-            ledger.save_champion_portfolio({"alloc_map": step_alloc, "metrics_summary": step_payload})
+                step_payload = {
+                    "step": s_idx,
+                    "added_unit": added_label,
+                    "archetype": arch,
+                    "timeframe": tf,
+                    "zoo_size": len(step_alloc),
+                    "full_trades": step_eval["full"]["trades"],
+                    "trades_per_yr": round(step_eval["full"]["trades"] / 6.77, 1),
+                    "full_active_pct": step_eval["full"]["active_pct"],
+                    "is_sharpe": step_eval["is"]["sharpe"],
+                    "is_calmar": step_eval["is"]["calmar"],
+                    "oos_cum_ret_pct": step_eval["oos"]["cum_ret_pct"],
+                    "oos_ann_ret_pct": step_eval["oos"]["ann_ret_pct"],
+                    "oos_sharpe": step_eval["oos"]["sharpe"],
+                    "oos_calmar": step_eval["oos"]["calmar"],
+                    "full_cum_ret_pct": step_eval["full"]["cum_ret_pct"],
+                    "full_ann_ret_pct": step_eval["full"]["ann_ret_pct"],
+                    "full_sharpe": step_eval["full"]["sharpe"],
+                    "full_mdd_pct": step_eval["full"]["mdd_pct"],
+                    "full_calmar": step_eval["full"]["calmar"],
+                }
+                ledger.log_evolution_step(step_payload)
+                ledger.save_champion_portfolio({"alloc_map": step_alloc, "metrics_summary": step_payload})
         zoo = ledger.load_signal_zoo()
 
     current_alloc = {uid: float(info["weight_alloc"]) for uid, info in zoo.items()}
