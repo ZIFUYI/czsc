@@ -1,18 +1,19 @@
 #!/usr/bin/env python
 """
-4×4 生态位矩阵候选信号生成器与分簇定制状态机引擎
+4×5 生态位矩阵候选信号生成器与分簇定制状态机引擎
 (MAP-Elites Niche Hypothesis Bank & Archetype-Specific State Machine Engine)
 
-四大战略方向 (Archetypes) × 四级独立周期 (1d, 60m, 30m, 15m)：
-1. A_顺势突破簇 (exit_mode="trend",    适用周期: 1d, 60m, 30m)
-2. B_背驰反转簇 (exit_mode="reversal", 适用周期: 60m, 30m, 15m)
-3. C_震荡回归簇 (exit_mode="range",    适用周期: 60m, 30m, 15m)
-4. D_日内微结构簇 (exit_mode="intraday", 适用周期: 30m, 15m)
+四大战略方向 (Archetypes) × 五级独立周期 (1d, 60m, 30m, 15m, 5m)：
+1. A_顺势突破簇 (exit_mode="trend",    适用周期: 1d, 60m, 30m, 15m, 5m)
+2. B_背驰反转簇 (exit_mode="reversal", 适用周期: 1d, 60m, 30m, 15m, 5m)
+3. C_震荡回归簇 (exit_mode="range",    适用周期: 1d, 60m, 30m, 15m, 5m)
+4. D_日内微结构簇 (exit_mode="intraday", 适用周期: 60m, 30m, 15m, 5m)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import time
 
 import numpy as np
 import pandas as pd
@@ -43,7 +44,7 @@ ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
         min_alpha_bp=12.0,
         min_safety_pct=4.5,
         max_boot_pval=0.20,
-        quota_max_units=6,  # 基石已有5个突破信号，限制新增突破信号配额 <= 6 个 (含原生缠论五笔/三买组合)
+        quota_max_units=7,  # 基石已有5个突破信号，限制新增突破信号配额 <= 7 个 (含 5m 级别突破)
     ),
     "B_背驰反转簇": ArchetypeRuler(
         archetype="B_背驰反转簇",
@@ -54,7 +55,7 @@ ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
         min_alpha_bp=8.0,
         min_safety_pct=3.5,
         max_boot_pval=0.22,
-        quota_max_units=7,
+        quota_max_units=9,
     ),
     "C_震荡回归簇": ArchetypeRuler(
         archetype="C_震荡回归簇",
@@ -65,7 +66,7 @@ ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
         min_alpha_bp=6.0,
         min_safety_pct=3.0,
         max_boot_pval=0.24,
-        quota_max_units=6,
+        quota_max_units=7,
     ),
     "D_日内微结构簇": ArchetypeRuler(
         archetype="D_日内微结构簇",
@@ -76,7 +77,7 @@ ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
         min_alpha_bp=7.0,
         min_safety_pct=3.0,
         max_boot_pval=0.24,
-        quota_max_units=6,
+        quota_max_units=8,
     ),
 }
 
@@ -94,7 +95,7 @@ class SignalSpec:
 
 
 # ---------------------------------------------------------------------------
-# 1. 基石真金信号 (5个) + 四大战略方向候选池 (Round 1 + Round 2 + Round 3 原生 czsc-signals 组合)
+# 1. 基石真金信号 (5个) + 四大战略方向候选池 (Round 1 + Round 2 + Round 3 + Round 4 + Round 5 TD序列)
 # ---------------------------------------------------------------------------
 BASE_SEED_SIGNALS: list[SignalSpec] = [
     SignalSpec("S1L", "S1L_中枢三买确认", "A_顺势突破簇", 1, 0.40, ("1d", "60m", "30m"), "trend", is_base_seed=True),
@@ -228,6 +229,60 @@ CANDIDATE_HYPOTHESIS_POOL: list[SignalSpec] = [
     SignalSpec(
         "CZ08S", "CZ08S_中枢中线下破双顺通道梯量杀跌", "D_日内微结构簇", -1, 0.26, ("15m", "30m", "60m"), "intraday"
     ),
+    # =========================================================================
+    # === Round 4 四期 5 分钟 (`5m`) 高频跨日锚定与日内微结构原生组合池 ===
+    # =========================================================================
+    SignalSpec(
+        "M501L", "M501L_5m宽幅唐奇安放量突破DualThrust共振", "A_顺势突破簇", 1, 0.26, ("5m",), "trend"
+    ),
+    SignalSpec(
+        "M501S", "M501S_5m宽幅唐奇安放量破位DualThrust共振", "A_顺势突破簇", -1, 0.26, ("5m",), "trend"
+    ),
+    SignalSpec(
+        "M502L", "M502L_5m跨日48根前低2B弹簧停顿吞没反转", "B_背驰反转簇", 1, 0.26, ("5m",), "reversal"
+    ),
+    SignalSpec(
+        "M502S", "M502S_5m缠论一二卖双中枢吞没停顿反杀", "B_背驰反转簇", -1, 0.26, ("5m",), "reversal"
+    ),
+    SignalSpec(
+        "M503L", "M503L_5m对称中枢回踩VWAP企稳放量回归", "C_震荡回归簇", 1, 0.26, ("5m",), "range"
+    ),
+    SignalSpec(
+        "M503S", "M503S_5m对称中枢反抽VWAP受阻MACD背驰回归", "C_震荡回归簇", -1, 0.26, ("5m",), "range"
+    ),
+    SignalSpec(
+        "M504L", "M504L_5m早盘30m首区上破DualThrust脉冲", "D_日内微结构簇", 1, 0.26, ("5m",), "intraday"
+    ),
+    SignalSpec(
+        "M504S", "M504S_5m早盘30m首区下破RBreaker共振杀跌", "D_日内微结构簇", -1, 0.26, ("5m",), "intraday"
+    ),
+    # =========================================================================
+    # === Round 5 五期项目原生 TD 序列 (Setup蓄力 + Countdown确认) 状态机策略池 ===
+    # =========================================================================
+    SignalSpec(
+        "TD01L", "TD01L_TD序列(4,2,3)蓄力三确认做多", "D_日内微结构簇", 1, 0.28, ("5m", "15m", "30m"), "intraday"
+    ),
+    SignalSpec(
+        "TD01S", "TD01S_TD序列(4,2,3)蓄力三确认做空", "D_日内微结构簇", -1, 0.28, ("5m", "15m", "30m"), "intraday"
+    ),
+    SignalSpec(
+        "TD02L", "TD02L_TD序列(5,3,6)深度六确认做多", "B_背驰反转簇", 1, 0.28, ("5m", "15m"), "reversal"
+    ),
+    SignalSpec(
+        "TD02S", "TD02S_TD序列(5,3,6)深度六确认做空", "B_背驰反转簇", -1, 0.28, ("5m", "15m"), "reversal"
+    ),
+    SignalSpec(
+        "TD03L", "TD03L_跨日TD(4,2,3)波段反转做多", "B_背驰反转簇", 1, 0.28, ("60m", "30m", "15m"), "reversal"
+    ),
+    SignalSpec(
+        "TD03S", "TD03S_跨日TD(4,2,3)波段反转做空", "B_背驰反转簇", -1, 0.28, ("60m", "30m", "15m"), "reversal"
+    ),
+    SignalSpec(
+        "TD04L", "TD04L_跨日TD(5,3,6)中线衰竭反转做多", "C_震荡回归簇", 1, 0.28, ("1d", "60m", "30m", "15m"), "range"
+    ),
+    SignalSpec(
+        "TD04S", "TD04S_跨日TD(5,3,6)中线衰竭反转做空", "C_震荡回归簇", -1, 0.28, ("1d", "60m", "30m", "15m"), "range"
+    ),
 ]
 
 ALL_SIGNAL_SPECS: dict[str, SignalSpec] = {s.sig_id: s for s in (BASE_SEED_SIGNALS + CANDIDATE_HYPOTHESIS_POOL)}
@@ -237,6 +292,7 @@ TF_SCALE_MAP: dict[str, float] = {
     "60m": 0.50,
     "30m": 0.35,
     "15m": 0.25,
+    "5m": 0.15,
 }
 
 
@@ -334,76 +390,64 @@ def enrich_kline_features(df: pd.DataFrame, scale: float = 1.0) -> pd.DataFrame:
 def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir) -> pd.DataFrame:
     """
     挂载项目内置 Rust `czsc-signals` 引擎预计算的 35 个原生信号列 (cxt/byi/jcc/bar/obv/vol)，
-    并合成为 16 个四大战略方向原生信号组合触发布尔列 (`cz_trig_CZ01L` ~ `cz_trig_CZ08S`)。
+    并合成为四大战略方向原生信号组合触发布尔列 (`cz_trig_CZ01L` ~ `cz_trig_CZ08S` 及 5m 专属 `cz_trig_M501L` ~ `cz_trig_M504S`)。
     """
     from pathlib import Path
 
     cache_path = Path(workspace_dir) / f"native_czsc_signals_{tf}.pkl"
     if not cache_path.exists():
-        from czsc import Freq, RawBar, generate_czsc_signals
-        from czsc.signals import bar, byi, cxt, jcc, obv, vol
+        import czsc
 
-        tf_to_freq = {"1d": Freq.D, "60m": Freq.F60, "30m": Freq.F30, "15m": Freq.F15}
-        freq_obj = tf_to_freq[tf]
-        freq_str = freq_obj.value
-        bars = [
-            RawBar(
-                symbol="159915",
-                id=i,
-                dt=row.dt,
-                freq=freq_obj,
-                open=float(row.open),
-                close=float(row.close),
-                high=float(row.high),
-                low=float(row.low),
-                vol=float(row.volume),
-                amount=float(row.volume * row.close),
-            )
-            for i, row in enumerate(df.itertuples(index=False))
+        tf_to_freq = {
+            "1d": czsc.Freq.D.value,
+            "60m": czsc.Freq.F60.value,
+            "30m": czsc.Freq.F30.value,
+            "15m": czsc.Freq.F15.value,
+            "5m": czsc.Freq.F5.value,
+        }
+        freq_str = tf_to_freq[tf]
+        sub = df[["dt", "symbol", "open", "close", "high", "low", "volume"]].copy()
+        sub = sub.rename(columns={"volume": "vol"})
+        sub["amount"] = sub["vol"] * sub["close"]
+        bars = czsc.format_standard_kline(sub, freq=freq_str)
+        sigs_cfg = [
+            {"name": "czsc.signals.cxt_five_bi_V230619", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.cxt_seven_bi_V230620", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.cxt_three_bi_V230618", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.cxt_third_bs_V230319", "freq": freq_str, "di": 1, "ma_type": "SMA", "timeperiod": 20},
+            {"name": "czsc.signals.cxt_third_bs_V230318", "freq": freq_str, "di": 1, "ma_type": "SMA", "timeperiod": 20},
+            {"name": "czsc.signals.cxt_third_buy_V230228", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.cxt_second_bs_V230320", "freq": freq_str, "di": 1, "ma_type": "SMA", "timeperiod": 20},
+            {"name": "czsc.signals.cxt_first_buy_V221126", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.cxt_first_sell_V221126", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.cxt_double_zs_V230311", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.cxt_ds_midline_break_V260521", "freq": freq_str, "di": 1, "n": 3, "m": 2},
+            {"name": "czsc.signals.cxt_bi_base_V230228", "freq": freq_str, "bi_init_length": 9},
+            {"name": "czsc.signals.cxt_bi_status_V230101", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.cxt_fx_power_V221107", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.cxt_bi_end_V230312", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.cxt_bi_end_V230106", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.cxt_bi_end_V230107", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.byi_second_bs_V230324", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.byi_symmetry_zs_V221107", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.jcc_san_xing_xian_V221023", "freq": freq_str, "di": 1, "th": 200},
+            {"name": "czsc.signals.jcc_ten_mo_V221101", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.jcc_yun_xian_V221101", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.jcc_ci_tou_V221111", "freq": freq_str, "di": 1, "z": 5, "th": 50},
+            {"name": "czsc.signals.jcc_wu_yun_gai_ding_V221112", "freq": freq_str, "di": 1, "z": 5, "th": 50},
+            {"name": "czsc.signals.jcc_three_crow_V221026", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.jcc_san_fa_V221101", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.bar_fake_break_V230203", "freq": freq_str, "di": 1, "n": 10, "m": 3},
+            {"name": "czsc.signals.bar_fang_liang_break_V221216", "freq": freq_str, "di": 1, "ma_type": "SMA", "timeperiod": 20, "th": 13},
+            {"name": "czsc.signals.bar_dual_thrust_V230403", "freq": freq_str, "di": 1, "n": 4, "k1": 5, "k2": 5},
+            {"name": "czsc.signals.bar_r_breaker_V230326", "freq": freq_str, "n": 1},
+            {"name": "czsc.signals.bar_td9_V240616", "freq": freq_str, "n": 9},
+            {"name": "czsc.signals.bar_accelerate_V221110", "freq": freq_str, "di": 1, "window": 10},
+            {"name": "czsc.signals.obv_up_down_V230719", "freq": freq_str, "di": 1, "n": 20, "m": 10, "ma_overlap": 3},
+            {"name": "czsc.signals.vol_ti_suo_V221216", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.vol_gao_di_V221218", "freq": freq_str, "di": 1},
         ]
-
-        def _get_signals(c):
-            if c.freq != freq_obj:
-                return {}
-            s = {}
-            s.update(cxt.cxt_five_bi_V230619(c, di=1))
-            s.update(cxt.cxt_seven_bi_V230620(c, di=1))
-            s.update(cxt.cxt_three_bi_V230618(c, di=1))
-            s.update(cxt.cxt_third_bs_V230319(c, di=1, ma_type="SMA", timeperiod=20))
-            s.update(cxt.cxt_third_bs_V230318(c, di=1, ma_type="SMA", timeperiod=20))
-            s.update(cxt.cxt_third_buy_V230228(c, di=1))
-            s.update(cxt.cxt_second_bs_V230320(c, di=1, ma_type="SMA", timeperiod=20))
-            s.update(cxt.cxt_first_buy_V221126(c, di=1))
-            s.update(cxt.cxt_first_sell_V221126(c, di=1))
-            s.update(cxt.cxt_double_zs_V230311(c, di=1))
-            s.update(cxt.cxt_ds_midline_break_V260521(c, di=1, n=3, m=2))
-            s.update(cxt.cxt_bi_base_V230228(c, bi_init_length=9))
-            s.update(cxt.cxt_bi_status_V230101(c, di=1))
-            s.update(cxt.cxt_fx_power_V221107(c, di=1))
-            s.update(cxt.cxt_bi_end_V230312(c, di=1))
-            s.update(cxt.cxt_bi_end_V230106(c, di=1))
-            s.update(cxt.cxt_bi_end_V230107(c, di=1))
-            s.update(byi.byi_second_bs_V230324(c, di=1))
-            s.update(byi.byi_symmetry_zs_V221107(c, di=1))
-            s.update(jcc.jcc_san_xing_xian_V221023(c, di=1, th=200))
-            s.update(jcc.jcc_ten_mo_V221101(c, di=1))
-            s.update(jcc.jcc_yun_xian_V221101(c, di=1))
-            s.update(jcc.jcc_ci_tou_V221111(c, di=1, z=5, th=50))
-            s.update(jcc.jcc_wu_yun_gai_ding_V221112(c, di=1, z=5, th=50))
-            s.update(jcc.jcc_three_crow_V221026(c, di=1))
-            s.update(jcc.jcc_san_fa_V221101(c, di=1))
-            s.update(bar.bar_fake_break_V230203(c, di=1, n=10, m=3))
-            s.update(bar.bar_fang_liang_break_V221216(c, di=1, ma_type="SMA", timeperiod=20, th=13))
-            s.update(bar.bar_dual_thrust_V230403(c, di=1, n=4, k1=5, k2=5))
-            s.update(bar.bar_r_breaker_V230326(c, n=1))
-            s.update(bar.bar_td9_V240616(c, n=9))
-            s.update(bar.bar_accelerate_V221110(c, di=1, window=10))
-            s.update(obv.obv_up_down_V230719(c, di=1, n=20, m=10, ma_overlap=3))
-            s.update(vol.vol_ti_suo_V221216(c, di=1))
-            s.update(vol.vol_gao_di_V221218(c, di=1))
-            return s
-
-        df_sig = generate_czsc_signals(bars, _get_signals, freqs=[freq_str], init_n=100, df=True)
+        df_sig = czsc.generate_czsc_signals(bars, sigs_cfg, sdt="2020-01-01", init_n=20, df=True)
         rename_map = {}
         sig_cols = []
         for col in df_sig.columns:
@@ -573,12 +617,342 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir) -> pd.D
         & be_stop.str.startswith("看空")
     ).values
 
+    # Round 4: 5m 专属跨日锚定 (48根全天极值 / 240根五日均线 / 30m首区ORB) 与原生 czsc-signals 组合
+    if tf == "5m":
+        c = df["close"].values
+        o = df["open"].values
+        h = df["high"].values
+        l = df["low"].values
+        ma20 = df["ma20"].values
+        ma60 = df["ma60"].values
+        ma240 = df["close"].rolling(240).mean().bfill().values
+        h48 = df["high"].shift(2).rolling(48).max().bfill().values
+        l48 = df["low"].shift(2).rolling(48).min().bfill().values
+        vol = df["volume"].values
+        vma20 = df["vol_ma20"].values
+        vwap = df["intraday_vwap"].values
+        bidx = df["bar_idx_in_day"].values
+        h10 = df["high10"].values
+        l10 = df["low10"].values
+        is_first_30m = df["bar_idx_in_day"] < 6
+        orb30_h = df["high"].where(is_first_30m).groupby(df["date"]).transform("max").values
+        orb30_l = df["low"].where(is_first_30m).groupby(df["date"]).transform("min").values
+
+        m501l = np.asarray(
+            (df["box_amp"] > 0.012)
+            & (c > ma60)
+            & (ma20 > ma60)
+            & (c > h10)
+            & (c > o)
+            & (vol >= 1.45 * vma20)
+            & (dt_bs.str.startswith("看多") | fl_brk.str.startswith("放量突破")),
+            dtype=bool,
+        )
+        m501s = np.asarray(
+            (df["box_amp"] > 0.012)
+            & (c < ma60)
+            & (ma20 < ma60)
+            & (c < l10)
+            & (c < o)
+            & (vol >= 1.45 * vma20)
+            & dt_bs.str.startswith("看空"),
+            dtype=bool,
+        )
+        m502l = np.asarray(
+            (c > ma240)
+            & (np.roll(l, 1) < l48)
+            & (c > l48)
+            & (c > o)
+            & (c > np.roll(h, 1))
+            & (vol >= 1.28 * vma20)
+            & (be_stop.str.startswith("看多") | be_macd.str.startswith("看多") | jcc_eng.str.contains("看涨吞没")),
+            dtype=bool,
+        )
+        m502s = np.asarray(
+            (c < ma240)
+            & (bs2_20.str.startswith("二卖") | sell1.str.startswith("一卖_") | dzs.str.startswith("看空"))
+            & (be_stop.str.startswith("看空") | jcc_eng.str.contains("看跌吞没") | jcc_drk.str.startswith("满足"))
+            & (c < ma20)
+            & (vol >= 1.20 * vma20),
+            dtype=bool,
+        )
+        m503l = np.asarray(
+            sym_zs.str.startswith("是_")
+            & (c > ma240)
+            & (np.roll(l, 1) <= np.roll(vwap, 1) * 0.999)
+            & (np.roll(c, 1) >= np.roll(vwap, 1) * 0.996)
+            & (c > o)
+            & (c > np.roll(h, 1))
+            & (c > vwap)
+            & (vol >= 1.35 * vma20)
+            & fl_brk.str.startswith("放量突破"),
+            dtype=bool,
+        )
+        m503s = np.asarray(
+            sym_zs.str.startswith("是_")
+            & (bidx % 6 >= 3)
+            & (c < ma240)
+            & (c < ma60)
+            & (c < vwap)
+            & (c < o)
+            & (c < np.roll(l, 1))
+            & (vol >= 1.28 * vma20)
+            & (be_macd.str.startswith("看空") | dt_bs.str.startswith("看空")),
+            dtype=bool,
+        )
+        m504l = np.asarray(
+            (bidx >= 6)
+            & (bidx <= 16)
+            & (c > orb30_h)
+            & (np.roll(c, 1) <= orb30_h)
+            & (c > vwap)
+            & (c > ma60)
+            & (vol >= 1.75 * vma20)
+            & fl_brk.str.startswith("放量突破")
+            & (dt_bs.str.startswith("看多") | rbrk.str.startswith("做多_")),
+            dtype=bool,
+        )
+        m504s = np.asarray(
+            (bidx >= 6)
+            & (bidx <= 18)
+            & (c < orb30_l)
+            & (np.roll(c, 1) >= orb30_l)
+            & (c < vwap)
+            & (c < ma60)
+            & (c < ma240)
+            & (vol >= 1.65 * vma20)
+            & (dt_bs.str.startswith("看空") | rbrk.str.startswith("做空_")),
+            dtype=bool,
+        )
+        for col_name, arr in [
+            ("cz_trig_M501L", m501l),
+            ("cz_trig_M501S", m501s),
+            ("cz_trig_M502L", m502l),
+            ("cz_trig_M502S", m502s),
+            ("cz_trig_M503L", m503l),
+            ("cz_trig_M503S", m503s),
+            ("cz_trig_M504L", m504l),
+            ("cz_trig_M504S", m504s),
+        ]:
+            arr[:240] = False
+            df[col_name] = arr
+
     return df
 
 
 # ---------------------------------------------------------------------------
-# 3. 分方向定制状态机与信号触发生成 (Archetype-Specific State Machine)
+# 3. 项目原生 TD 序列 (Setup 蓄力 + Countdown 三条件确认) 状态机与分方向状态机
 # ---------------------------------------------------------------------------
+TD_SIGNAL_PARAM_MAP: dict[str, tuple[int, int, int, int, float, bool, int, bool]] = {
+    # sig_id: (direction, n1, n2, n3, sl_threshold, daily_reset, max_hold_bars, trend_filter)
+    "TD01L": (1, 4, 2, 3, 0.015, True, 999, False),
+    "TD01S": (-1, 4, 2, 3, 0.015, True, 999, True),
+    "TD02L": (1, 5, 3, 6, 0.015, True, 999, True),
+    "TD02S": (-1, 5, 3, 6, 0.015, True, 999, True),
+    "TD03L": (1, 4, 2, 3, 0.018, False, 8, False),
+    "TD03S": (-1, 4, 2, 3, 0.018, False, 8, True),
+    "TD04L": (1, 5, 3, 6, 0.018, False, 8, False),
+    "TD04S": (-1, 5, 3, 6, 0.018, False, 8, False),
+}
+
+
+def compute_td_triggers_and_weights(
+    df: pd.DataFrame,
+    direction: int,
+    n1: int = 4,
+    n2: int = 2,
+    n3: int = 3,
+    sl_threshold: float = 0.015,
+    daily_reset: bool = True,
+    max_hold_bars: int = 999,
+    trend_filter: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    项目原生 TD 序列两阶段状态机 (源自 examples/czsc_td_strategy_backtest.py 与 td_sequential_real_backtest.py)：
+    - Stage 1 (Setup 蓄力): close 与 close[i-n1] 比较得到 ud_run，连续满 ±n2 根触发蓄力完成。
+    - Stage 2 (Countdown 计数): 蓄力完成后满足三条件微突破 (condA & condB & condC) 累计达 n3 次触发入场，
+      记录计数期极值 buy_count_low / sell_count_high 作为结构止损位，配合 sl_threshold 动态跟踪止损。
+    """
+    n = len(df)
+    triggers = np.zeros(n, dtype=bool)
+    weights = np.zeros(n, dtype=np.float64)
+
+    c_arr = df["close"].values
+    h_arr = df["high"].values
+    l_arr = df["low"].values
+    ma60_arr = df["ma60"].values
+    vwap_arr = df["intraday_vwap"].values
+    dates = df["date"].values
+    dts = pd.to_datetime(df["dt"]).dt.time.values
+
+    open_t = time(9, 30)
+    no_open_t = time(14, 45)
+    exit_t = time(14, 55)
+
+    last_date = None
+    last_ud = 0
+    ud_run = 0
+
+    buy_setup = False
+    buy_count = 0
+    buy_k1_close = None
+    buy_count_low = float("inf")
+
+    sell_setup = False
+    sell_count = 0
+    sell_k1_close = None
+    sell_count_high = float("-inf")
+
+    pos = 0
+    entry_idx = -999
+    stop_price = None
+    highest_price = None
+    lowest_price = None
+    bar_count_today = 0
+
+    for i in range(n):
+        c_now, h_now, l_now = c_arr[i], h_arr[i], l_arr[i]
+        cur_date = dates[i]
+        cur_time = dts[i]
+
+        if daily_reset and last_date != cur_date:
+            last_date = cur_date
+            last_ud = 0
+            ud_run = 0
+            buy_setup = False
+            buy_count = 0
+            buy_k1_close = None
+            buy_count_low = float("inf")
+            sell_setup = False
+            sell_count = 0
+            sell_k1_close = None
+            sell_count_high = float("-inf")
+            bar_count_today = 0
+            pos = 0
+            stop_price = None
+            highest_price = None
+            lowest_price = None
+
+        bar_count_today += 1
+
+        if daily_reset and cur_time >= exit_t:
+            pos = 0
+            stop_price = None
+            highest_price = None
+            lowest_price = None
+            weights[i] = 0.0
+            continue
+
+        if pos != 0 and (i - entry_idx) >= max_hold_bars:
+            pos = 0
+            stop_price = None
+            highest_price = None
+            lowest_price = None
+            weights[i] = 0.0
+            continue
+
+        if pos == 1 and stop_price is not None and l_now <= stop_price:
+            pos = 0
+            stop_price = None
+            highest_price = None
+            weights[i] = 0.0
+            continue
+        elif pos == -1 and stop_price is not None and h_now >= stop_price:
+            pos = 0
+            stop_price = None
+            lowest_price = None
+            weights[i] = 0.0
+            continue
+
+        if pos == 1 and sl_threshold > 0:
+            highest_price = max(highest_price or c_now, h_now)
+            if highest_price > 0 and (highest_price - c_now) / highest_price >= sl_threshold:
+                pos = 0
+                stop_price = None
+                highest_price = None
+                weights[i] = 0.0
+                continue
+        elif pos == -1 and sl_threshold > 0:
+            lowest_price = min(lowest_price or c_now, l_now)
+            if lowest_price > 0 and (c_now - lowest_price) / lowest_price >= sl_threshold:
+                pos = 0
+                stop_price = None
+                lowest_price = None
+                weights[i] = 0.0
+                continue
+
+        min_bars = max(n1, 2) + 1
+        if (daily_reset and bar_count_today < min_bars) or i < max(60, min_bars):
+            weights[i] = float(pos)
+            continue
+
+        c_lag = c_arr[i - n1]
+        ud = 1 if c_now > c_lag else (-1 if c_now < c_lag else 0)
+        if ud == last_ud and ud != 0:
+            ud_run += ud
+        else:
+            ud_run = ud
+        last_ud = ud
+
+        if ud_run == n2:
+            sell_setup = True
+            sell_count = 0
+            sell_k1_close = None
+            sell_count_high = float("-inf")
+        elif ud_run == -n2:
+            buy_setup = True
+            buy_count = 0
+            buy_k1_close = None
+            buy_count_low = float("inf")
+
+        if buy_setup:
+            condA = c_now >= h_arr[i - 2]
+            condB = h_now > h_arr[i - 1]
+            condC = (buy_k1_close is None) or (c_now > buy_k1_close)
+            if condA and condB and condC:
+                buy_count += 1
+                if buy_count == 1:
+                    buy_k1_close = c_now
+                buy_count_low = min(buy_count_low, l_now)
+
+        if sell_setup:
+            condA = c_now <= l_arr[i - 2]
+            condB = l_now < l_arr[i - 1]
+            condC = (sell_k1_close is None) or (c_now < sell_k1_close)
+            if condA and condB and condC:
+                sell_count += 1
+                if sell_count == 1:
+                    sell_k1_close = c_now
+                sell_count_high = max(sell_count_high, h_now)
+
+        in_open_window = (open_t <= cur_time < no_open_t) if daily_reset else True
+
+        if direction == 1 and buy_count >= n3:
+            ok_filter = (not trend_filter) or (c_now > ma60_arr[i] and c_now > vwap_arr[i])
+            if in_open_window and pos == 0 and ok_filter:
+                pos = 1
+                entry_idx = i
+                stop_price = buy_count_low
+                highest_price = c_now
+                triggers[i] = True
+            buy_setup = False
+            buy_count = 0
+        elif direction == -1 and sell_count >= n3:
+            ok_filter = (not trend_filter) or (c_now < ma60_arr[i] and c_now < vwap_arr[i])
+            if in_open_window and pos == 0 and ok_filter:
+                pos = -1
+                entry_idx = i
+                stop_price = sell_count_high
+                lowest_price = c_now
+                triggers[i] = True
+            sell_setup = False
+            sell_count = 0
+
+        weights[i] = float(pos)
+
+    return triggers, weights
+
+
 def compute_signal_triggers_and_weights(
     df: pd.DataFrame,
     sig_id: str,
@@ -587,16 +961,34 @@ def compute_signal_triggers_and_weights(
     """
     针对不同战略方向 (trend / reversal / range / intraday) 采用物理匹配的离场状态机：
     - trend:    MA20 趋势跟踪 + 保本提损 + 3%*scale 移动止盈
-    - reversal: 从偏离区向 MA20 均值回归 (触及 MA20 或盈利达 +1.35*ATR 立即止盈，或满 8 根时间平仓)
-    - range:    通道边界向中轨回归 (触及 MA20 或盈利达 +1.15*ATR 立即止盈，或满 6 根时间平仓)
-    - intraday: 日内微结构脉冲 (盈利达 +1.25*ATR 或满 6 根平仓)
+    - reversal: 从偏离区向 MA20 均值回归 (触及 MA20 或盈利达 +1.35*ATR 立即止盈，或满 8 根时间平仓；5m 信号翻倍持仓根数)
+    - range:    通道边界向中轨回归 (触及 MA20 或盈利达 +1.15*ATR 立即止盈，或满 6 根时间平仓；5m 信号翻倍持仓根数)
+    - intraday: 日内微结构脉冲 (盈利达 +1.25*ATR 或满 6 根平仓；5m 信号翻倍持仓根数)
+    - TD序列:   直连项目原生 TD(Setup+Countdown) 两阶段状态机与计数极值结构止损
     """
+    if sig_id in TD_SIGNAL_PARAM_MAP:
+        direction, n1, n2, n3, sl_th, daily_rst, max_hold, t_flt = TD_SIGNAL_PARAM_MAP[sig_id]
+        return compute_td_triggers_and_weights(
+            df,
+            direction=direction,
+            n1=n1,
+            n2=n2,
+            n3=n3,
+            sl_threshold=sl_th,
+            daily_reset=daily_rst,
+            max_hold_bars=max_hold,
+            trend_filter=t_flt,
+        )
+
     spec = ALL_SIGNAL_SPECS[sig_id]
     n = len(df)
     triggers = np.zeros(n, dtype=bool)
     weights = np.zeros(n, dtype=np.float64)
+    is_5m_sig = sig_id.startswith("M5")
     cz_trig_arr = (
-        df[f"cz_trig_{sig_id}"].values if sig_id.startswith("CZ") and f"cz_trig_{sig_id}" in df.columns else None
+        df[f"cz_trig_{sig_id}"].values
+        if (sig_id.startswith("CZ") or is_5m_sig) and f"cz_trig_{sig_id}" in df.columns
+        else None
     )
 
     box_amp_th = 0.09 * scale
@@ -658,7 +1050,14 @@ def compute_signal_triggers_and_weights(
     l_ret = 9999.0
     s_reb = 0.0
 
-    for i in range(60, n):
+    tp_scale = 1.35 if is_5m_sig else 1.0
+    sl_scale = 1.20 if is_5m_sig else 1.0
+    rev_max_b = 16 if is_5m_sig else 8
+    rng_max_b = 12 if is_5m_sig else 6
+    intra_max_b = 12 if is_5m_sig else 6
+    start_bar = 240 if is_5m_sig else 60
+
+    for i in range(start_bar, n):
         c, o, h, l = c_arr[i], o_arr[i], h_arr[i], l_arr[i]
         ma20, ma60 = ma20_arr[i], ma60_arr[i]
         atr = max(atr_arr[i], 1e-5)
@@ -678,7 +1077,8 @@ def compute_signal_triggers_and_weights(
                     and l <= stop_p
                     or unreal >= act_th
                     and (peak_p - c) / peak_p >= trail_th
-                    or c < ma20
+                    or (c < ma60 if is_5m_sig else c < ma20)
+                    or (is_5m_sig and bars_held >= 32)
                 ):
                     pos = 0
                     exited = True
@@ -686,23 +1086,29 @@ def compute_signal_triggers_and_weights(
                 if (
                     stop_p is not None
                     and l <= stop_p
-                    or h >= entry_p + 1.35 * atr
-                    or (bars_held >= 2 and c >= ma20)
-                    or bars_held >= 8
+                    or h >= entry_p + 1.35 * tp_scale * atr
+                    or (not is_5m_sig and bars_held >= 2 and c >= ma20)
+                    or bars_held >= rev_max_b
                 ):
                     pos = 0
                     exited = True
             elif spec.exit_mode == "range":
-                if stop_p is not None and l <= stop_p or h >= entry_p + 1.15 * atr or c >= ma20 or bars_held >= 6:
+                if (
+                    stop_p is not None
+                    and l <= stop_p
+                    or h >= entry_p + 1.15 * tp_scale * atr
+                    or (not is_5m_sig and c >= ma20)
+                    or bars_held >= rng_max_b
+                ):
                     pos = 0
                     exited = True
             elif spec.exit_mode == "intraday":
                 if (
                     stop_p is not None
                     and l <= stop_p
-                    or h >= entry_p + 1.25 * atr
-                    or bars_held >= 6
-                    or (cz_trig_arr is not None and bars_held >= 2 and c < ma20)
+                    or h >= entry_p + 1.25 * tp_scale * atr
+                    or bars_held >= intra_max_b
+                    or (not is_5m_sig and cz_trig_arr is not None and bars_held >= 2 and c < ma20)
                 ):
                     pos = 0
                     exited = True
@@ -718,7 +1124,8 @@ def compute_signal_triggers_and_weights(
                     and h >= stop_p
                     or unreal >= act_th
                     and (c - trough_p) / trough_p >= trail_th
-                    or c > ma20
+                    or (c > ma60 if is_5m_sig else c > ma20)
+                    or (is_5m_sig and bars_held >= 32)
                 ):
                     pos = 0
                     exited = True
@@ -726,23 +1133,29 @@ def compute_signal_triggers_and_weights(
                 if (
                     stop_p is not None
                     and h >= stop_p
-                    or l <= entry_p - 1.35 * atr
-                    or (bars_held >= 2 and c <= ma20)
-                    or bars_held >= 8
+                    or l <= entry_p - 1.35 * tp_scale * atr
+                    or (not is_5m_sig and bars_held >= 2 and c <= ma20)
+                    or bars_held >= rev_max_b
                 ):
                     pos = 0
                     exited = True
             elif spec.exit_mode == "range":
-                if stop_p is not None and h >= stop_p or l <= entry_p - 1.15 * atr or c <= ma20 or bars_held >= 6:
+                if (
+                    stop_p is not None
+                    and h >= stop_p
+                    or l <= entry_p - 1.15 * tp_scale * atr
+                    or (not is_5m_sig and c <= ma20)
+                    or bars_held >= rng_max_b
+                ):
                     pos = 0
                     exited = True
             elif spec.exit_mode == "intraday":
                 if (
                     stop_p is not None
                     and h >= stop_p
-                    or l <= entry_p - 1.25 * atr
-                    or bars_held >= 6
-                    or (cz_trig_arr is not None and bars_held >= 2 and c > ma20)
+                    or l <= entry_p - 1.25 * tp_scale * atr
+                    or bars_held >= intra_max_b
+                    or (not is_5m_sig and cz_trig_arr is not None and bars_held >= 2 and c > ma20)
                 ):
                     pos = 0
                     exited = True
@@ -1186,11 +1599,12 @@ def compute_signal_triggers_and_weights(
                         entered = True
 
         # =====================================================================
-        # === Round 3 三期原生 Rust `czsc-signals` 组合信号状态机 ===
+        # === Round 3 & Round 4 原生 Rust `czsc-signals` (含 5m 专属) 组合信号状态机 ===
         # =====================================================================
         elif cz_trig_arr is not None:
             if pos == 0 and bool(cz_trig_arr[i]):
-                stop_mult = 1.10 if spec.exit_mode == "trend" else (0.95 if spec.exit_mode == "reversal" else 0.85)
+                base_sl = 1.10 if spec.exit_mode == "trend" else (0.95 if spec.exit_mode == "reversal" else 0.85)
+                stop_mult = base_sl * sl_scale
                 if spec.direction == 1:
                     pos, entry_p, peak_p, stop_p = 1, c, c, c - stop_mult * atr
                 else:
@@ -1204,6 +1618,6 @@ def compute_signal_triggers_and_weights(
 
     if cz_trig_arr is not None:
         triggers[:] = False
-        triggers[60:] = cz_trig_arr[60:]
+        triggers[start_bar:] = cz_trig_arr[start_bar:]
 
     return triggers, weights

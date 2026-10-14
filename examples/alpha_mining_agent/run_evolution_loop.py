@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """
-159915 长期自主信号挖掘与 4×4 生态位矩阵进化 Agent 主循环
-(MAP-Elites Niche Matrix + Archetype-Specific Rulers + 4-Timeframe Atomic Routing)
+159915 长期自主信号挖掘与 4×5 全周期生态位矩阵进化 Agent 主循环
+(MAP-Elites Niche Matrix + Archetype-Specific Rulers + 5-Timeframe Atomic Routing)
 
 核心特性：
-1. 搜索单元原子化为 `sig_id@tf` (跨越 1d / 60m / 30m / 15m 四级周期)，哪个信号在哪个周期过关就只挂载在哪个周期；
+1. 搜索单元原子化为 `sig_id@tf` (跨越 1d / 60m / 30m / 15m / 5m 五级周期)，哪个信号在哪个周期过关就只挂载在哪个周期；
 2. 四大战略方向配置专属法医三重屏障检验尺 (趋势尺 / 反转尺 / 回归尺 / 日内尺)，彻底消除对反转与日内信号的误杀；
 3. 三维真互补门禁 (生态位配额防扎堆 + 持仓时序低相关 |ρ|<0.32 + 空仓填补率 & 回撤期雪中送炭收益 > 0)；
 4. 持久态存储 signal_zoo.json / niche_matrix.json / graveyard.jsonl / leaderboard.md。
@@ -77,16 +77,21 @@ def load_all_four_timeframes(csv_path: Path) -> dict[str, pd.DataFrame]:
 
     def _agg(bars_per_group: int, tf: str) -> pd.DataFrame:
         scale = TF_SCALE_MAP[tf]
-        tmp = df_raw.copy()
-        tmp["grp"] = tmp["bar_in_day"] // bars_per_group
-        kdf = tmp.groupby(["date", "grp"], as_index=False).agg(
-            dt=("datetime", "last"),
-            open=("open", "first"),
-            high=("high", "max"),
-            low=("low", "min"),
-            close=("close", "last"),
-            volume=("volume", "sum"),
-        )
+        if bars_per_group == 1:
+            kdf = df_raw[["date", "datetime", "open", "high", "low", "close", "volume"]].copy()
+            kdf = kdf.rename(columns={"datetime": "dt"})
+            kdf["grp"] = df_raw["bar_in_day"]
+        else:
+            tmp = df_raw.copy()
+            tmp["grp"] = tmp["bar_in_day"] // bars_per_group
+            kdf = tmp.groupby(["date", "grp"], as_index=False).agg(
+                dt=("datetime", "last"),
+                open=("open", "first"),
+                high=("high", "max"),
+                low=("low", "min"),
+                close=("close", "last"),
+                volume=("volume", "sum"),
+            )
         kdf["symbol"] = "159915"
         kdf = enrich_kline_features(kdf, scale=scale)
         return attach_native_czsc_signals(kdf, tf, WORKSPACE_DIR)
@@ -96,6 +101,7 @@ def load_all_four_timeframes(csv_path: Path) -> dict[str, pd.DataFrame]:
         "60m": _agg(12, "60m"),
         "30m": _agg(6, "30m"),
         "15m": _agg(3, "15m"),
+        "5m": _agg(1, "5m"),
     }
 
 
@@ -111,7 +117,7 @@ def evaluate_full_is_oos(df_30m: pd.DataFrame, w_multi: np.ndarray) -> dict:
 
 def build_niche_matrix_summary(zoo: dict[str, dict]) -> pd.DataFrame:
     archetypes = ["A_顺势突破簇", "B_背驰反转簇", "C_震荡回归簇", "D_日内微结构簇"]
-    tfs = ["1d", "60m", "30m", "15m"]
+    tfs = ["1d", "60m", "30m", "15m", "5m"]
     grid = {arch: {tf: [] for tf in tfs} for arch in archetypes}
 
     for _uid, info in zoo.items():
@@ -151,12 +157,12 @@ def generate_markdown_leaderboard(ledger: AgentStateLedger, niche_df: pd.DataFra
 
     new_units = [u for u, v in zoo.items() if not v["is_base_seed"]]
     lines = [
-        "# 159915 自主信号挖掘 Agent · 4×4 生态位矩阵与实时排行榜 (MAP-Elites Signal Zoo)",
+        "# 159915 自主信号挖掘 Agent · 4×5 全周期生态位矩阵与实时排行榜 (MAP-Elites Signal Zoo)",
         "",
-        f"- **已入库原子信号单元总数 (`sig_id@tf`)**: `{len(zoo)}` 个（含 15 个基石种子单元 + **`{len(new_units)}` 个 Agent 跨四大战略方向与四周期新挖正交单元**）",
+        f"- **已入库原子信号单元总数 (`sig_id@tf`)**: `{len(zoo)}` 个（含 15 个基石种子单元 + **`{len(new_units)}` 个 Agent 跨四大战略方向与五级周期新挖正交单元**）",
         f"- **已证伪/拦截进入墓地的原子单元数**: `{len(grave)}` 个",
         "",
-        "## 一、4×4 生态位矩阵分布表 (4 大战略方向 × 4 个独立周期)",
+        "## 一、4×5 全周期生态位矩阵分布表 (4 大战略方向 × 5 个独立周期 1d / 60m / 30m / 15m / 5m)",
         "",
         _df_to_md_table(niche_df),
         "",
@@ -224,9 +230,9 @@ def export_evolution_dashboard(
         shared_xaxes=False,
         vertical_spacing=0.08,
         subplot_titles=(
-            "【159915 4×4生态位矩阵 Agent】 进化前后四周期复合净值对比 (左侧 2020-2023 样本内 | 右侧 2024-2026 样本外盲测)",
+            "【159915 4×5全周期生态位矩阵 Agent】 进化前后五周期复合净值对比 (左侧 2020-2023 样本内 | 右侧 2024-2026 样本外盲测)",
             "动态回撤深度对比 (Drawdown %)",
-            "Agent 跨四大战略方向与四周期 (1d/60m/30m/15m) 自主进化阶梯轨迹",
+            "Agent 跨四大战略方向与五级周期 (1d/60m/30m/15m/5m) 自主进化阶梯轨迹",
         ),
         row_heights=[0.48, 0.22, 0.30],
         specs=[[{"secondary_y": False}], [{"secondary_y": False}], [{"secondary_y": True}]],
@@ -257,7 +263,7 @@ def export_evolution_dashboard(
         go.Scatter(
             x=dates_str,
             y=nav_champ.values,
-            name=f"★ 进化后：4×4生态位矩阵多方向共振策略 (Step {history_rows[-1]['step']})",
+            name=f"★ 进化后：4×5全周期生态位矩阵多方向共振策略 (Step {history_rows[-1]['step']})",
             line={"color": "#00E676", "width": 3.4},
         ),
         row=1,
@@ -332,7 +338,7 @@ def export_evolution_dashboard(
         paper_bgcolor="#0A0E14",
         plot_bgcolor="#101721",
         title={
-            "text": "159915 创业板 ETF · 4×4 生态位矩阵 (趋势+反转+回归+日内 × 1d/60m/30m/15m) 自主进化大屏",
+            "text": "159915 创业板 ETF · 4×5 全周期生态位矩阵 (趋势+反转+回归+日内 × 1d/60m/30m/15m/5m) 自主进化大屏",
             "font": {"size": 18, "color": "#FFFFFF"},
             "x": 0.02,
             "y": 0.98,
@@ -357,12 +363,12 @@ def export_evolution_dashboard(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="159915 4×4 生态位矩阵自主信号挖掘与进化 Agent")
+    parser = argparse.ArgumentParser(description="159915 4×5 全周期生态位矩阵自主信号挖掘与进化 Agent")
     parser.add_argument(
-        "--reset", action="store_true", help="清空历史账本，从基石种子开始重新运行完整 4×4 生态位进化循环"
+        "--reset", action="store_true", help="清空历史账本，从基石种子开始重新运行完整 4×5 全周期生态位进化循环"
     )
     parser.add_argument("--max-candidates", type=int, default=999, help="本轮最多测试多少个原子候选单元")
-    parser.add_argument("--status-only", action="store_true", help="仅打印当前持久态信号库与 4×4 生态位矩阵")
+    parser.add_argument("--status-only", action="store_true", help="仅打印当前持久态信号库与 4×5 全周期生态位矩阵")
     args = parser.parse_args()
 
     ledger = AgentStateLedger(WORKSPACE_DIR)
@@ -378,8 +384,8 @@ def main() -> None:
         return
 
     print("=" * 125)
-    print("  【159915 4×4 生态位矩阵 · 长期自主信号挖掘与多方向正交进化 Agent】")
-    print("  四大战略方向 (趋势突破 / 背驰反转 / 震荡回归 / 日内微结构) × 四级独立周期 (1d / 60m / 30m / 15m)")
+    print("  【159915 4×5 全周期生态位矩阵 · 长期自主信号挖掘与多方向正交进化 Agent】")
+    print("  四大战略方向 (趋势突破 / 背驰反转 / 震荡回归 / 日内微结构) × 五级独立周期 (1d / 60m / 30m / 15m / 5m)")
     print("=" * 125)
 
     tf_dfs = load_all_four_timeframes(REAL_5M_CSV)
@@ -563,7 +569,8 @@ def main() -> None:
         best_trial_eval = None
         best_delta_score = -999.0
 
-        for cand_w in (0.20, 0.28, 0.36):
+        cand_weights = (0.28, 0.40, 0.52) if tf == "5m" else (0.20, 0.28, 0.36)
+        for cand_w in cand_weights:
             t_alloc = dict(current_alloc)
             t_alloc[unit_id] = cand_w
             w_t_multi = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, t_alloc)
@@ -591,14 +598,16 @@ def main() -> None:
         delta_sharpe_is = round(trial_eval["is"]["sharpe"] - curr_eval["is"]["sharpe"], 3)
         delta_calmar_is = round(trial_eval["is"]["calmar"] - curr_eval["is"]["calmar"], 3)
 
-        min_delta_ret = 0.05 if tf == "15m" else 0.25
+        min_delta_ret = 0.05 if tf in ("15m", "5m") else 0.25
+        min_score_th = -0.06 if tf == "5m" else -0.04
         passed_g3 = (
             (delta_trades_is >= 1 or delta_active_is >= 0.15)
             and (
                 delta_ret_is >= min_delta_ret
                 or (delta_ret_is >= 0.15 and delta_mdd_is <= 0.10 and best_delta_score >= -0.02)
+                or (tf == "5m" and delta_ret_is >= 0.0 and delta_mdd_is <= 0.25 and best_delta_score >= -0.06)
             )
-            and best_delta_score >= -0.04
+            and best_delta_score >= min_score_th
             and delta_mdd_is <= 0.80
         )
         if not passed_g3:
@@ -624,7 +633,7 @@ def main() -> None:
             )
             continue
 
-        # --- 连闯三关！正式晋升入库 4×4 生态位矩阵 ---
+        # --- 连闯三关！正式晋升入库 4×5 生态位矩阵 ---
         gate_stats["Admitted"] += 1
         step_counter += 1
         current_alloc = trial_alloc
@@ -729,13 +738,13 @@ def main() -> None:
         print(pd.DataFrame(admitted_summary_rows).to_string(index=False))
 
     print("\n" + "=" * 125)
-    print("【二、4×4 生态位矩阵分布总览 (4 大战略方向 × 4 个独立周期 1d / 60m / 30m / 15m)】")
+    print("【二、4×5 全周期生态位矩阵分布总览 (4 大战略方向 × 5 个独立周期 1d / 60m / 30m / 15m / 5m)】")
     print("=" * 125)
     print(niche_df.to_string(index=False))
 
     history_rows = ledger.load_evolution_history()
     print("\n" + "=" * 125)
-    print("【三、Agent 自主进化阶梯轨迹：从单一突破基线到四方向×四周期生态位共振组合 (含 2024-2026 纯样本外盲测)】")
+    print("【三、Agent 自主进化阶梯轨迹：从单一突破基线到四方向×五周期生态位共振组合 (含 2024-2026 纯样本外盲测)】")
     print("=" * 125)
     hist_df = pd.DataFrame(history_rows)[
         [
@@ -763,7 +772,7 @@ def main() -> None:
 
     print("\n" + "=" * 125)
     print(f"  [持久态基因库]   {ledger.zoo_path.resolve()}")
-    print(f"  [4x4生态位矩阵]  {ledger.niche_path.resolve()}")
+    print(f"  [4x5生态位矩阵]  {ledger.niche_path.resolve()}")
     print(f"  [证伪信号墓地]   {ledger.graveyard_path.resolve()}")
     print(f"  [实时演化榜单]   {ledger.leaderboard_path.resolve()}")
     print(f"  [交互式进化大屏] {DASHBOARD_HTML.resolve()}")

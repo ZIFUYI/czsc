@@ -111,18 +111,22 @@ def run_gate1_forensic_audit(
     is_mask = (df_tf["dt"] <= IS_END_DT).values
     oos_mask = (df_tf["dt"] > IS_END_DT).values
 
-    min_samples = 8 if timeframe == "1d" else (12 if timeframe == "60m" else 15)
+    min_samples = 8 if timeframe == "1d" else (12 if timeframe == "60m" else (20 if timeframe == "5m" else 15))
+    eff_max_bars = ruler.max_bars * 2 if timeframe == "5m" else ruler.max_bars
+    eff_tp_atr = ruler.tp_atr * 1.35 if timeframe == "5m" else ruler.tp_atr
+    eff_sl_atr = ruler.sl_atr * 1.20 if timeframe == "5m" else ruler.sl_atr
+    min_warmup = 240 if timeframe == "5m" else 60
 
     is_raw_idx = np.where(triggers_tf & is_mask)[0]
-    is_purged_idx = purge_overlapping_triggers(is_raw_idx, cooldown_bars=ruler.max_bars)
+    is_purged_idx = purge_overlapping_triggers(is_raw_idx, cooldown_bars=eff_max_bars)
 
     tb_is = evaluate_triple_barrier(
         df_tf,
         is_purged_idx,
         direction,
-        max_bars=ruler.max_bars,
-        tp_atr=ruler.tp_atr,
-        sl_atr=ruler.sl_atr,
+        max_bars=eff_max_bars,
+        tp_atr=eff_tp_atr,
+        sl_atr=eff_sl_atr,
     )
     n_purged = len(tb_is)
     if n_purged < min_samples:
@@ -145,7 +149,7 @@ def run_gate1_forensic_audit(
 
     # 500 轮随机入场置换检验 (同样使用该专属标尺)
     valid_pool = np.where(
-        is_mask & (np.arange(len(df_tf)) >= 60) & (np.arange(len(df_tf)) < len(df_tf) - ruler.max_bars - 2)
+        is_mask & (np.arange(len(df_tf)) >= min_warmup) & (np.arange(len(df_tf)) < len(df_tf) - eff_max_bars - 2)
     )[0]
     unit_seed = (
         4242
@@ -158,9 +162,9 @@ def run_gate1_forensic_audit(
         df_tf,
         rand_pool_idx,
         direction,
-        max_bars=ruler.max_bars,
-        tp_atr=ruler.tp_atr,
-        sl_atr=ruler.sl_atr,
+        max_bars=eff_max_bars,
+        tp_atr=eff_tp_atr,
+        sl_atr=eff_sl_atr,
     )
     rand_rets = rand_tb["net_ret"].values
     bench_drift = float(np.mean(rand_rets))
@@ -171,14 +175,14 @@ def run_gate1_forensic_audit(
 
     # 样本外 (2024-2026) 盲测表现跟踪
     oos_raw_idx = np.where(triggers_tf & oos_mask)[0]
-    oos_purged_idx = purge_overlapping_triggers(oos_raw_idx, cooldown_bars=ruler.max_bars)
+    oos_purged_idx = purge_overlapping_triggers(oos_raw_idx, cooldown_bars=eff_max_bars)
     tb_oos = evaluate_triple_barrier(
         df_tf,
         oos_purged_idx,
         direction,
-        max_bars=ruler.max_bars,
-        tp_atr=ruler.tp_atr,
-        sl_atr=ruler.sl_atr,
+        max_bars=eff_max_bars,
+        tp_atr=eff_tp_atr,
+        sl_atr=eff_sl_atr,
     )
     if len(tb_oos) >= 2:
         r_oos = tb_oos["net_ret"].values
@@ -194,7 +198,7 @@ def run_gate1_forensic_audit(
     else:
         oos_mean = oos_alpha = oos_safety = 0.0
 
-    tf_alpha_scale = {"1d": 1.2, "60m": 1.0, "30m": 0.85, "15m": 0.55}.get(timeframe, 1.0)
+    tf_alpha_scale = {"1d": 1.2, "60m": 1.0, "30m": 0.85, "15m": 0.55, "5m": 0.40}.get(timeframe, 1.0)
     min_alpha_dec = (ruler.min_alpha_bp * tf_alpha_scale) / 10000.0
     min_safety_dec = ruler.min_safety_pct / 100.0
     max_pval = ruler.max_boot_pval + (0.02 if timeframe in ("60m", "1d") else 0.0)
@@ -253,10 +257,11 @@ def run_gate2_3d_complementarity_audit(
             "dd_rescue_alpha_bp": 0.0,
         }
 
-    if current_arch_same_dir_new_count >= 4:
+    max_same_dir = max(4, (ruler.quota_max_units + 1) // 2)
+    if current_arch_same_dir_new_count >= max_same_dir:
         return {
             "passed": False,
-            "reason": f"{archetype} 同向单边配额已满 ({current_arch_same_dir_new_count}/4)，优先预留反向对冲生态位",
+            "reason": f"{archetype} 同向单边配额已满 ({current_arch_same_dir_new_count}/{max_same_dir})，优先预留反向对冲生态位",
             "max_corr": 0.0,
             "max_corr_peer": "DirQuotaCap",
             "gap_fill_ratio_pct": 0.0,
@@ -331,10 +336,11 @@ def map_tf_weight_to_30m_grid(
     timeframe: str,
 ) -> np.ndarray:
     """
-    将任意周期 (1d / 60m / 30m / 15m) 的持仓权重无未来函数映射到 30m 主时间轴上：
+    将任意周期 (1d / 60m / 30m / 15m / 5m) 的持仓权重无未来函数映射到 30m 主时间轴上：
     - 30m: 直接返回
     - 1d / 60m: 在收盘时刻 dt 对齐并向后 ffill
     - 15m: 每个 30m K线由 2 根 15m K线组成，按索引分组取均值映射到对应 30m K线
+    - 5m: 每个 30m K线由 6 根 5m K线组成，取该 30m K线收盘时刻 (第6根5m) 的已知持仓状态以消除高频碎步换手磨损
     """
     if timeframe == "30m":
         return w_source.copy()
@@ -348,6 +354,12 @@ def map_tf_weight_to_30m_grid(
             return 0.5 * (w_source[0::2] + w_source[1::2])
         s_src = pd.Series(w_source, index=df_source["dt"])
         return df_30m["dt"].map(s_src).ffill().fillna(0.0).values
+    elif timeframe == "5m":
+        n30 = len(df_30m)
+        if len(w_source) == 6 * n30:
+            return w_source[5::6].copy()
+        s_src = pd.Series(w_source, index=df_source["dt"])
+        return df_30m["dt"].map(s_src).ffill().fillna(0.0).values
     raise ValueError(f"Unsupported timeframe: {timeframe}")
 
 
@@ -357,8 +369,8 @@ def synthesize_atomic_units_portfolio(
     unit_alloc_map: dict[str, float],
 ) -> np.ndarray:
     """
-    按原子单元 (sig_id@tf) 独立合成四周期复合持仓权重：
-    先在各周期层内部 (1d, 60m, 30m, 15m) 聚合截断，再按四周期分形共振系数叠加。
+    按原子单元 (sig_id@tf) 独立合成五周期复合持仓权重：
+    先在各周期层内部 (1d, 60m, 30m, 15m, 5m) 聚合截断，再按五周期分形共振系数叠加。
     """
     n = len(df_30m)
     w_by_tf = {
@@ -366,6 +378,7 @@ def synthesize_atomic_units_portfolio(
         "60m": np.zeros(n, dtype=np.float64),
         "30m": np.zeros(n, dtype=np.float64),
         "15m": np.zeros(n, dtype=np.float64),
+        "5m": np.zeros(n, dtype=np.float64),
     }
 
     for unit_id, coeff in unit_alloc_map.items():
@@ -376,8 +389,9 @@ def synthesize_atomic_units_portfolio(
     w60 = np.clip(w_by_tf["60m"], -1.0, 1.0)
     w30 = np.clip(w_by_tf["30m"], -1.0, 1.0)
     w15 = np.clip(w_by_tf["15m"], -1.0, 1.0)
+    w5 = np.clip(w_by_tf["5m"], -1.0, 1.0)
 
-    w_multi = np.clip(0.65 * w1d + 0.55 * w60 + 0.45 * w30 + 0.35 * w15, -1.0, 1.0)
+    w_multi = np.clip(0.65 * w1d + 0.55 * w60 + 0.45 * w30 + 0.35 * w15 + 0.25 * w5, -1.0, 1.0)
     return w_multi
 
 
