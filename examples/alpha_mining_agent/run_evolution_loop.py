@@ -57,22 +57,33 @@ REAL_5M_CSV = Path("examples/results/159915_real_5m_2020_2026.csv")
 DASHBOARD_HTML = WORKSPACE_DIR / "autonomous_evolution_dashboard.html"
 
 
-def load_all_four_timeframes(csv_path: Path) -> dict[str, pd.DataFrame]:
-    df_raw = pd.read_csv(csv_path)
-    df_raw["datetime"] = pd.to_datetime(df_raw["datetime"])
-    df_raw = (
-        df_raw.rename(
-            columns={
-                "SZSE.159915.open": "open",
-                "SZSE.159915.high": "high",
-                "SZSE.159915.low": "low",
-                "SZSE.159915.close": "close",
-                "SZSE.159915.volume": "volume",
-            }
-        )
-        .sort_values("datetime")
-        .reset_index(drop=True)
-    )
+def load_all_four_timeframes(
+    data_path: Path, symbol_name: str = "159915", workspace_dir: Path = WORKSPACE_DIR
+) -> dict[str, pd.DataFrame]:
+    if str(data_path).endswith(".parquet"):
+        df_raw = pd.read_parquet(data_path)
+    else:
+        df_raw = pd.read_csv(data_path)
+
+    if "datetime" not in df_raw.columns:
+        if "dt" in df_raw.columns:
+            df_raw["datetime"] = pd.to_datetime(df_raw["dt"])
+        else:
+            df_raw["datetime"] = pd.to_datetime(df_raw.index)
+    else:
+        df_raw["datetime"] = pd.to_datetime(df_raw["datetime"])
+
+    col_map = {}
+    for standard_col in ["open", "high", "low", "close", "volume"]:
+        if standard_col not in df_raw.columns:
+            for c in df_raw.columns:
+                if standard_col in c.lower():
+                    col_map[c] = standard_col
+                    break
+    if col_map:
+        df_raw = df_raw.rename(columns=col_map)
+
+    df_raw = df_raw.sort_values("datetime").reset_index(drop=True)
     df_raw["date"] = df_raw["datetime"].dt.date
     df_raw["bar_in_day"] = df_raw.groupby("date").cumcount()
 
@@ -93,9 +104,9 @@ def load_all_four_timeframes(csv_path: Path) -> dict[str, pd.DataFrame]:
                 close=("close", "last"),
                 volume=("volume", "sum"),
             )
-        kdf["symbol"] = "159915"
+        kdf["symbol"] = symbol_name
         kdf = enrich_kline_features(kdf, scale=scale)
-        return attach_native_czsc_signals(kdf, tf, WORKSPACE_DIR)
+        return attach_native_czsc_signals(kdf, tf, workspace_dir)
 
     return {
         "1d": _agg(48, "1d"),
@@ -364,7 +375,25 @@ def export_evolution_dashboard(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="159915 4×5 全周期生态位矩阵自主信号挖掘与进化 Agent")
+    parser = argparse.ArgumentParser(description="4×5 全周期生态位矩阵自主信号挖掘与进化 Agent")
+    parser.add_argument(
+        "--symbol",
+        type=str,
+        default="159915",
+        help="标的代码 (例如 159915, IM9999.CCFX, IC9999.CCFX, IF9999.CCFX)",
+    )
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        default=None,
+        help="行情数据路径 (默认根据 symbol 自动匹配本地 Parquet 或 CSV)",
+    )
+    parser.add_argument(
+        "--workspace-dir",
+        type=str,
+        default=None,
+        help="专属工作区目录 (默认 examples/results/alpha_agent_workspace/{symbol})",
+    )
     parser.add_argument(
         "--reset", action="store_true", help="清空历史账本，从基石种子开始重新运行完整 4×5 全周期生态位进化循环"
     )
@@ -387,25 +416,40 @@ def main() -> None:
     parser.add_argument("--status-only", action="store_true", help="仅打印当前持久态信号库与 4×5 全周期生态位矩阵")
     args = parser.parse_args()
 
-    ledger = AgentStateLedger(WORKSPACE_DIR)
+    symbol = args.symbol
+    data_base_dir = Path(r"D:\my-qlib\data")
+    if symbol == "159915":
+        workspace_dir = Path(args.workspace_dir) if args.workspace_dir else WORKSPACE_DIR
+        data_path = Path(args.data_path) if args.data_path else REAL_5M_CSV
+        symbol_code = "159915"
+        dashboard_html = DASHBOARD_HTML
+    else:
+        sym_clean = symbol.replace(".", "_")
+        workspace_dir = Path(args.workspace_dir) if args.workspace_dir else (WORKSPACE_DIR / sym_clean)
+        data_path = Path(args.data_path) if args.data_path else (data_base_dir / "5min" / f"{symbol}.parquet")
+        symbol_code = symbol.split(".")[0]
+        dashboard_html = workspace_dir / f"autonomous_evolution_dashboard_{sym_clean}.html"
+
+    ledger = AgentStateLedger(workspace_dir)
     if args.reset:
         ledger.reset_workspace()
 
     if args.status_only:
         zoo = ledger.load_signal_zoo()
         grave = ledger.load_graveyard_records()
-        print(f"当前已入库原子信号单元: {len(zoo)} 个 | 已淘汰墓地原子单元: {len(grave)} 个")
+        print(f"[{symbol}] 当前已入库原子信号单元: {len(zoo)} 个 | 已淘汰墓地原子单元: {len(grave)} 个")
         if zoo:
             print(build_niche_matrix_summary(zoo).to_string(index=False))
         return
 
     print("=" * 125)
-    print("  【159915 4×5 全周期生态位矩阵 · 长期自主信号挖掘与多方向正交进化 Agent】")
+    print(f"  【{symbol} 4×5 全周期生态位矩阵 · 长期自主信号挖掘与多方向正交进化 Agent】")
     print("  四大战略方向 (趋势突破 / 背驰反转 / 震荡回归 / 日内微结构) × 五级独立周期 (1d / 60m / 30m / 15m / 5m)")
     print("  [主时间轴] 原生 5m 无未来函数阶梯对齐网格 (消除 15m/5m 下采样坍缩与延迟 + 0.06 最小调仓死区)")
+    print(f"  [数据源] {data_path} | [工作区] {workspace_dir}")
     print("=" * 125)
 
-    tf_dfs = load_all_four_timeframes(REAL_5M_CSV)
+    tf_dfs = load_all_four_timeframes(data_path, symbol_name=symbol_code, workspace_dir=workspace_dir)
     df_1d = tf_dfs["1d"]
     # 将主回测与合成网格下沉至原生 5m 时间轴 (保持变量名 df_30m 兼容后续调用)
     df_30m = tf_dfs["5m"]
@@ -1244,8 +1288,18 @@ def main() -> None:
         print("=" * 125)
 
         is_mask = (df_30m["dt"] <= IS_END_DT).values
-        h1_mask = (df_30m["dt"] <= pd.Timestamp("2021-12-31 23:59:59")).values
-        h2_mask = ((df_30m["dt"] > pd.Timestamp("2021-12-31 23:59:59")) & (df_30m["dt"] <= IS_END_DT)).values
+        is_dts = df_30m["dt"][is_mask]
+        if len(is_dts) > 0 and is_dts.min() < pd.Timestamp("2022-01-01"):
+            h1_mask = (df_30m["dt"] <= pd.Timestamp("2021-12-31 23:59:59")).values
+            h2_mask = ((df_30m["dt"] > pd.Timestamp("2021-12-31 23:59:59")) & (df_30m["dt"] <= IS_END_DT)).values
+        elif len(is_dts) > 0:
+            mid_idx = len(is_dts) // 2
+            mid_dt = is_dts.iloc[mid_idx]
+            h1_mask = (df_30m["dt"] <= mid_dt).values
+            h2_mask = ((df_30m["dt"] > mid_dt) & (df_30m["dt"] <= IS_END_DT)).values
+        else:
+            h1_mask = is_mask
+            h2_mask = is_mask
 
         def _prep_fast_slice(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             sub = df_30m.iloc[mask].reset_index(drop=True)
@@ -1454,14 +1508,14 @@ def main() -> None:
     print(hist_df.to_string(index=False))
 
     generate_markdown_leaderboard(ledger, niche_df)
-    export_evolution_dashboard(df_1d, base_eval, curr_eval, history_rows, DASHBOARD_HTML)
+    export_evolution_dashboard(df_1d, base_eval, curr_eval, history_rows, dashboard_html)
 
     print("\n" + "=" * 125)
     print(f"  [持久态基因库]   {ledger.zoo_path.resolve()}")
     print(f"  [4x5生态位矩阵]  {ledger.niche_path.resolve()}")
     print(f"  [证伪信号墓地]   {ledger.graveyard_path.resolve()}")
     print(f"  [实时演化榜单]   {ledger.leaderboard_path.resolve()}")
-    print(f"  [交互式进化大屏] {DASHBOARD_HTML.resolve()}")
+    print(f"  [交互式进化大屏] {dashboard_html.resolve()}")
     print("=" * 125)
 
 

@@ -426,24 +426,24 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir) -> pd.D
             {"name": "czsc.signals.cxt_bi_status_V230101", "freq": freq_str, "di": 1},
             {"name": "czsc.signals.cxt_fx_power_V221107", "freq": freq_str, "di": 1},
             {"name": "czsc.signals.cxt_bi_end_V230312", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.cxt_bi_end_V230106", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.cxt_bi_end_V230107", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.byi_bi_end_V230106", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.byi_bi_end_V230107", "freq": freq_str, "di": 1},
             {"name": "czsc.signals.byi_second_bs_V230324", "freq": freq_str, "di": 1},
             {"name": "czsc.signals.byi_symmetry_zs_V221107", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.jcc_san_xing_xian_V221023", "freq": freq_str, "di": 1, "th": 200},
-            {"name": "czsc.signals.jcc_ten_mo_V221101", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.jcc_yun_xian_V221101", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.jcc_ci_tou_V221111", "freq": freq_str, "di": 1, "z": 5, "th": 50},
-            {"name": "czsc.signals.jcc_wu_yun_gai_ding_V221112", "freq": freq_str, "di": 1, "z": 5, "th": 50},
-            {"name": "czsc.signals.jcc_three_crow_V221026", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.jcc_san_fa_V221101", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.bar_fake_break_V230203", "freq": freq_str, "di": 1, "n": 10, "m": 3},
+            {"name": "czsc.signals.jcc_san_xing_xian_V221023", "freq": freq_str, "di": 1, "th": 2},
+            {"name": "czsc.signals.jcc_ten_mo_V221028", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.jcc_yun_xian_V221118", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.jcc_ci_tou_V221101", "freq": freq_str, "di": 1, "z": 5, "th": 50},
+            {"name": "czsc.signals.jcc_wu_yun_gai_ding_V221101", "freq": freq_str, "di": 1, "z": 5, "th": 50},
+            {"name": "czsc.signals.jcc_three_crow_V221108", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.jcc_san_fa_V20221115", "freq": freq_str, "di": 1},
+            {"name": "czsc.signals.bar_fake_break_V230204", "freq": freq_str, "di": 1, "n": 10, "m": 3},
             {"name": "czsc.signals.bar_fang_liang_break_V221216", "freq": freq_str, "di": 1, "ma_type": "SMA", "timeperiod": 20, "th": 13},
             {"name": "czsc.signals.bar_dual_thrust_V230403", "freq": freq_str, "di": 1, "n": 4, "k1": 5, "k2": 5},
             {"name": "czsc.signals.bar_r_breaker_V230326", "freq": freq_str, "n": 1},
             {"name": "czsc.signals.bar_td9_V240616", "freq": freq_str, "n": 9},
             {"name": "czsc.signals.bar_accelerate_V221110", "freq": freq_str, "di": 1, "window": 10},
-            {"name": "czsc.signals.obv_up_down_V230719", "freq": freq_str, "di": 1, "n": 20, "m": 10, "ma_overlap": 3},
+            {"name": "czsc.signals.obv_up_dw_line_V230719", "freq": freq_str, "di": 1, "n": 20, "m": 10, "max_overlap": 3},
             {"name": "czsc.signals.vol_ti_suo_V221216", "freq": freq_str, "di": 1},
             {"name": "czsc.signals.vol_gao_di_V221218", "freq": freq_str, "di": 1},
         ]
@@ -466,39 +466,54 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir) -> pd.D
 
     df = pd.concat([df.reset_index(drop=True), sig_df.reset_index(drop=True)], axis=1)
 
-    bi5 = df["cz_D1五笔_形态V230619"].astype(str)
-    bi7 = df["cz_D1七笔_形态V230620"].astype(str)
-    bs3_19 = df["cz_D1#SMA#20_BS3辅助V230319"].astype(str)
-    bs3_28 = df["cz_D1_三买辅助V230228"].astype(str)
-    bs2_20 = df["cz_D1#SMA#20_BS2辅助V230320"].astype(str)
-    buy1 = df["cz_D1B_BUY1"].astype(str)
-    sell1 = df["cz_D1B_SELL1"].astype(str)
-    dzs = df["cz_D1双中枢_BS1辅助V230311"].astype(str)
-    mid_brk = df["cz_D1N3M2_双顺中线突破V260521"].astype(str)
-    bi_base = df["cz_D0BL9_V230228"].astype(str)
-    bi_st = df["cz_D1_表里关系V230101"].astype(str)
-    fx_pwr = df["cz_D1F_分型强弱"].astype(str)
-    be_macd = df["cz_D0MACD12#26#9_BE辅助V230312"].astype(str)
-    be_stop = df["cz_D0停顿分型_BE辅助V230106"].astype(str)
-    be_ver = df["cz_D0验证分型_BE辅助V230107"].astype(str)
-    byi_bs2 = df["cz_D1MACD12#26#9回抽零轴_BS2辅助V230324"].astype(str)
-    sym_zs = df["cz_D1B_对称中枢"].astype(str)
-    jcc_umb = df["cz_D1TH200_伞形线"].astype(str)
-    jcc_eng = df["cz_D1_吞没形态"].astype(str)
-    jcc_har = df["cz_D1_孕线"].astype(str)
-    jcc_prc = df["cz_D1Z5TH50_刺透形态"].astype(str)
-    jcc_drk = df["cz_D1Z5TH50_乌云盖顶"].astype(str)
-    jcc_crw = df["cz_D1_三只乌鸦"].astype(str)
-    jcc_3f = df["cz_D1K_三法"].astype(str)
-    fake_brk = df["cz_D1N10M3_假突破"].astype(str)
-    fl_brk = df["cz_D1TH13#SMA#20_突破V221216"].astype(str)
-    dt_bs = df["cz_D1通道突破#4#5#5_BS辅助V230403"].astype(str)
-    rbrk = df["cz_RBreaker_BS辅助V230326"].astype(str)
-    td9 = df["cz_神奇九转N9_BS辅助V240616"].astype(str)
-    acc = df["cz_D1W10_加速V221110"].astype(str)
-    obv_s = df["cz_D1N20M10MO3_OBV能量V230719"].astype(str)
-    vol_ts = df["cz_D1K_量柱V221216"].astype(str)
-    vol_gd = df["cz_D1K_量柱V221218"].astype(str)
+    def _safe_get(target_col: str, fallback_candidates: list[str] = None) -> pd.Series:
+        if target_col in df.columns:
+            return df[target_col].astype(str)
+        if fallback_candidates:
+            for cand in fallback_candidates:
+                if cand in df.columns:
+                    return df[cand].astype(str)
+                for col in df.columns:
+                    if cand in col:
+                        return df[col].astype(str)
+        for col in df.columns:
+            if target_col in col:
+                return df[col].astype(str)
+        return pd.Series("其他", index=df.index, dtype=str)
+
+    bi5 = _safe_get("cz_D1五笔_形态V230619", ["五笔"])
+    bi7 = _safe_get("cz_D1七笔_形态V230620", ["七笔"])
+    bs3_19 = _safe_get("cz_D1#SMA#20_BS3辅助V230319", ["BS3辅助V230319", "BS3"])
+    bs3_28 = _safe_get("cz_D1_三买辅助V230228", ["三买辅助V230228"])
+    bs2_20 = _safe_get("cz_D1#SMA#20_BS2辅助V230320", ["BS2辅助V230320", "BS2"])
+    buy1 = _safe_get("cz_D1B_BUY1", ["BUY1"])
+    sell1 = _safe_get("cz_D1B_SELL1", ["SELL1"])
+    dzs = _safe_get("cz_D1双中枢_BS1辅助V230311", ["双中枢"])
+    mid_brk = _safe_get("cz_D1N3M2_双顺中线突破V260521", ["双顺中线突破"])
+    bi_base = _safe_get("cz_D0BL9_V230228", ["BL9"])
+    bi_st = _safe_get("cz_D1_表里关系V230101", ["表里关系"])
+    fx_pwr = _safe_get("cz_D1F_分型强弱", ["分型强弱"])
+    be_macd = _safe_get("cz_D0MACD12#26#9_BE辅助V230312", ["BE辅助V230312"])
+    be_stop = _safe_get("cz_D0停顿分型_BE辅助V230106", ["停顿分型", "BE辅助V230106"])
+    be_ver = _safe_get("cz_D0验证分型_BE辅助V230107", ["验证分型", "BE辅助V230107"])
+    byi_bs2 = _safe_get("cz_D1MACD12#26#9回抽零轴_BS2辅助V230324", ["回抽零轴"])
+    sym_zs = _safe_get("cz_D1B_对称中枢", ["对称中枢"])
+    jcc_umb = _safe_get("cz_D1TH200_伞形线", ["伞形线"])
+    jcc_eng = _safe_get("cz_D1_吞没形态", ["吞没形态"])
+    jcc_har = _safe_get("cz_D1_孕线", ["孕线"])
+    jcc_prc = _safe_get("cz_D1Z5TH50_刺透形态", ["刺透形态"])
+    jcc_drk = _safe_get("cz_D1Z5TH50_乌云盖顶", ["乌云盖顶"])
+    jcc_crw = _safe_get("cz_D1_三只乌鸦", ["三只乌鸦"])
+    jcc_3f = _safe_get("cz_D1K_三法", ["三法"])
+    fake_brk = _safe_get("cz_D1N10M3_假突破", ["假突破"])
+    fl_brk = _safe_get("cz_D1TH13#SMA#20_突破V221216", ["突破V221216"])
+    dt_bs = _safe_get("cz_D1通道突破#4#5#5_BS辅助V230403", ["通道突破", "BS辅助V230403"])
+    rbrk = _safe_get("cz_RBreaker_BS辅助V230326", ["RBreaker"])
+    td9 = _safe_get("cz_神奇九转N9_BS辅助V240616", ["神奇九转"])
+    acc = _safe_get("cz_D1W10_加速V221110", ["加速V221110"])
+    obv_s = _safe_get("cz_D1N20M10MO3_OBV能量V230719", ["OBV能量"])
+    vol_ts = _safe_get("cz_D1K_量柱V221216", ["量柱V221216"])
+    vol_gd = _safe_get("cz_D1K_量柱V221218", ["量柱V221218"])
 
     df["cz_trig_CZ01L"] = (
         (bi5.str.startswith("上颈线突破") | bi5.str.startswith("类三买") | bi7.str.startswith("类三买"))
