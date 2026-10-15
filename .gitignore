@@ -134,3 +134,13 @@ scripts/auto-czsc-quant/results/
 # agent runtime artifacts (Multica / Claude Code) — not part of the library
 .multica/
 .agent_context/
+
+# Local market data caches and scratch
+159915/
+IC9999.CCFX/
+IF9999.CCFX/
+IM9999.CCFX/
+scratch/
+*.parquet
+examples/obv_ag/data/
+examples/obv_ag/runs/

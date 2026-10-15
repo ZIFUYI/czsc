@@ -16,7 +16,6 @@ from examples.multi_factor_cta.data_engine import (
 )
 from examples.multi_factor_cta.factor_engine import (
     ARCHETYPE_RULERS,
-    ArchetypeRuler,
     RuleFactorRegistry,
     RuleFactorSpec,
 )
@@ -33,7 +32,6 @@ from examples.multi_factor_cta.synthesis_engine import (
 
 __all__ = [
     "ARCHETYPE_RULERS",
-    "ArchetypeRuler",
     "AssetClass",
     "AssetSpec",
     "CrossAssetDataEngine",

@@ -112,7 +112,12 @@ def adjust_continuous_roll_gaps(df: pd.DataFrame, gap_atr_mult: float = 4.0) -> 
     overnight_gap = np.zeros(len(out), dtype=np.float64)
     overnight_gap[1:] = np.abs(o[1:] - c[:-1])
 
-    roll_mask = day_switch & (overnight_gap > gap_atr_mult * np.maximum(atr, 1e-6))
+    if "underlying_symbol" in out.columns and out["underlying_symbol"].dropna().nunique() > 1:
+        usym = out["underlying_symbol"].ffill().bfill().astype(str).values
+        roll_mask = np.zeros(len(out), dtype=bool)
+        roll_mask[1:] = usym[1:] != usym[:-1]
+    else:
+        roll_mask = day_switch & (overnight_gap > gap_atr_mult * np.maximum(atr, 1e-6))
     ratios = np.ones(len(out), dtype=np.float64)
     if np.any(roll_mask):
         idx_arr = np.where(roll_mask)[0]
@@ -259,8 +264,11 @@ class CrossAssetDataEngine:
         else:
             df["dt"] = pd.to_datetime(df["dt"])
 
+        keep_cols = ["dt", "open", "high", "low", "close", "volume"]
+        if "underlying_symbol" in df.columns:
+            keep_cols.append("underlying_symbol")
         df = (
-            df[["dt", "open", "high", "low", "close", "volume"]]
+            df[keep_cols]
             .dropna(subset=["open", "high", "low", "close"])
             .sort_values("dt")
             .drop_duplicates(subset=["dt"])

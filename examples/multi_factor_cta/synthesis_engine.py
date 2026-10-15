@@ -38,6 +38,13 @@ class IntraAssetThreePillarSynthesizer:
         "15m": 0.40,
         "5m": 0.30,
     }
+    COMMODITY_TF_WEIGHTS: dict[str, float] = {
+        "1d": 0.95,
+        "60m": 0.55,
+        "30m": 0.25,
+        "15m": 0.20,
+        "5m": 0.00,
+    }
 
     def synthesize(
         self,
@@ -83,16 +90,26 @@ class IntraAssetThreePillarSynthesizer:
             self._get_causal_regimes(df_grid) if (enable_regime_gating and asset_spec.symbol != "SZSE.159915") else None
         )
 
-        for tf, tw in self.TF_WEIGHTS.items():
+        is_commodity = asset_spec.asset_class == AssetClass.COMMODITY_FUTURES
+        tf_weight_map = self.COMMODITY_TF_WEIGHTS if is_commodity else self.TF_WEIGHTS
+
+        for tf, tw in tf_weight_map.items():
             wa = np.clip(w_tf_arch[tf]["A_顺势突破簇"], -1.0, 1.0)
             wb = np.clip(w_tf_arch[tf]["B_背驰反转簇"], -1.0, 1.0)
             wc = np.clip(w_tf_arch[tf]["C_震荡回归簇"], -1.0, 1.0)
             wd = np.clip(w_tf_arch[tf]["D_日内微结构簇"], -1.0, 1.0)
 
             if regimes is not None:
-                # 在强空头趋势态 (regime == -1) 下对 C_震荡回归簇 的逆势抄底多单施加保护阻尼；强多头趋势态 (regime == +1) 下对逆势摸顶空单施加保护阻尼
-                wc = np.where((regimes == -1) & (wc > 0.0), wc * 0.35, wc)
-                wc = np.where((regimes == 1) & (wc < 0.0), wc * 0.35, wc)
+                if is_commodity:
+                    # 商品期货趋势延续性强：彻底剔除 B_背驰反转簇，强趋势态下对 C_震荡回归簇 逆势信号施加保护阻尼
+                    wb = np.zeros_like(wb)
+                    wc = np.where((regimes == -1) & (wc > 0.0), wc * 0.15, wc)
+                    wc = np.where((regimes == 1) & (wc < 0.0), wc * 0.15, wc)
+                    wd = np.where(regimes != 0, wd * 0.35, wd * 0.50)
+                else:
+                    # 权益/股指标的：仅在强单边趋势态下对 C_震荡回归簇 的逆势头寸施加保护阻尼
+                    wc = np.where((regimes == -1) & (wc > 0.0), wc * 0.35, wc)
+                    wc = np.where((regimes == 1) & (wc < 0.0), wc * 0.35, wc)
 
             wbcd = np.clip(wb + wc + wd, -1.0, 1.0)
             w_a_total += tw * wa
@@ -104,10 +121,15 @@ class IntraAssetThreePillarSynthesizer:
             w_multi = np.clip(w_a_total, -1.0, 1.0)
         else:
             # 第二支柱：跨簇多空非对称反向断路器（按资产类别自适应）
-            if asset_spec.asset_class == AssetClass.COMMODITY_FUTURES:
+            if is_commodity and enable_regime_gating:
+                b_long, b_short = 0.15, 0.15
+                bcd_mult = 0.25
+            elif is_commodity:
                 b_long, b_short = 0.40, 0.40
+                bcd_mult = 1.25
             else:
                 b_long, b_short = 0.35, 0.50
+                bcd_mult = 1.25
 
             w_a_gated = w_a_total.copy()
             long_mask = w_a_gated > 0.0
@@ -115,7 +137,7 @@ class IntraAssetThreePillarSynthesizer:
             w_a_gated[long_mask] *= np.clip(1.0 - b_long * np.abs(w_bcd_neg[long_mask]), 0.15, 1.0)
             w_a_gated[short_mask] *= np.clip(1.0 - b_short * w_bcd_pos[short_mask], 0.15, 1.0)
 
-            w_raw = w_a_gated + 1.25 * w_bcd_total
+            w_raw = w_a_gated + bcd_mult * w_bcd_total
 
             # 第三支柱：因果有效湍流波动率封顶调制
             vol_cap = self._get_causal_turbulence_cap(df_grid, asset_spec.base_tf)
@@ -351,12 +373,18 @@ class CrossAssetHRPSynthesizer:
         2. 板块内相关性去拥挤与板块间分层风险平价 (Sector-Level HRP)；
         3. 组合目标波动率调制，输出跨资产全天候组合表现。
         """
-        ret_df = pd.DataFrame(asset_daily_returns).fillna(0.0).sort_index()
-        ret_df.index = pd.to_datetime(ret_df.index)
+        raw_df = pd.DataFrame(asset_daily_returns).sort_index()
+        raw_df.index = pd.to_datetime(raw_df.index)
+        active_mask = raw_df.notna().astype(float)
+        ret_df = raw_df.fillna(0.0)
 
-        # 1. 因果滚动 60 日波动率 (shift(1) 严格避免当日未来信息)
-        roll_vol = ret_df.rolling(60, min_periods=15).std().shift(1).bfill() * np.sqrt(252.0)
-        inv_vol = 1.0 / np.maximum(roll_vol, 0.06)
+        # 0. 基准对比：在市品种动态等权组合 (Dynamic Listed Equal-Weight 1/N_t)
+        eq_weights = active_mask.div(active_mask.sum(axis=1).replace(0.0, np.nan), axis=0).fillna(0.0)
+        eq_daily_ret = (ret_df * eq_weights).sum(axis=1)
+
+        # 1. 因果滚动 60 日波动率 (shift(1) 严格避免当日未来信息，仅在已上市区间内统计)
+        roll_vol = raw_df.rolling(60, min_periods=10).std().shift(1).bfill() * np.sqrt(252.0)
+        inv_vol = (1.0 / np.maximum(roll_vol.fillna(0.15), 0.06)) * active_mask
 
         # 2. 板块级分层风险预算 (Sector Equal-Risk / Inverse-Sector-Count Shrinkage)
         sectors: dict[str, list[str]] = {}
@@ -370,8 +398,8 @@ class CrossAssetHRPSynthesizer:
             # 同一板块多品种共享板块风险预算 (按 1 / sqrt(K) 折减同板块拥挤风险)
             sector_multiplier[syms] = 1.0 / (n_sectors * np.sqrt(len(syms)))
 
-        raw_alloc = inv_vol.multiply(sector_multiplier, axis=1)
-        alloc_weights = raw_alloc.div(raw_alloc.sum(axis=1), axis=0).fillna(1.0 / len(ret_df.columns))
+        raw_alloc = inv_vol.multiply(sector_multiplier, axis=1) * active_mask
+        alloc_weights = raw_alloc.div(raw_alloc.sum(axis=1).replace(0.0, np.nan), axis=0).fillna(eq_weights)
 
         # 3. 因果组合级波动率目标缩放 (使组合整体保持稳健高夏普)
         unscaled_port_ret = (ret_df * alloc_weights).sum(axis=1)
@@ -384,10 +412,16 @@ class CrossAssetHRPSynthesizer:
 
         return {
             "daily_returns": port_daily_ret,
+            "equal_weight_returns": eq_daily_ret,
+            "equal_weights_df": eq_weights,
+            "unscaled_hrp_weights_df": alloc_weights,
             "asset_weights_df": alloc_weights.multiply(lev_scalar, axis=0),
             "full": self._calc_return_series_stats(port_daily_ret),
             "is": self._calc_return_series_stats(port_daily_ret.loc[is_mask]),
             "oos": self._calc_return_series_stats(port_daily_ret.loc[oos_mask]),
+            "eq_full": self._calc_return_series_stats(eq_daily_ret),
+            "eq_is": self._calc_return_series_stats(eq_daily_ret.loc[is_mask]),
+            "eq_oos": self._calc_return_series_stats(eq_daily_ret.loc[oos_mask]),
         }
 
     @staticmethod
@@ -425,6 +459,18 @@ def evaluate_single_asset_backtest(
     """调用 czsc.WeightBacktest 评估单品种 IS / OOS / Full 表现并返回日收益序列"""
 
     def _run_slice(sub_df: pd.DataFrame, sub_w: np.ndarray) -> tuple[dict[str, float], pd.Series]:
+        if len(sub_df) < 10:
+            return (
+                {
+                    "cum_ret_pct": 0.0,
+                    "ann_ret_pct": 0.0,
+                    "sharpe": 0.0,
+                    "mdd_pct": 0.0,
+                    "calmar": 0.0,
+                    "active_pct": 0.0,
+                },
+                pd.Series(dtype=np.float64),
+            )
         dfw = pd.DataFrame(
             {
                 "dt": sub_df["dt"].astype(str),
@@ -436,8 +482,11 @@ def evaluate_single_asset_backtest(
         wb = WeightBacktest(data=dfw, fee_rate=fee_rate, weight_type="ts")
         st = wb.stats
         dr = wb.daily_return.copy()
-        dr["date"] = pd.to_datetime(dr["date"])
-        s_dr = dr.set_index("date")["total"]
+        dts = pd.to_datetime(dr["date"])
+        wk = dts.dt.weekday
+        shift_d = np.where(wk == 5, 2, np.where(wk == 6, 1, 0))
+        dr["date"] = dts + pd.to_timedelta(shift_d, unit="D")
+        s_dr = dr.groupby("date")["total"].sum()
         return (
             {
                 "cum_ret_pct": round(float(st.get("绝对收益", 0.0) * 100.0), 2),
