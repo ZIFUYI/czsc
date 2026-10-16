@@ -15,29 +15,26 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
-
-ROOT_DIR = Path(__file__).resolve().parents[2]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from examples.alpha_mining_agent.forensic_pipeline import (
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from examples.alpha_mining_agent.forensic_pipeline import (  # noqa: E402
     IS_END_DT,
     backtest_slice,
     map_tf_weight_to_5m_grid,
-    map_tf_weight_to_30m_grid,
     run_gate1_forensic_audit,
     run_gate2_3d_complementarity_audit,
     synthesize_atomic_units_portfolio,
 )
-from examples.alpha_mining_agent.hypothesis_bank import (
+from examples.alpha_mining_agent.hypothesis_bank import (  # noqa: E402
     ALL_ARCHETYPES,
     ALL_SIGNAL_SPECS,
     ARCH_A,
@@ -49,21 +46,27 @@ from examples.alpha_mining_agent.hypothesis_bank import (
     compute_signal_triggers_and_weights,
     enrich_kline_features,
 )
-from examples.alpha_mining_agent.state_ledger import (
+from examples.alpha_mining_agent.state_ledger import (  # noqa: E402
     WORKSPACE_DIR,
     AdmittedSignalRecord,
     AgentStateLedger,
 )
-from examples.multi_factor_cta.atomic_factors import link_higher_timeframes
+from examples.multi_factor_cta.atomic_factors import link_higher_timeframes  # noqa: E402
+from examples.multi_factor_cta.forensic_validator import run_stratified_pooled_gate1b_audit  # noqa: E402
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 REAL_5M_CSV = Path("examples/results/159915_real_5m_2020_2026.csv")
 DASHBOARD_HTML = WORKSPACE_DIR / "autonomous_evolution_dashboard.html"
 
 
 def load_all_four_timeframes(
-    data_path: Path, symbol_name: str = "159915", workspace_dir: Path = WORKSPACE_DIR
+    data_path: Path | pd.DataFrame, symbol_name: str = "159915", workspace_dir: Path = WORKSPACE_DIR
 ) -> dict[str, pd.DataFrame]:
-    if str(data_path).endswith(".parquet"):
+    if isinstance(data_path, pd.DataFrame):
+        df_raw = data_path.copy()
+    elif str(data_path).endswith(".parquet"):
         df_raw = pd.read_parquet(data_path)
     else:
         df_raw = pd.read_csv(data_path)
@@ -80,7 +83,7 @@ def load_all_four_timeframes(
     for standard_col in ["open", "high", "low", "close", "volume"]:
         if standard_col not in df_raw.columns:
             for c in df_raw.columns:
-                if standard_col in c.lower():
+                if standard_col in c.lower() or (standard_col == "volume" and c.lower() == "vol"):
                     col_map[c] = standard_col
                     break
     if col_map:
@@ -89,6 +92,9 @@ def load_all_four_timeframes(
     df_raw = df_raw.sort_values("datetime").reset_index(drop=True)
     df_raw["date"] = df_raw["datetime"].dt.date
     df_raw["bar_in_day"] = df_raw.groupby("date").cumcount()
+
+    sym_cache_dir = workspace_dir if symbol_name == "159915" else (workspace_dir / f"cache_{symbol_name}")
+    sym_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _agg(bars_per_group: int, tf: str) -> pd.DataFrame:
         scale = TF_SCALE_MAP[tf]
@@ -99,17 +105,41 @@ def load_all_four_timeframes(
         else:
             tmp = df_raw.copy()
             tmp["grp"] = tmp["bar_in_day"] // bars_per_group
-            kdf = tmp.groupby(["date", "grp"], as_index=False).agg(
-                dt=("datetime", "last"),
-                open=("open", "first"),
-                high=("high", "max"),
-                low=("low", "min"),
-                close=("close", "last"),
-                volume=("volume", "sum"),
-            )
+            if tf == "1d":
+                if len(tmp) > 0:
+                    last_date = tmp["date"].iloc[-1]
+                    last_dt = pd.to_datetime(tmp["datetime"].iloc[-1])
+                    last_day_cnt = int((tmp["date"] == last_date).sum())
+                    prev_days = tmp[tmp["date"] != last_date]
+                    expected_day_bars = (
+                        int(prev_days.groupby("date")["close"].count().median())
+                        if len(prev_days) > 0
+                        else bars_per_group
+                    )
+                    if (last_day_cnt < expected_day_bars and (last_dt.hour * 60 + last_dt.minute) < 15 * 60) or (
+                        last_day_cnt < bars_per_group and expected_day_bars >= bars_per_group
+                    ):
+                        tmp = prev_days
+            else:
+                grp_cnt = tmp.groupby(["date", "grp"], sort=False)["close"].transform("count")
+                tmp = tmp[grp_cnt >= bars_per_group]
+
+            if len(tmp) > 0:
+                kdf = tmp.groupby(["date", "grp"], as_index=False, sort=False).agg(
+                    dt=("datetime", "last"),
+                    open=("open", "first"),
+                    high=("high", "max"),
+                    low=("low", "min"),
+                    close=("close", "last"),
+                    volume=("volume", "sum"),
+                )
+            else:
+                kdf = pd.DataFrame(columns=["date", "grp", "dt", "open", "high", "low", "close", "volume"])
         kdf["symbol"] = symbol_name
         kdf = enrich_kline_features(kdf, scale=scale)
-        return attach_native_czsc_signals(kdf, tf, workspace_dir)
+        if not kdf.empty:
+            kdf = attach_native_czsc_signals(kdf, tf, sym_cache_dir)
+        return kdf
 
     return link_higher_timeframes(
         {
@@ -120,6 +150,127 @@ def load_all_four_timeframes(
             "5m": _agg(1, "5m"),
         }
     )
+
+
+def discover_pool_symbol_paths(
+    primary_symbol: str,
+    primary_data_path: Path,
+    pool_symbols_arg: str | list[str] | None = None,
+    data_base_dir: Path = Path(r"D:\my-qlib\data"),
+) -> dict[str, Path]:
+    """发现本地可用的同质池/跨资产池行情数据文件，支持显式指定或自动扫描。"""
+    pool_paths: dict[str, Path] = {}
+    if primary_data_path.exists():
+        pool_paths[primary_symbol] = primary_data_path
+
+    candidates: list[str] = []
+    if isinstance(pool_symbols_arg, str) and pool_symbols_arg.strip():
+        candidates = [s.strip() for s in pool_symbols_arg.split(",") if s.strip()]
+    elif isinstance(pool_symbols_arg, list):
+        candidates = [str(s).strip() for s in pool_symbols_arg if str(s).strip()]
+    else:
+        candidates = [
+            "159915",
+            "510300",
+            "510500",
+            "510050",
+            "588000",
+            "IM9999.CCFX",
+            "IC9999.CCFX",
+            "IF9999.CCFX",
+            "IH9999.CCFX",
+            "RB9999.XSGE",
+            "I9999.XDCE",
+            "CU9999.XSGE",
+            "AU9999.XSGE",
+            "TA9999.XZCE",
+            "M9999.XDCE",
+        ]
+
+    for item in candidates:
+        if "=" in item:
+            sym_k, path_v = item.split("=", 1)
+            p = Path(path_v.strip())
+            if p.exists():
+                pool_paths[sym_k.strip()] = p
+            continue
+        p_direct = Path(item)
+        if p_direct.exists() and p_direct.is_file():
+            sym_k = p_direct.stem.split("_")[0]
+            pool_paths[sym_k] = p_direct
+            continue
+        search_paths = [
+            primary_data_path.parent / f"{item}.parquet",
+            primary_data_path.parent / f"{item}.csv",
+            primary_data_path.parent / f"{item}_real_5m_2020_2026.csv",
+            data_base_dir / "5min" / f"{item}.parquet",
+            data_base_dir / "5min" / f"{item}.csv",
+        ]
+        for sp in search_paths:
+            if sp.exists():
+                pool_paths[item] = sp
+                break
+
+    return pool_paths
+
+
+def evaluate_candidate_pooled_gate1b(
+    sid: str,
+    tf: str,
+    primary_symbol: str,
+    primary_g1: dict,
+    pool_tf_dfs: dict[str, dict[str, pd.DataFrame]],
+    rng: np.random.Generator,
+    allow_single_asset_degrade: bool = True,
+    ledger: AgentStateLedger | None = None,
+    per_symbol_gate1_overrides: dict[str, dict] | None = None,
+) -> dict:
+    """
+    执行候选原子单元 `sid@tf` 的 Pre-Admission Gate 1B 三级多标的分层池化准入检验。
+    若未通过且传入了 `ledger`，则自动将该候选单元记入 `graveyard.jsonl`。
+    """
+    spec = ALL_SIGNAL_SPECS[sid]
+    ruler = ARCHETYPE_RULERS[spec.archetype]
+    unit_id = f"{sid}@{tf}"
+
+    if per_symbol_gate1_overrides is not None:
+        per_symbol_gate1 = dict(per_symbol_gate1_overrides)
+        per_symbol_gate1.setdefault(primary_symbol, primary_g1)
+    else:
+        per_symbol_gate1 = {primary_symbol: primary_g1}
+        for psym, p_dfs in pool_tf_dfs.items():
+            if psym == primary_symbol or tf not in p_dfs or p_dfs[tf].empty:
+                continue
+            p_trig, p_weight = compute_signal_triggers_and_weights(p_dfs[tf], sid, scale=TF_SCALE_MAP[tf])
+            per_symbol_gate1[psym] = run_gate1_forensic_audit(
+                p_dfs[tf],
+                p_trig,
+                spec.direction,
+                ruler,
+                tf,
+                rng,
+                weights_tf=p_weight,
+            )
+
+    g1b = run_stratified_pooled_gate1b_audit(
+        per_symbol_gate1=per_symbol_gate1,
+        archetype=spec.archetype,
+        timeframe=tf,
+        allow_single_asset_degrade=allow_single_asset_degrade,
+    )
+    if not g1b["passed"] and ledger is not None:
+        ledger.bury_rejected_signal(
+            unit_id,
+            sid,
+            tf,
+            f"{spec.name}@{tf}",
+            spec.archetype,
+            spec.direction,
+            failed_gate="Gate 1B (多标的分层池化普适关)",
+            reason=g1b["reason"],
+            metrics={**primary_g1, **g1b},
+        )
+    return g1b
 
 
 def evaluate_full_is_oos(df_30m: pd.DataFrame, w_multi: np.ndarray) -> dict:
@@ -418,6 +569,12 @@ def main() -> None:
         help="执行存量活跃单元样本内法医先验锚定 + 双半场 (2020-2021/2022-2023) L2 信赖域联合坐标重配权",
     )
     parser.add_argument("--max-candidates", type=int, default=999, help="本轮最多测试多少个原子候选单元")
+    parser.add_argument(
+        "--pool-symbols",
+        type=str,
+        default=None,
+        help="逗号分隔的多标的池代码或路径列表 (用于 Pre-Admission Gate 1B 三级分层池化准入检验；未指定时自动发现本地可用池)",
+    )
     parser.add_argument("--status-only", action="store_true", help="仅打印当前持久态信号库与 6×5 全周期生态位矩阵")
     args = parser.parse_args()
 
@@ -449,19 +606,43 @@ def main() -> None:
 
     print("=" * 125)
     print(f"  【{symbol} 6×5 全周期生态位矩阵 · 长期自主信号挖掘与多方向正交进化 Agent】")
-    print("  四大战略方向 (趋势突破 / 背驰反转 / 震荡回归 / 日内微结构) × 五级独立周期 (1d / 60m / 30m / 15m / 5m)")
+    print(
+        "  六大战略方向 (趋势突破 / 背驰衰竭 / 中枢震荡 / 量价筹码 / 波动率压缩 / 多周期共振) × 五级独立周期 (1d / 60m / 30m / 15m / 5m)"
+    )
     print("  [主时间轴] 原生 5m 无未来函数阶梯对齐网格 (消除 15m/5m 下采样坍缩与延迟 + 0.06 最小调仓死区)")
     print(f"  [数据源] {data_path} | [工作区] {workspace_dir}")
     print("=" * 125)
 
     tf_dfs = load_all_four_timeframes(data_path, symbol_name=symbol_code, workspace_dir=workspace_dir)
+    pool_paths = discover_pool_symbol_paths(
+        primary_symbol=symbol,
+        primary_data_path=data_path,
+        pool_symbols_arg=args.pool_symbols,
+        data_base_dir=data_base_dir,
+    )
+    pool_tf_dfs: dict[str, dict[str, pd.DataFrame]] = {symbol: tf_dfs}
+    if len(pool_paths) <= 1:
+        print(
+            f"  [Gate 1B 告警] 当前仅发现单标的数据 ({symbol})，Pre-Admission Gate 1B 三级分层池化门禁将启用单标的平滑降级模式。"
+        )
+    else:
+        print(f"  [Gate 1B 多标的检验池] 已发现 {len(pool_paths)} 个联合检验标的: {list(pool_paths.keys())}")
+
+    def _ensure_pool_loaded() -> dict[str, dict[str, pd.DataFrame]]:
+        for psym, ppath in pool_paths.items():
+            if psym not in pool_tf_dfs and ppath.exists():
+                psym_code = psym.split(".")[0]
+                pool_tf_dfs[psym] = load_all_four_timeframes(ppath, symbol_name=psym_code, workspace_dir=workspace_dir)
+        return pool_tf_dfs
+
     df_1d = tf_dfs["1d"]
     # 将主回测与合成网格下沉至原生 5m 时间轴 (保持变量名 df_30m 兼容后续调用)
     df_30m = tf_dfs["5m"]
     rng = np.random.default_rng(42)
 
-    # 预计算所有 (sig_id, tf) 原子单元在自身周期上的触发序列，以及无延迟映射到 5m 主时间轴上的持仓序列
+    # 预计算所有 (sig_id, tf) 原子单元在自身周期上的触发序列、连续权重序列，以及无延迟映射到 5m 主时间轴上的持仓序列
     trig_by_unit: dict[str, np.ndarray] = {}
+    weight_by_unit: dict[str, np.ndarray] = {}
     w_on_30m_by_unit: dict[str, np.ndarray] = {}
 
     for sid, spec in ALL_SIGNAL_SPECS.items():
@@ -469,6 +650,7 @@ def main() -> None:
             unit_id = f"{sid}@{tf}"
             t_arr, w_arr = compute_signal_triggers_and_weights(tf_dfs[tf], sid, scale=TF_SCALE_MAP[tf])
             trig_by_unit[unit_id] = t_arr
+            weight_by_unit[unit_id] = w_arr
             w_on_30m_by_unit[unit_id] = map_tf_weight_to_5m_grid(tf_dfs[tf], w_arr, df_30m, tf)
 
     # 1. 初始化 5 个基石信号在 (1d, 60m, 30m) 上的 15 个种子原子单元
@@ -479,7 +661,15 @@ def main() -> None:
         for spec in BASE_SEED_SIGNALS:
             for tf in spec.eligible_tfs:
                 unit_id = f"{spec.sig_id}@{tf}"
-                g1 = run_gate1_forensic_audit(tf_dfs[tf], trig_by_unit[unit_id], spec.direction, ruler_a, tf, rng)
+                g1 = run_gate1_forensic_audit(
+                    tf_dfs[tf],
+                    trig_by_unit[unit_id],
+                    spec.direction,
+                    ruler_a,
+                    tf,
+                    rng,
+                    weights_tf=weight_by_unit[unit_id],
+                )
                 rec = AdmittedSignalRecord(
                     unit_id=unit_id,
                     sig_id=spec.sig_id,
@@ -706,7 +896,13 @@ def main() -> None:
 
     step_counter = len(ledger.load_evolution_history()) - 1
     admitted_summary_rows = []
-    gate_stats = {"Gate1_Rejected": 0, "Gate2_Rejected": 0, "Gate3_Rejected": 0, "Admitted": 0}
+    gate_stats = {
+        "Gate1_Rejected": 0,
+        "Gate1B_Rejected": 0,
+        "Gate2_Rejected": 0,
+        "Gate3_Rejected": 0,
+        "Admitted": 0,
+    }
 
     for sid, tf in atomic_candidates:
         spec = ALL_SIGNAL_SPECS[sid]
@@ -726,7 +922,15 @@ def main() -> None:
         )
 
         # --- 第一关：Gate 1 分方向专属标尺法医审计 (2020-2023 IS) ---
-        g1 = run_gate1_forensic_audit(tf_dfs[tf], trig_by_unit[unit_id], spec.direction, ruler, tf, rng)
+        g1 = run_gate1_forensic_audit(
+            tf_dfs[tf],
+            trig_by_unit[unit_id],
+            spec.direction,
+            ruler,
+            tf,
+            rng,
+            weights_tf=weight_by_unit[unit_id],
+        )
         if not g1["passed"]:
             gate_stats["Gate1_Rejected"] += 1
             ledger.bury_rejected_signal(
@@ -740,6 +944,21 @@ def main() -> None:
                 reason=g1["reason"],
                 metrics=g1,
             )
+            continue
+
+        # --- 前置准入关：Pre-Admission Gate 1B 三级多标的分层池化普适审计 ---
+        g1b = evaluate_candidate_pooled_gate1b(
+            sid=sid,
+            tf=tf,
+            primary_symbol=symbol,
+            primary_g1=g1,
+            pool_tf_dfs=_ensure_pool_loaded(),
+            rng=rng,
+            allow_single_asset_degrade=True,
+            ledger=ledger,
+        )
+        if not g1b["passed"]:
+            gate_stats["Gate1B_Rejected"] += 1
             continue
 
         # --- 第二关：Gate 2 三维真互补门禁 (配额 + 低相关 + 空仓补盲 & 回撤雪中送炭) ---
@@ -959,12 +1178,11 @@ def main() -> None:
                 c_obj = cur_obj - _calc_is_obj(ev_t)
                 c_ret = curr_eval["is"]["cum_ret_pct"] - ev_t["is"]["cum_ret_pct"]
                 c_sh = curr_eval["is"]["sharpe"] - ev_t["is"]["sharpe"]
-                if c_obj <= -0.05 and c_sh < 0 and c_ret <= 0.05:
-                    if c_obj < worst_contrib:
-                        worst_contrib = c_obj
-                        worst_uid = uid
-                        best_without_ev = ev_t
-                        best_without_w = w_t
+                if c_obj <= -0.05 and c_sh < 0 and c_ret <= 0.05 and c_obj < worst_contrib:
+                    worst_contrib = c_obj
+                    worst_uid = uid
+                    best_without_ev = ev_t
+                    best_without_w = w_t
 
             if worst_uid is None:
                 break
@@ -1026,9 +1244,28 @@ def main() -> None:
                 uid = f"{spec.sig_id}@{tf}"
                 if uid in zoo or uid in pruned_uids:
                     continue
-                g1 = run_gate1_forensic_audit(tf_dfs[tf], trig_by_unit[uid], spec.direction, ruler, tf, rng)
+                g1 = run_gate1_forensic_audit(
+                    tf_dfs[tf],
+                    trig_by_unit[uid],
+                    spec.direction,
+                    ruler,
+                    tf,
+                    rng,
+                    weights_tf=weight_by_unit[uid],
+                )
                 if g1["passed"] and g1["is_n_purged"] >= 80:
-                    challengers.append((uid, spec, tf, g1))
+                    g1b = evaluate_candidate_pooled_gate1b(
+                        sid=spec.sig_id,
+                        tf=tf,
+                        primary_symbol=symbol,
+                        primary_g1=g1,
+                        pool_tf_dfs=_ensure_pool_loaded(),
+                        rng=rng,
+                        allow_single_asset_degrade=True,
+                        ledger=None,
+                    )
+                    if g1b["passed"]:
+                        challengers.append((uid, spec, tf, g1))
 
         # 按样本深度对数 × 样本内安全垫进行锦标赛种子排序 (完全无样本外信息泄露)
         challengers.sort(key=lambda x: np.log(x[3]["is_n_purged"]) * x[3]["is_safety_margin_pct"], reverse=True)
@@ -1389,7 +1626,7 @@ def main() -> None:
                 tf = uid.split("@")[1]
                 lo = max(0.16, round(w_p - 0.10, 2))
                 hi = min(0.58 if tf == "5m" else 0.48, round(w_p + 0.10, 2))
-                grid = sorted(set([lo, round(w_p - 0.05, 2), round(w_p, 2), round(w_p + 0.05, 2), hi]))
+                grid = sorted({lo, round(w_p - 0.05, 2), round(w_p, 2), round(w_p + 0.05, 2), hi})
 
                 best_w = opt_alloc[uid]
                 best_obj = obj_cur
@@ -1469,8 +1706,9 @@ def main() -> None:
 
     print("\n" + "=" * 125)
     print(
-        f"【一、三级漏斗筛选统计】 总检验原子候选: {len(atomic_candidates)} 个 -> "
+        f"【一、四级漏斗筛选统计】 总检验原子候选: {len(atomic_candidates)} 个 -> "
         f"Gate1法医关淘汰: {gate_stats['Gate1_Rejected']} | "
+        f"Gate1B分层池化关淘汰: {gate_stats['Gate1B_Rejected']} | "
         f"Gate2互补与配额关淘汰: {gate_stats['Gate2_Rejected']} | "
         f"Gate3组合边际关淘汰: {gate_stats['Gate3_Rejected']} | "
         f"★ 最终晋升入库: {gate_stats['Admitted']} 个"

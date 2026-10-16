@@ -173,6 +173,8 @@ def _align_htf_state(df_base: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[np.nd
     把大级别 (已挂载 Rust 信号的) K 线状态因果地映射到基准网格：
     大级别 K 线在其收盘时刻 `dt` 才生效，基准 bar 只看到 `dt_htf <= dt_base` 的最近一根 (backward asof)。
     """
+    if df_htf is None or len(df_htf) == 0 or len(df_base) == 0:
+        return np.zeros(len(df_base), dtype=np.int8), np.zeros(len(df_base), dtype=np.float64)
     n = len(df_htf)
     bi = (
         df_htf[BI_BASE_COL].astype(str).str.split("_").str[0].to_numpy(dtype=object)
@@ -525,7 +527,12 @@ def _unbox(df: pd.DataFrame, key: str):
     return box.value if isinstance(box, _AttrBox) else box
 
 
-def compute_atomic_signal(df: pd.DataFrame, sig_id: str, scale: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
+def compute_atomic_signal(
+    df: pd.DataFrame,
+    sig_id: str,
+    scale: float = 1.0,
+    decay: DecayConfig | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """
     注册表入口 (签名与 `compute_signal_triggers_and_weights` 一致)：`sig_id = 因子族 + L/S`，
     返回 (triggers, weights)，weights = 单一方向的连续强度 S。大级别 K 线 / 截面强弱提供者通过
@@ -543,5 +550,5 @@ def compute_atomic_signal(df: pd.DataFrame, sig_id: str, scale: float = 1.0) -> 
         df.attrs["_atomic_ctx"] = _AttrBox((key, ctx))
     else:
         ctx = cache[1]
-    s, trig = compute_family(ctx, family, sides=(1 if side_char == "L" else -1,))
+    s, trig = compute_family(ctx, family, sides=(1 if side_char == "L" else -1,), decay=decay)
     return trig, s

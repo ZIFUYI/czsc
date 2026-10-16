@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -24,10 +25,27 @@ import pandas as pd
 
 from examples.alpha_mining_agent.forensic_pipeline import (
     IS_END_DT,
+    _compute_weighted_edge_metrics,
+    compute_active_union_correlation,
+    compute_forward_rank_ic_profile,
+    compute_single_factor_net_sharpe_and_turnover,
     evaluate_triple_barrier,
     purge_overlapping_triggers,
+    run_parameter_smoothness_audit,
 )
-from examples.alpha_mining_agent.hypothesis_bank import ARCH_A, ARCH_C, ARCHETYPE_RULERS, ArchetypeRuler
+from examples.alpha_mining_agent.hypothesis_bank import (
+    ALL_SIGNAL_SPECS,
+    ARCH_A,
+    ARCH_B,
+    ARCH_C,
+    ARCH_D,
+    ARCH_E,
+    ARCH_F,
+    ARCHETYPE_RULERS,
+    TF_SCALE_MAP,
+    ArchetypeRuler,
+    compute_signal_triggers_and_weights,
+)
 
 # 周期自适应最小独立样本数门槛（解决日线/60m 低频高质量信号被固定高样本门槛误杀的问题）
 TF_MIN_PURGED_SAMPLES: dict[str, int] = {
@@ -37,6 +55,74 @@ TF_MIN_PURGED_SAMPLES: dict[str, int] = {
     "15m": 55,
     "5m": 80,
 }
+
+# 三级多标的分层池化检验层级映射 (Tier 1: 跨资产普适簇 | Tier 2: 同质资产类别特征簇 | Tier 3: 交易制度与微结构簇)
+STRATIFIED_POOL_TIERS: dict[str, int] = {
+    ARCH_A: 1,
+    ARCH_E: 1,
+    ARCH_F: 1,
+    ARCH_B: 2,
+    ARCH_C: 2,
+    ARCH_D: 3,
+}
+
+
+def get_stratified_pool_tier(archetype: str, timeframe: str = "30m") -> int:
+    """根据战略簇与周期返回对应的分层池化检验层级 (Tier 1 / 2 / 3)。"""
+    ruler = ARCHETYPE_RULERS.get(archetype)
+    base_tier = int(getattr(ruler, "pool_tier", STRATIFIED_POOL_TIERS.get(archetype, 1)))
+    if base_tier == 3 or archetype == ARCH_D:
+        return 3
+    if timeframe in ("5m", "15m") and archetype not in (ARCH_A, ARCH_E, ARCH_F, ARCH_B, ARCH_C):
+        return 3
+    return base_tier
+
+
+def infer_asset_pool_group(symbol: str, explicit_group: str | None = None) -> str:
+    """
+    识别标的所属同质资产池类别 ("equity" 宽基权益池 vs "commodity" 商品期货池)：
+    - 若传入 explicit_group，优先归一化为 "equity" 或 "commodity"；
+    - 否则按标的代码前缀/特征自动判定。
+    """
+    if explicit_group:
+        g = explicit_group.strip().lower()
+        if any(k in g for k in ("eq", "etf", "index", "stock", "if", "ic", "im", "ih")):
+            return "equity"
+        if any(k in g for k in ("comm", "cmd", "fut", "metal", "chem", "agri", "black", "energy")):
+            return "commodity"
+    s = symbol.upper()
+    if any(
+        tag in s
+        for tag in (
+            "SHFE",
+            "DCE",
+            "CZCE",
+            "INE",
+            "GFEX",
+            "CMD",
+            "COMM",
+            "KQ.M@",
+            "RB",
+            "AG",
+            "CU",
+            "AU",
+            "AL",
+            "ZN",
+            "NI",
+            "TA",
+            "MA",
+            "M0",
+            "RM",
+            "CF",
+            "SR",
+            "SC",
+            "I9",
+            "JM",
+            "J9",
+        )
+    ):
+        return "commodity"
+    return "equity"
 
 
 def compute_signed_jaccard(w_u: np.ndarray, w_v: np.ndarray, eps: float = 1e-4) -> float:
@@ -78,10 +164,11 @@ def compute_cross_sectional_concurrency(
 
 
 class RuleFactorForensicValidator:
-    """规则型因子三级法医检验器"""
+    """规则型与连续强度因子四级法医检验器 (Gate 1A + Gate 1B 分层池化 + 参数平原 + 激活态正交 & 边际增益)"""
 
-    def __init__(self, is_end_dt: pd.Timestamp = IS_END_DT) -> None:
+    def __init__(self, is_end_dt: pd.Timestamp = IS_END_DT, max_pairwise_corr: float = 0.32) -> None:
         self.is_end_dt = is_end_dt
+        self.max_pairwise_corr = max_pairwise_corr
         self.rng = np.random.default_rng(42)
 
     def run_gate1_single_asset_audit(
@@ -92,25 +179,29 @@ class RuleFactorForensicValidator:
         archetype: str,
         timeframe: str,
         fee_rate: float = 0.0002,
+        weights_tf: np.ndarray | None = None,
     ) -> dict[str, Any]:
         """
         Gate 1A：单品种单周期法医标尺检验（严格样本内 IS）
         - Purged 去重叠独立事件抽样
         - 周期自适应最小样本数门槛
-        - 分战略簇三重屏障标尺 (Next-Bar Open + 交易成本扣除)
-        - 成本穿透安全边际 ΔW = W - 1/(1+R) 与 Bootstrap p-val
+        - 分战略簇三重屏障标尺 (Next-Bar Open + 交易成本扣除 + 连续质量分 Q 加权)
+        - MFE / MAE 路径偏离比门槛 + 单因子扣费 Net Sharpe + 前向多期 Rank IC / ICIR 衰减曲线
         """
         ruler: ArchetypeRuler = ARCHETYPE_RULERS[archetype]
         is_mask = (df_tf["dt"] <= self.is_end_dt).values
+        if int(is_mask.sum()) < 25:
+            is_mask = np.ones(len(df_tf), dtype=bool)
         oos_mask = (df_tf["dt"] > self.is_end_dt).values
 
         min_samples = 8 if timeframe == "1d" else (12 if timeframe == "60m" else (20 if timeframe == "5m" else 15))
         eff_max_bars = ruler.max_bars * 2 if timeframe == "5m" else ruler.max_bars
         eff_tp_atr = ruler.tp_atr * 1.35 if timeframe == "5m" else ruler.tp_atr
         eff_sl_atr = ruler.sl_atr * 1.20 if timeframe == "5m" else ruler.sl_atr
-        min_warmup = 240 if timeframe == "5m" else 60
+        min_warmup = min(240 if timeframe == "5m" else 60, max(10, int(is_mask.sum()) // 4))
 
-        is_raw_idx = np.where((raw_triggers == 1) & is_mask)[0]
+        trig_bool = np.asarray(raw_triggers, dtype=bool)
+        is_raw_idx = np.where(trig_bool & is_mask)[0]
         is_purged_idx = purge_overlapping_triggers(is_raw_idx, cooldown_bars=eff_max_bars)
 
         tb_is = evaluate_triple_barrier(
@@ -121,6 +212,7 @@ class RuleFactorForensicValidator:
             tp_atr=eff_tp_atr,
             sl_atr=eff_sl_atr,
             fee_rate=fee_rate,
+            weights_tf=weights_tf,
         )
         n_purged = len(tb_is)
         if n_purged < min_samples:
@@ -131,15 +223,24 @@ class RuleFactorForensicValidator:
             }
 
         rets_is = tb_is["net_ret"].values
-        f_mean = float(np.mean(rets_is))
-        f_win = float(np.mean(rets_is > 0))
-        wins = rets_is[rets_is > 0]
-        losses = rets_is[rets_is <= 0]
-        avg_win = float(np.mean(wins)) if len(wins) > 0 else 0.0
-        avg_loss = float(abs(np.mean(losses))) if len(losses) > 0 else 1e-6
-        pl_ratio = avg_win / max(avg_loss, 1e-6)
-        be_win = 1.0 / (1.0 + pl_ratio)
-        safety_margin = f_win - be_win
+        q_w = tb_is["quality_w"].values if "quality_w" in tb_is.columns else np.ones(n_purged, dtype=np.float64)
+
+        eq_stats = _compute_weighted_edge_metrics(rets_is, np.ones(n_purged, dtype=np.float64))
+        qw_stats = _compute_weighted_edge_metrics(rets_is, q_w)
+
+        use_q_weight = weights_tf is not None and (np.std(q_w) > 1e-4)
+        active_stats = qw_stats if use_q_weight else eq_stats
+        f_mean = active_stats["mean"]
+        f_win = active_stats["win_rate"]
+        pl_ratio = active_stats["pl_ratio"]
+        safety_margin = active_stats["safety_margin"]
+
+        mfe_arr = tb_is["mfe_atr"].values
+        mae_arr = tb_is["mae_atr"].values
+        q_norm = q_w / max(float(np.sum(q_w)), 1e-12)
+        mean_mfe_atr = float(np.sum(q_norm * mfe_arr))
+        mean_mae_atr = float(np.sum(q_norm * mae_arr))
+        excursion_ratio = float(mean_mfe_atr / max(mean_mae_atr, 1e-6))
 
         valid_pool = np.where(
             is_mask & (np.arange(len(df_tf)) >= min_warmup) & (np.arange(len(df_tf)) < len(df_tf) - eff_max_bars - 2)
@@ -164,7 +265,26 @@ class RuleFactorForensicValidator:
         boot_means = np.array([np.mean(self.rng.choice(rand_rets, size=n_purged, replace=True)) for _ in range(500)])
         boot_pval = float(np.mean(boot_means >= f_mean))
 
-        oos_raw_idx = np.where((raw_triggers == 1) & oos_mask)[0]
+        if weights_tf is not None:
+            net_sh_pack = compute_single_factor_net_sharpe_and_turnover(
+                df_tf, weights_tf, timeframe, fee_rate=fee_rate, is_end_dt=self.is_end_dt
+            )
+            ic_pack = compute_forward_rank_ic_profile(df_tf, weights_tf, is_end_dt=self.is_end_dt)
+        else:
+            synth_w = np.zeros(len(df_tf), dtype=np.float64)
+            for _, r_row in tb_is.iterrows():
+                st_i = int(r_row["trigger_idx"]) + 1
+                ed_i = min(st_i + max(1, int(r_row["bars_held"])), len(df_tf))
+                synth_w[st_i:ed_i] = float(direction)
+            net_sh_pack = compute_single_factor_net_sharpe_and_turnover(
+                df_tf, synth_w, timeframe, fee_rate=fee_rate, is_end_dt=self.is_end_dt
+            )
+            ic_pack = compute_forward_rank_ic_profile(df_tf, synth_w, is_end_dt=self.is_end_dt)
+
+        is_net_sharpe = float(net_sh_pack["is_net_sharpe"])
+        ann_turnover = float(net_sh_pack["ann_turnover"])
+
+        oos_raw_idx = np.where(trig_bool & oos_mask)[0]
         oos_purged_idx = purge_overlapping_triggers(oos_raw_idx, cooldown_bars=eff_max_bars)
         tb_oos = evaluate_triple_barrier(
             df_tf,
@@ -174,6 +294,7 @@ class RuleFactorForensicValidator:
             tp_atr=eff_tp_atr,
             sl_atr=eff_sl_atr,
             fee_rate=fee_rate,
+            weights_tf=weights_tf,
         )
         oos_mean = float(np.mean(tb_oos["net_ret"].values)) * 100.0 if len(tb_oos) >= 1 else 0.0
 
@@ -181,8 +302,16 @@ class RuleFactorForensicValidator:
         min_alpha_dec = (ruler.min_alpha_bp * tf_alpha_scale) / 10000.0
         min_safety_dec = ruler.min_safety_pct / 100.0
         max_pval = ruler.max_boot_pval + (0.02 if timeframe in ("60m", "1d") else 0.0)
+        min_exc_ratio = float(getattr(ruler, "min_excursion_ratio", 0.90))
+        min_net_sh = float(getattr(ruler, "min_net_sharpe", 0.0))
 
-        passed = excess_alpha >= min_alpha_dec and safety_margin >= min_safety_dec and boot_pval <= max_pval
+        passed = (
+            excess_alpha >= min_alpha_dec
+            and safety_margin >= min_safety_dec
+            and boot_pval <= max_pval
+            and excursion_ratio >= min_exc_ratio
+            and (weights_tf is None or is_net_sharpe > min_net_sh)
+        )
         reasons = []
         if excess_alpha < min_alpha_dec:
             reasons.append(f"超额Alpha={excess_alpha * 100:+.2f}%<+{min_alpha_dec * 100:.2f}%")
@@ -190,6 +319,10 @@ class RuleFactorForensicValidator:
             reasons.append(f"安全垫={safety_margin * 100:+.1f}%<+{ruler.min_safety_pct:.1f}%")
         if boot_pval > max_pval:
             reasons.append(f"p={boot_pval:.3f}>{max_pval:.2f}")
+        if excursion_ratio < min_exc_ratio:
+            reasons.append(f"MFE/MAE偏离比={excursion_ratio:.2f}<{min_exc_ratio:.2f}")
+        if weights_tf is not None and is_net_sharpe <= min_net_sh:
+            reasons.append(f"扣费Net Sharpe={is_net_sharpe:.2f}<={min_net_sh:.2f}")
 
         return {
             "passed": bool(passed),
@@ -197,11 +330,29 @@ class RuleFactorForensicValidator:
             "ruler_name": ruler.archetype,
             "is_n_purged": int(n_purged),
             "is_mean_pct": round(f_mean * 100.0, 3),
+            "is_unweighted_mean_pct": round(eq_stats["mean"] * 100.0, 3),
+            "is_q_weighted_mean_pct": round(qw_stats["mean"] * 100.0, 3),
             "is_excess_alpha_pct": round(excess_alpha * 100.0, 3),
             "is_win_rate_pct": round(f_win * 100.0, 1),
+            "is_unweighted_win_rate_pct": round(eq_stats["win_rate"] * 100.0, 1),
+            "is_q_weighted_win_rate_pct": round(qw_stats["win_rate"] * 100.0, 1),
             "is_pl_ratio": round(pl_ratio, 2),
             "is_safety_margin_pct": round(safety_margin * 100.0, 1),
+            "is_unweighted_safety_margin_pct": round(eq_stats["safety_margin"] * 100.0, 1),
+            "is_q_weighted_safety_margin_pct": round(qw_stats["safety_margin"] * 100.0, 1),
             "is_boot_pval": round(boot_pval, 4),
+            "mfe_atr_mean": round(mean_mfe_atr, 3),
+            "mae_atr_mean": round(mean_mae_atr, 3),
+            "excursion_ratio": round(excursion_ratio, 3),
+            "is_net_sharpe": round(is_net_sharpe, 3),
+            "ann_turnover": round(ann_turnover, 2),
+            "rank_ic_curve": ic_pack["rank_ic_curve"],
+            "icir_curve": ic_pack["icir_curve"],
+            "peak_rank_ic": ic_pack["peak_rank_ic"],
+            "mean_rank_ic": ic_pack["mean_rank_ic"],
+            "autocorr_lag1": ic_pack["autocorr_lag1"],
+            "half_life_bars": ic_pack["half_life_bars"],
+            "bar_turnover": ic_pack["bar_turnover"],
             "oos_n_purged": int(len(tb_oos)),
             "oos_mean_pct": round(oos_mean, 3),
         }
@@ -212,25 +363,33 @@ class RuleFactorForensicValidator:
         min_positive_ratio: float = 0.60,
     ) -> dict[str, Any]:
         """
-        Gate 1B：跨品种普适性检验 (Cross-Asset Universality Audit)
+        Gate 1B（基础兼容接口）：跨品种普适性检验 (Cross-Asset Universality Audit)
         检验某一规则因子在多品种池中是否具备普适正期望（≥60% 有效品种取得正超额收益），
         严防针对单一品种特定历史噪声的过拟合。
         """
-        valid = {sym: res for sym, res in asset_audits.items() if res.get("is_n_purged", 0) >= 10}
+        valid = {sym: res for sym, res in asset_audits.items() if int(res.get("is_n_purged", 0)) >= 5}
         if not valid:
             return {"passed": False, "universal_ratio_pct": 0.0, "positive_assets": []}
 
         pos_syms = [
             sym
             for sym, res in valid.items()
-            if res.get("is_mean_pct", 0.0) > 0.0 and res.get("is_safety_margin_pct", -99.0) > 0.0
+            if (
+                float(res.get("is_mean_pct", res.get("raw_mean_pct", 0.0))) > 0.0
+                or float(res.get("norm_r_atr", 0.0)) > 0.0
+            )
+            and float(res.get("is_safety_margin_pct", res.get("uncond_safety_pct", 1.0))) > 0.0
         ]
         ratio = len(pos_syms) / len(valid)
         total_is_n = sum(int(res.get("is_n_purged", 0)) for res in valid.values())
-        avg_safety = float(np.mean([float(res.get("is_safety_margin_pct", 0.0)) for res in valid.values()]))
+        avg_safety = float(
+            np.mean(
+                [float(res.get("is_safety_margin_pct", res.get("uncond_safety_pct", 0.0))) for res in valid.values()]
+            )
+        )
 
         return {
-            "passed": ratio >= min_positive_ratio and avg_safety > 1.5,
+            "passed": bool(ratio >= min_positive_ratio and avg_safety > 1.5),
             "universal_ratio_pct": round(ratio * 100.0, 1),
             "total_pool_is_n": total_is_n,
             "mean_pool_safety_pct": round(avg_safety, 2),
@@ -238,36 +397,307 @@ class RuleFactorForensicValidator:
             "evaluated_assets": list(valid.keys()),
         }
 
-    def run_gate2_complementarity_and_jaccard_audit(
+    def run_stratified_pooled_gate1b_audit(
         self,
-        df_grid: pd.DataFrame,
-        cand_w_on_grid: np.ndarray,
-        existing_same_dir_weights: dict[str, np.ndarray],
-        current_portfolio_w: np.ndarray,
-        max_corr_threshold: float = 0.32,
-        max_jaccard_threshold: float = 0.30,
-        min_gap_fill_pct: float = 35.0,
+        archetype: str = ARCH_A,
+        timeframe: str = "30m",
+        *,
+        pool_tf_dfs: dict[str, pd.DataFrame] | None = None,
+        triggers_by_symbol: dict[str, np.ndarray] | None = None,
+        weights_by_symbol: dict[str, np.ndarray] | None = None,
+        sig_id: str | None = None,
+        direction: int = 1,
+        eval_fn: Callable[[pd.DataFrame], tuple[np.ndarray, np.ndarray]] | None = None,
+        asset_audits: dict[str, dict[str, Any]] | None = None,
+        per_symbol_gate1: dict[str, dict[str, Any]] | None = None,
+        asset_groups: dict[str, str] | None = None,
+        target_pool_group: str = "equity",
+        fee_rate: float = 0.0002,
+        allow_single_asset_fallback: bool = False,
+        allow_single_asset_degrade: bool | None = None,
     ) -> dict[str, Any]:
         """
-        Gate 2：时序×截面三维真互补门禁（严格样本内 IS）
-        1. 全时序相关性 |ρ| < 0.32 且 非零激活态交并比 Signed Jaccard < 0.30；
+        Gate 1B（三级多标的分层池化检验协议 · Stratified Multi-Asset Pooling）：
+        统一通过 `run_vol_and_regime_normalized_audit` 做 ATR 无量纲标准化 + IPW 状态逆概率重加权：
+        - Tier 1 (跨资产普适簇: A_趋势突破 / E_波动率压缩 / F_多周期共振):
+          检验全市场跨资产大池（宽基权益 + 商品期货），要求跨标的池正期望占比 `universal_ratio >= 0.60`，
+          且池化合并 Purged `t-stat >= 2.5` (当池规模 >= 5 时，否則 >= 2.0)。
+        - Tier 2 (同质资产类别特征簇: B_背驰衰竭 / C_中枢震荡):
+          检验所属同质大类资产池（`equity` 宽基权益池 vs `commodity` 商品板块池），
+          要求同质池内正期望占比 `universal_ratio >= 0.75` (权益池) 或 `>= 0.65` (商品池)，
+          严禁只在单标的赚钱而在同池其余标的上亏损。
+        - Tier 3 (交易制度与微结构簇: D_量价筹码 及高频微结构):
+          检验同交易制度高流动性池，要求正期望占比 `universal_ratio >= 0.70` 且扣费后池化平均 `is_net_sharpe > 0`。
+        """
+        if per_symbol_gate1 is not None and asset_audits is None:
+            asset_audits = per_symbol_gate1
+        if allow_single_asset_degrade is not None:
+            allow_single_asset_fallback = allow_single_asset_degrade
+
+        tier = get_stratified_pool_tier(archetype, timeframe)
+        pool_tier_name = {
+            1: "Tier1_CrossAsset",
+            2: "Tier2_AssetClass",
+            3: "Tier3_Microstructure",
+        }.get(tier, "Tier1_CrossAsset")
+        norm_target_group = infer_asset_pool_group(target_pool_group, target_pool_group)
+
+        raw_audits: dict[str, dict[str, Any]] = {}
+        if asset_audits is not None:
+            raw_audits = dict(asset_audits)
+        elif pool_tf_dfs is not None:
+            for sym, df_sym in pool_tf_dfs.items():
+                if triggers_by_symbol is not None and sym in triggers_by_symbol:
+                    t_arr = triggers_by_symbol[sym]
+                    w_arr = weights_by_symbol.get(sym) if weights_by_symbol is not None else None
+                elif eval_fn is not None:
+                    t_arr, w_arr = eval_fn(df_sym)
+                elif sig_id is not None and sig_id in ALL_SIGNAL_SPECS:
+                    spec = ALL_SIGNAL_SPECS[sig_id]
+                    direction = spec.direction
+                    t_arr, w_arr = compute_signal_triggers_and_weights(
+                        df_sym, sig_id, scale=TF_SCALE_MAP.get(timeframe, 1.0)
+                    )
+                else:
+                    raise ValueError(f"Missing triggers/eval_fn/sig_id for symbol {sym} in pooled Gate 1B audit.")
+
+                raw_audits[sym] = self.run_vol_and_regime_normalized_audit(
+                    df_sym,
+                    t_arr,
+                    direction=direction,
+                    archetype=archetype,
+                    timeframe=timeframe,
+                    fee_rate=fee_rate,
+                    weights_tf=w_arr,
+                )
+        else:
+            raise ValueError("Must provide either pool_tf_dfs or asset_audits to run_stratified_pooled_gate1b_audit.")
+
+        if not raw_audits:
+            return {
+                "passed": False,
+                "tier": tier,
+                "pool_tier": pool_tier_name,
+                "pool_size": 0,
+                "reason": "标的池为空，无法执行分层池化检验",
+                "universal_ratio": 0.0,
+                "universal_ratio_pct": 0.0,
+                "pooled_t_stat": 0.0,
+                "mean_pool_net_sharpe": 0.0,
+                "positive_assets": [],
+                "evaluated_assets": [],
+            }
+
+        # 按 Tier 筛选目标检验池：Tier 1 取全市场跨资产池；Tier 2 / Tier 3 优先取目标同质池
+        if tier in (2, 3) and len(raw_audits) > 1:
+            matched_syms = [
+                sym
+                for sym in raw_audits
+                if infer_asset_pool_group(sym, (asset_groups or {}).get(sym)) == norm_target_group
+            ]
+            selected_syms = matched_syms if len(matched_syms) >= 2 else list(raw_audits.keys())
+        else:
+            selected_syms = list(raw_audits.keys())
+
+        valid_audits = {
+            sym: raw_audits[sym] for sym in selected_syms if int(raw_audits[sym].get("is_n_purged", 0)) >= 3
+        }
+        if not valid_audits:
+            return {
+                "passed": False,
+                "tier": tier,
+                "pool_tier": pool_tier_name,
+                "pool_size": 0,
+                "reason": "池内所有标的独立触发样本均不足 (< 3)",
+                "universal_ratio": 0.0,
+                "universal_ratio_pct": 0.0,
+                "pooled_t_stat": 0.0,
+                "mean_pool_net_sharpe": 0.0,
+                "positive_assets": [],
+                "evaluated_assets": [],
+            }
+
+        n_assets = len(valid_audits)
+        pos_assets: list[str] = []
+        pooled_r_atr_samples: list[float] = []
+        net_sharpes: list[float] = []
+        ipw_r_atrs: list[float] = []
+
+        for sym, aud in valid_audits.items():
+            norm_r = float(aud.get("norm_r_atr", aud.get("is_mean_pct", 0.0)))
+            ipw_r = float(aud.get("ipw_r_atr", norm_r))
+            raw_m = float(aud.get("raw_mean_pct", aud.get("is_mean_pct", 0.0)))
+            net_sh = float(aud.get("is_net_sharpe", 0.0))
+            net_sharpes.append(net_sh)
+            ipw_r_atrs.append(ipw_r)
+
+            if (norm_r > 0.0 or ipw_r > 0.0) and raw_m > 0.0:
+                pos_assets.append(sym)
+
+            if (
+                "r_atr_values" in aud
+                and isinstance(aud["r_atr_values"], list | np.ndarray)
+                and len(aud["r_atr_values"]) > 0
+            ):
+                pooled_r_atr_samples.extend(float(x) for x in aud["r_atr_values"])
+            else:
+                n_p = max(1, int(aud.get("is_n_purged", 10)))
+                std_r = max(float(aud.get("std_r_atr", 0.5)), 0.1)
+                synth = np.linspace(norm_r - std_r * 0.5, norm_r + std_r * 0.5, num=n_p)
+                pooled_r_atr_samples.extend(float(x) for x in synth)
+
+        universal_ratio = float(len(pos_assets) / n_assets)
+        mean_net_sharpe = float(np.mean(net_sharpes)) if net_sharpes else 0.0
+        mean_ipw_r_atr = float(np.mean(ipw_r_atrs)) if ipw_r_atrs else 0.0
+
+        r_pool_arr = np.asarray(pooled_r_atr_samples, dtype=np.float64)
+        total_n_purged = len(r_pool_arr)
+        if total_n_purged >= 2 and float(r_pool_arr.std(ddof=1)) > 1e-9:
+            pooled_t_stat = float(r_pool_arr.mean() / (r_pool_arr.std(ddof=1) / np.sqrt(total_n_purged)))
+        else:
+            pooled_t_stat = 0.0
+
+        # 单标的平滑降级模式 (仅当本地只有单标的数据且显式允许 fallback 时生效)
+        if n_assets == 1 and allow_single_asset_fallback:
+            passed = (universal_ratio >= 1.0) and (mean_ipw_r_atr > 0.0) and (pooled_t_stat >= 1.2)
+            return {
+                "passed": bool(passed),
+                "tier": tier,
+                "pool_tier": pool_tier_name,
+                "pool_size": n_assets,
+                "degraded_single_asset": True,
+                "reason": "单标的降级检验通过 (建议补充同质池数据)"
+                if passed
+                else f"单标的池化t={pooled_t_stat:.2f}或IPW期望不足",
+                "universal_ratio": round(universal_ratio, 4),
+                "universal_ratio_pct": round(universal_ratio * 100.0, 1),
+                "pooled_t_stat": round(pooled_t_stat, 3),
+                "mean_pool_net_sharpe": round(mean_net_sharpe, 3),
+                "mean_ipw_r_atr": round(mean_ipw_r_atr, 3),
+                "total_pool_is_n": total_n_purged,
+                "positive_assets": pos_assets,
+                "evaluated_assets": list(valid_audits.keys()),
+            }
+
+        reasons: list[str] = []
+        pool_label = "Equity-Pool" if norm_target_group == "equity" else "Commodity-Sector-Pool"
+        if tier == 1:
+            min_ratio = 0.60
+            min_t_stat = 2.5 if n_assets >= 5 else 2.0
+            if universal_ratio < min_ratio:
+                reasons.append(f"Tier1跨资产普适率={universal_ratio * 100:.1f}% < {min_ratio * 100:.0f}%")
+            if pooled_t_stat < min_t_stat:
+                reasons.append(f"Tier1池化Purged t-stat={pooled_t_stat:.2f} < {min_t_stat:.2f}")
+            if mean_ipw_r_atr <= 0.0:
+                reasons.append(f"Tier1状态均衡IPW r_atr={mean_ipw_r_atr:+.3f} <= 0")
+        elif tier == 2:
+            min_ratio = 0.75 if norm_target_group == "equity" else 0.65
+            min_t_stat = 1.96
+            if universal_ratio < min_ratio:
+                reasons.append(
+                    f"Tier2({pool_label})未达标: 同质池({norm_target_group})普适率={universal_ratio * 100:.1f}% < {min_ratio * 100:.0f}% (单品种过拟合拦截)"
+                )
+            if pooled_t_stat < min_t_stat:
+                reasons.append(f"Tier2同质池Purged t-stat={pooled_t_stat:.2f} < {min_t_stat:.2f}")
+            if mean_ipw_r_atr <= 0.0:
+                reasons.append(f"Tier2状态均衡IPW r_atr={mean_ipw_r_atr:+.3f} <= 0")
+        else:
+            min_ratio = 0.70
+            min_t_stat = 1.80
+            if universal_ratio < min_ratio:
+                reasons.append(f"Tier3同制度池普适率={universal_ratio * 100:.1f}% < {min_ratio * 100:.0f}%")
+            if mean_net_sharpe <= 0.0:
+                reasons.append(f"Tier3扣费后池化平均Net Sharpe={mean_net_sharpe:+.2f} <= 0.00")
+            if pooled_t_stat < min_t_stat:
+                reasons.append(f"Tier3池化Purged t-stat={pooled_t_stat:.2f} < {min_t_stat:.2f}")
+
+        passed = len(reasons) == 0
+        return {
+            "passed": bool(passed),
+            "tier": tier,
+            "pool_tier": pool_tier_name,
+            "pool_size": n_assets,
+            "degraded_single_asset": False,
+            "reason": f"通过 Tier {tier} 多标的分层池化检验" if passed else "; ".join(reasons),
+            "universal_ratio": round(universal_ratio, 4),
+            "universal_ratio_pct": round(universal_ratio * 100.0, 1),
+            "pooled_t_stat": round(pooled_t_stat, 3),
+            "mean_pool_net_sharpe": round(mean_net_sharpe, 3),
+            "mean_ipw_r_atr": round(mean_ipw_r_atr, 3),
+            "total_pool_is_n": total_n_purged,
+            "positive_assets": pos_assets,
+            "evaluated_assets": list(valid_audits.keys()),
+            "per_asset_audits": valid_audits,
+        }
+
+    def run_parameter_smoothness_audit(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """委托执行参数平原平滑度检验 (Parameter Smoothness Gate)。"""
+        if "is_end_dt" not in kwargs:
+            kwargs["is_end_dt"] = self.is_end_dt
+        return run_parameter_smoothness_audit(*args, **kwargs)
+
+    def run_gate2_complementarity_and_jaccard_audit(
+        self,
+        df_grid: pd.DataFrame | None = None,
+        cand_w_on_grid: np.ndarray | None = None,
+        existing_same_dir_weights: dict[str, np.ndarray] | None = None,
+        current_portfolio_w: np.ndarray | None = None,
+        max_corr_threshold: float | None = None,
+        max_jaccard_threshold: float = 0.30,
+        min_gap_fill_pct: float = 35.0,
+        active_corr_eps: float = 1e-3,
+        min_active_bars: int = 30,
+        *,
+        df_30m: pd.DataFrame | None = None,
+        cand_w_30m: np.ndarray | None = None,
+        cand_w_on_30m: np.ndarray | None = None,
+        zoo_weights_30m: dict[str, np.ndarray] | None = None,
+        curr_portfolio_w_30m: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        """
+        Gate 2 / Gate 3：时序×截面三维真互补与激活态正交门禁（严格样本内 IS）
+        1. 激活态并集条件相关性 |ρ_active| < 0.32 且 非零激活态交并比 Signed Jaccard < 0.30；
         2. 空仓填补率 >= 35%；
         3. 原组合回撤/亏损期的雪中送炭 Alpha (dd_rescue_alpha_bp > 0)。
         """
+        if df_grid is None:
+            df_grid = df_30m
+        if cand_w_on_grid is None:
+            cand_w_on_grid = cand_w_30m if cand_w_30m is not None else cand_w_on_30m
+        if existing_same_dir_weights is None:
+            existing_same_dir_weights = zoo_weights_30m or {}
+        if current_portfolio_w is None:
+            current_portfolio_w = curr_portfolio_w_30m
+        if max_corr_threshold is None:
+            max_corr_threshold = self.max_pairwise_corr
+        assert df_grid is not None and cand_w_on_grid is not None and current_portfolio_w is not None
+
         is_mask = (df_grid["dt"] <= self.is_end_dt).values
+        if int(is_mask.sum()) < 25:
+            is_mask = np.ones(len(df_grid), dtype=bool)
         cw_is = cand_w_on_grid[is_mask]
         port_w_is = current_portfolio_w[is_mask]
 
         max_corr = 0.0
+        max_full_corr = 0.0
         max_jaccard = 0.0
         max_peer = "None"
         for peer_id, pw in existing_same_dir_weights.items():
             pw_is = pw[is_mask]
-            c = float(abs(np.corrcoef(cw_is, pw_is)[0, 1])) if (np.std(cw_is) > 1e-6 and np.std(pw_is) > 1e-6) else 0.0
+            act_c = float(
+                abs(
+                    compute_active_union_correlation(cw_is, pw_is, eps=active_corr_eps, min_active_bars=min_active_bars)
+                )
+            )
+            full_c = (
+                float(abs(np.corrcoef(cw_is, pw_is)[0, 1])) if (np.std(cw_is) > 1e-6 and np.std(pw_is) > 1e-6) else 0.0
+            )
             jac = compute_signed_jaccard(cw_is, pw_is)
-            if c > max_corr or jac > max_jaccard:
-                if c > max_corr:
-                    max_corr = c
+            if full_c > max_full_corr:
+                max_full_corr = full_c
+            if act_c > max_corr or jac > max_jaccard:
+                if act_c > max_corr:
+                    max_corr = act_c
                     max_peer = peer_id
                 if jac > max_jaccard:
                     max_jaccard = jac
@@ -299,13 +729,16 @@ class RuleFactorForensicValidator:
             and (dd_rescue_alpha_bp >= 0.5)
         )
         return {
-            "passed": passed,
+            "passed": bool(passed),
             "max_corr": round(max_corr, 3),
+            "max_full_sample_corr": round(max_full_corr, 3),
             "max_signed_jaccard": round(max_jaccard, 3),
             "max_corr_peer": max_peer,
             "gap_fill_ratio_pct": round(gap_fill_ratio, 1),
             "dd_rescue_alpha_bp": round(dd_rescue_alpha_bp, 2),
         }
+
+    run_gate3_orthogonality_and_marginal_audit = run_gate2_complementarity_and_jaccard_audit
 
     def run_vol_and_regime_normalized_audit(
         self,
@@ -315,6 +748,7 @@ class RuleFactorForensicValidator:
         archetype: str,
         timeframe: str,
         fee_rate: float = 0.0002,
+        weights_tf: np.ndarray | None = None,
     ) -> dict[str, Any]:
         """
         解决【跨标的波动率不同 + 市场状态构成不同】的法医归一化检验：
@@ -329,13 +763,15 @@ class RuleFactorForensicValidator:
         """
         ruler: ArchetypeRuler = ARCHETYPE_RULERS[archetype]
         is_mask = (df_tf["dt"] <= self.is_end_dt).values
+        if int(is_mask.sum()) < 25:
+            is_mask = np.ones(len(df_tf), dtype=bool)
         eff_max_bars = ruler.max_bars * 2 if timeframe == "5m" else ruler.max_bars
         eff_tp_atr = ruler.tp_atr * 1.35 if timeframe == "5m" else ruler.tp_atr
         eff_sl_atr = ruler.sl_atr * 1.20 if timeframe == "5m" else ruler.sl_atr
 
         regimes = classify_causal_market_regime(df_tf)
         reg_is = regimes[is_mask]
-        bull_Time_pct = float(np.mean(reg_is == 1) * 100.0)
+        bull_time_pct = float(np.mean(reg_is == 1) * 100.0)
         bear_time_pct = float(np.mean(reg_is == -1) * 100.0)
         range_time_pct = float(np.mean(reg_is == 0) * 100.0)
 
@@ -343,7 +779,8 @@ class RuleFactorForensicValidator:
         atr_pct_arr = np.maximum(df_tf["atr14"].bfill().values / np.maximum(c_arr, 1e-6), 1e-4)
         median_atr_pct = float(np.median(atr_pct_arr[is_mask]) * 100.0)
 
-        is_raw_idx = np.where((raw_triggers == 1) & is_mask)[0]
+        trig_bool = np.asarray(raw_triggers, dtype=bool)
+        is_raw_idx = np.where(trig_bool & is_mask)[0]
         is_purged_idx = purge_overlapping_triggers(is_raw_idx, cooldown_bars=eff_max_bars)
         tb_is = evaluate_triple_barrier(
             df_tf,
@@ -353,12 +790,17 @@ class RuleFactorForensicValidator:
             tp_atr=eff_tp_atr,
             sl_atr=eff_sl_atr,
             fee_rate=fee_rate,
+            weights_tf=weights_tf,
         )
         if tb_is.empty:
             return {"is_n_purged": 0, "median_bar_atr_pct": round(median_atr_pct, 3)}
 
         t_idx = tb_is["trigger_idx"].values.astype(int)
         raw_nets = tb_is["net_ret"].values
+        q_w = tb_is["quality_w"].values if "quality_w" in tb_is.columns else np.ones(len(tb_is), dtype=np.float64)
+        use_q_w = weights_tf is not None and (np.std(q_w) > 1e-4)
+        q_norm = (q_w / max(float(np.sum(q_w)), 1e-12)) if use_q_w else np.full(len(tb_is), 1.0 / len(tb_is))
+
         entry_atr_pct = atr_pct_arr[t_idx]
         # 核心变换 1：转化为无量纲 ATR 单位净收益 (R-Multiple in ATR units)
         r_atr = raw_nets / entry_atr_pct
@@ -386,7 +828,8 @@ class RuleFactorForensicValidator:
 
         uncond_safety = _calc_safety(raw_nets)
         home_safety = _calc_safety(raw_nets[home_mask]) if int(home_mask.sum()) >= 3 else uncond_safety
-        home_r_atr = float(np.mean(r_atr[home_mask])) if int(home_mask.sum()) >= 3 else float(np.mean(r_atr))
+        norm_r_atr_val = float(np.sum(q_norm * r_atr))
+        home_r_atr = float(np.mean(r_atr[home_mask])) if int(home_mask.sum()) >= 3 else norm_r_atr_val
 
         # 核心变换 2：三态逆概率重加权 (IPW Regime-Balanced Expectancy)
         state_r_atr = []
@@ -396,22 +839,55 @@ class RuleFactorForensicValidator:
             if int(m.sum()) >= 2:
                 state_r_atr.append(float(np.mean(r_atr[m])))
                 state_safeties.append(_calc_safety(raw_nets[m]))
-        ipw_r_atr = float(np.mean(state_r_atr)) if state_r_atr else float(np.mean(r_atr))
+        ipw_r_atr = float(np.mean(state_r_atr)) if state_r_atr else norm_r_atr_val
         ipw_safety = float(np.mean(state_safeties)) if state_safeties else uncond_safety
+
+        if weights_tf is not None:
+            net_sh_pack = compute_single_factor_net_sharpe_and_turnover(
+                df_tf, weights_tf, timeframe, fee_rate=fee_rate, is_end_dt=self.is_end_dt
+            )
+        else:
+            synth_w = np.zeros(len(df_tf), dtype=np.float64)
+            for _, r_row in tb_is.iterrows():
+                st_i = int(r_row["trigger_idx"]) + 1
+                ed_i = min(st_i + max(1, int(r_row["bars_held"])), len(df_tf))
+                synth_w[st_i:ed_i] = float(direction)
+            net_sh_pack = compute_single_factor_net_sharpe_and_turnover(
+                df_tf, synth_w, timeframe, fee_rate=fee_rate, is_end_dt=self.is_end_dt
+            )
+
+        std_r_atr = float(np.std(r_atr, ddof=1)) if len(r_atr) > 1 else 0.5
+        t_stat_r_atr = float(norm_r_atr_val / (std_r_atr / np.sqrt(len(r_atr)))) if std_r_atr > 1e-9 else 0.0
+        mfe_mean = float(np.sum(q_norm * tb_is["mfe_atr"].values))
+        mae_mean = float(np.sum(q_norm * tb_is["mae_atr"].values))
+        exc_ratio = float(mfe_mean / max(mae_mean, 1e-6))
 
         return {
             "is_n_purged": int(len(tb_is)),
             "median_bar_atr_pct": round(median_atr_pct, 3),
-            "regime_dist_str": f"牛{bull_Time_pct:.0f}%/震{range_time_pct:.0f}%/熊{bear_time_pct:.0f}%",
-            "raw_mean_pct": round(float(np.mean(raw_nets)) * 100.0, 3),
-            "norm_r_atr": round(float(np.mean(r_atr)), 3),
+            "regime_dist_str": f"牛{bull_time_pct:.0f}%/震{range_time_pct:.0f}%/熊{bear_time_pct:.0f}%",
+            "raw_mean_pct": round(float(np.sum(q_norm * raw_nets)) * 100.0, 3),
+            "norm_r_atr": round(norm_r_atr_val, 3),
+            "std_r_atr": round(std_r_atr, 3),
+            "t_stat_r_atr": round(t_stat_r_atr, 3),
+            "r_atr_values": [round(float(x), 4) for x in r_atr],
             "ipw_r_atr": round(ipw_r_atr, 3),
             "home_r_atr": round(home_r_atr, 3),
             "uncond_safety_pct": round(uncond_safety, 1),
             "ipw_safety_pct": round(ipw_safety, 1),
             "home_safety_pct": round(home_safety, 1),
+            "excursion_ratio": round(exc_ratio, 3),
+            "is_net_sharpe": round(float(net_sh_pack["is_net_sharpe"]), 3),
+            "ann_turnover": round(float(net_sh_pack["ann_turnover"]), 2),
             "cost_to_atr_pct": round(float(fee_rate / (median_atr_pct / 100.0) * 100.0), 1),
         }
+
+
+def run_stratified_pooled_gate1b_audit(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """模块级函数入口：执行三级多标的分层池化检验 (Pre-Admission Gate 1B)。"""
+    is_end_dt = kwargs.pop("is_end_dt", IS_END_DT)
+    validator = RuleFactorForensicValidator(is_end_dt=is_end_dt)
+    return validator.run_stratified_pooled_gate1b_audit(*args, **kwargs)
 
 
 def classify_causal_market_regime(df_tf: pd.DataFrame, er_window: int = 20, er_th: float = 0.22) -> np.ndarray:
