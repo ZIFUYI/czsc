@@ -46,6 +46,7 @@ from examples.alpha_mining_agent.hypothesis_bank import (
     ArchetypeRuler,
     compute_signal_triggers_and_weights,
 )
+from examples.multi_factor_cta.atomic_factors import SoftCrossSectionalGate
 
 # 周期自适应最小独立样本数门槛（解决日线/60m 低频高质量信号被固定高样本门槛误杀的问题）
 TF_MIN_PURGED_SAMPLES: dict[str, int] = {
@@ -166,10 +167,43 @@ def compute_cross_sectional_concurrency(
 class RuleFactorForensicValidator:
     """规则型与连续强度因子四级法医检验器 (Gate 1A + Gate 1B 分层池化 + 参数平原 + 激活态正交 & 边际增益)"""
 
-    def __init__(self, is_end_dt: pd.Timestamp = IS_END_DT, max_pairwise_corr: float = 0.32) -> None:
+    def __init__(
+        self,
+        is_end_dt: pd.Timestamp = IS_END_DT,
+        max_pairwise_corr: float = 0.32,
+        soft_gate: SoftCrossSectionalGate | bool | None = True,
+    ) -> None:
         self.is_end_dt = is_end_dt
         self.max_pairwise_corr = max_pairwise_corr
+        self.soft_gate = soft_gate
         self.rng = np.random.default_rng(42)
+
+    def _resolve_soft_gated_inputs(
+        self,
+        df_tf: pd.DataFrame,
+        raw_triggers: np.ndarray,
+        weights_tf: np.ndarray | None,
+        archetype: str,
+        direction: int,
+        soft_gate: SoftCrossSectionalGate | bool | None = None,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        eff_gate = self.soft_gate if soft_gate is None else soft_gate
+        trig_bool = np.asarray(raw_triggers, dtype=bool)
+        if eff_gate is None or eff_gate is False:
+            return trig_bool, weights_tf
+        gate_obj = eff_gate if isinstance(eff_gate, SoftCrossSectionalGate) else SoftCrossSectionalGate()
+        cs_rank = gate_obj.extract_cs_rank(df_tf)
+        if cs_rank is None:
+            return trig_bool, weights_tf
+        er = gate_obj.extract_causal_er(df_tf)
+        return gate_obj.apply_to_triggers_and_weights(
+            trig_bool,
+            weights_tf,
+            cs_rank,
+            er,
+            archetype=archetype,
+            direction=direction,
+        )
 
     def run_gate1_single_asset_audit(
         self,
@@ -180,6 +214,7 @@ class RuleFactorForensicValidator:
         timeframe: str,
         fee_rate: float = 0.0002,
         weights_tf: np.ndarray | None = None,
+        soft_gate: SoftCrossSectionalGate | bool | None = None,
     ) -> dict[str, Any]:
         """
         Gate 1A：单品种单周期法医标尺检验（严格样本内 IS）
@@ -200,7 +235,9 @@ class RuleFactorForensicValidator:
         eff_sl_atr = ruler.sl_atr * 1.20 if timeframe == "5m" else ruler.sl_atr
         min_warmup = min(240 if timeframe == "5m" else 60, max(10, int(is_mask.sum()) // 4))
 
-        trig_bool = np.asarray(raw_triggers, dtype=bool)
+        trig_bool, weights_tf = self._resolve_soft_gated_inputs(
+            df_tf, raw_triggers, weights_tf, archetype, direction, soft_gate
+        )
         is_raw_idx = np.where(trig_bool & is_mask)[0]
         is_purged_idx = purge_overlapping_triggers(is_raw_idx, cooldown_bars=eff_max_bars)
 
@@ -415,6 +452,7 @@ class RuleFactorForensicValidator:
         fee_rate: float = 0.0002,
         allow_single_asset_fallback: bool = False,
         allow_single_asset_degrade: bool | None = None,
+        soft_gate: SoftCrossSectionalGate | bool | None = None,
     ) -> dict[str, Any]:
         """
         Gate 1B（三级多标的分层池化检验协议 · Stratified Multi-Asset Pooling）：
@@ -469,6 +507,7 @@ class RuleFactorForensicValidator:
                     timeframe=timeframe,
                     fee_rate=fee_rate,
                     weights_tf=w_arr,
+                    soft_gate=soft_gate,
                 )
         else:
             raise ValueError("Must provide either pool_tf_dfs or asset_audits to run_stratified_pooled_gate1b_audit.")
@@ -749,6 +788,7 @@ class RuleFactorForensicValidator:
         timeframe: str,
         fee_rate: float = 0.0002,
         weights_tf: np.ndarray | None = None,
+        soft_gate: SoftCrossSectionalGate | bool | None = None,
     ) -> dict[str, Any]:
         """
         解决【跨标的波动率不同 + 市场状态构成不同】的法医归一化检验：
@@ -779,7 +819,9 @@ class RuleFactorForensicValidator:
         atr_pct_arr = np.maximum(df_tf["atr14"].bfill().values / np.maximum(c_arr, 1e-6), 1e-4)
         median_atr_pct = float(np.median(atr_pct_arr[is_mask]) * 100.0)
 
-        trig_bool = np.asarray(raw_triggers, dtype=bool)
+        trig_bool, weights_tf = self._resolve_soft_gated_inputs(
+            df_tf, raw_triggers, weights_tf, archetype, direction, soft_gate
+        )
         is_raw_idx = np.where(trig_bool & is_mask)[0]
         is_purged_idx = purge_overlapping_triggers(is_raw_idx, cooldown_bars=eff_max_bars)
         tb_is = evaluate_triple_barrier(
@@ -798,7 +840,7 @@ class RuleFactorForensicValidator:
         t_idx = tb_is["trigger_idx"].values.astype(int)
         raw_nets = tb_is["net_ret"].values
         q_w = tb_is["quality_w"].values if "quality_w" in tb_is.columns else np.ones(len(tb_is), dtype=np.float64)
-        use_q_w = weights_tf is not None and (np.std(q_w) > 1e-4)
+        use_q_w = weights_tf is not None and (np.std(q_w) > 1e-4 or np.mean(q_w) < 0.99)
         q_norm = (q_w / max(float(np.sum(q_w)), 1e-12)) if use_q_w else np.full(len(tb_is), 1.0 / len(tb_is))
 
         entry_atr_pct = atr_pct_arr[t_idx]
@@ -829,7 +871,11 @@ class RuleFactorForensicValidator:
         uncond_safety = _calc_safety(raw_nets)
         home_safety = _calc_safety(raw_nets[home_mask]) if int(home_mask.sum()) >= 3 else uncond_safety
         norm_r_atr_val = float(np.sum(q_norm * r_atr))
-        home_r_atr = float(np.mean(r_atr[home_mask])) if int(home_mask.sum()) >= 3 else norm_r_atr_val
+        home_r_atr = (
+            float(np.sum(q_norm[home_mask] * r_atr[home_mask]) / max(float(np.sum(q_norm[home_mask])), 1e-12))
+            if int(home_mask.sum()) >= 3
+            else norm_r_atr_val
+        )
 
         # 核心变换 2：三态逆概率重加权 (IPW Regime-Balanced Expectancy)
         state_r_atr = []
@@ -837,7 +883,8 @@ class RuleFactorForensicValidator:
         for st in (1, 0, -1):
             m = trig_regimes == st
             if int(m.sum()) >= 2:
-                state_r_atr.append(float(np.mean(r_atr[m])))
+                w_m = q_norm[m]
+                state_r_atr.append(float(np.sum(w_m * r_atr[m]) / max(float(np.sum(w_m)), 1e-12)))
                 state_safeties.append(_calc_safety(raw_nets[m]))
         ipw_r_atr = float(np.mean(state_r_atr)) if state_r_atr else norm_r_atr_val
         ipw_safety = float(np.mean(state_safeties)) if state_safeties else uncond_safety
@@ -899,10 +946,15 @@ def classify_causal_market_regime(df_tf: pd.DataFrame, er_window: int = 20, er_t
     - `0`  (CHOPPY_RANGE 震荡盘整态): 其余时间（路径效率低或均线缠绕）
     """
     c = df_tf["close"].values.astype(np.float64)
-    ma20 = df_tf["ma20"].bfill().values
-    ma60 = df_tf["ma60"].bfill().values
+    c_series = pd.Series(c)
+    ma20 = (
+        df_tf["ma20"].bfill().values if "ma20" in df_tf.columns else c_series.rolling(20, min_periods=1).mean().values
+    )
+    ma60 = (
+        df_tf["ma60"].bfill().values if "ma60" in df_tf.columns else c_series.rolling(60, min_periods=1).mean().values
+    )
 
-    net_chg = np.abs(pd.Series(c).diff(er_window).fillna(0.0).values)
+    net_chg = np.abs(c_series.diff(er_window).fillna(0.0).values)
     abs_path = pd.Series(np.abs(np.diff(c, prepend=c[0]))).rolling(er_window, min_periods=5).sum().bfill().values
     er = net_chg / np.maximum(abs_path, 1e-6)
 
@@ -930,3 +982,342 @@ def compute_empirical_bayes_shrinkage_weight(
     lam = float(is_n_purged / max(is_n_purged + shrink_k, 1))
     w_eb = (1.0 - lam) * cross_asset_prior_weight + lam * local_weight
     return round(float(w_eb), 3), round(lam, 3)
+
+
+class RollingEBWeightsResult(dict[str, np.ndarray]):
+    """
+    滚动经验贝叶斯配权结果容器：
+    - 继承自 `dict[str, np.ndarray]`，可直接按 `res[unit_id]` 获取各单元/簇在时间轴上的因果 EB 权重序列；
+    - 同时暴露 `.eb_weights`、`.prior_weights`、`.rolling_perf_weights`、`.rolling_ir` 与 `.prior_anchor_lambda` 属性。
+    """
+
+    def __init__(
+        self,
+        eb_weights: dict[str, np.ndarray],
+        prior_weights: dict[str, float],
+        rolling_perf_weights: dict[str, np.ndarray],
+        rolling_ir: dict[str, np.ndarray],
+        prior_anchor_lambda: float = 0.70,
+    ) -> None:
+        super().__init__(eb_weights)
+        self.eb_weights = eb_weights
+        self.prior_weights = prior_weights
+        self.rolling_perf_weights = rolling_perf_weights
+        self.rolling_ir = rolling_ir
+        self.prior_anchor_lambda = float(prior_anchor_lambda)
+
+    def __getitem__(self, key: str) -> Any:
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        meta_map = {
+            "eb_weights": self.eb_weights,
+            "prior_weights": self.prior_weights,
+            "rolling_perf_weights": self.rolling_perf_weights,
+            "rolling_ir": self.rolling_ir,
+            "prior_anchor_lambda": self.prior_anchor_lambda,
+        }
+        if key in meta_map:
+            return meta_map[key]
+        raise KeyError(key)
+
+    def to_dataframe(self, index: Any = None) -> pd.DataFrame:
+        return pd.DataFrame(self.eb_weights, index=index)
+
+
+class RollingEmpiricalBayesWeighter:
+    """
+    零前视滚动/扩展窗口经验贝叶斯部分池化收缩配权器 (Rolling Empirical Bayes Shrinkage Weighter, Issue #7 Phase 4)
+
+    核心机制：
+    1. 静态先验层 (Prior Anchor):
+       支持结合跨品种池化先验得分/权重 Q_pool,k (如 Gate 1B 的 pooled_r_atr / safety_margin 或先验基准权重)
+       与单品种样本内质量得分/权重 Q_local,i,k，按先验收缩比 λ_prior = 0.70
+       (70% 锚定全品种池化先验 + 30% 锚定单品种样本量自适应调整) 生成无过拟合的基准权重先验 w_{i,k}^{prior}。
+    2. 因果滚动动态更新层 (Causal Rolling / Expanding Update):
+       在时间轴 t 上，仅使用严格截至 t-1 (shift(1) 零前视) 的历史已实现净收益序列
+       (滚动窗口 lookback_bars 如 60~120，或扩展窗口 lookback_bars=None)，计算各单元/各簇的因果滚动信息比率 / 净夏普得分，
+       映射为滚动表现权重 w_{i,k,t-1}^{rolling_perf}，并向基准先验执行 L2 经验贝叶斯收缩：
+           w_{i,k,t}^{EB} = λ_prior * w_{i,k}^{prior} + (1 - λ_prior) * w_{i,k,t-1}^{rolling_perf},  λ_prior = 0.70
+    """
+
+    def __init__(
+        self,
+        prior_anchor_lambda: float = 0.70,
+        lookback_bars: int | None = 90,
+        min_bars: int = 15,
+        shrink_k: int = 60,
+        annualization_factor: float = 252.0,
+        perf_tilt_scale: float = 0.55,
+        min_weight: float = 0.05,
+        max_weight: float = 1.00,
+        normalize_budget: bool = False,
+        *,
+        lambda_prior: float | None = None,
+    ) -> None:
+        eff_lam = float(lambda_prior if lambda_prior is not None else prior_anchor_lambda)
+        if not (0.0 <= eff_lam <= 1.0):
+            raise ValueError(f"prior_anchor_lambda must be in [0, 1], got {eff_lam}")
+        self.prior_anchor_lambda = eff_lam
+        self.lookback_bars = lookback_bars
+        self.min_bars = max(int(min_bars), 2)
+        self.shrink_k = max(int(shrink_k), 1)
+        self.annualization_factor = float(annualization_factor)
+        self.perf_tilt_scale = float(perf_tilt_scale)
+        self.min_weight = float(min_weight)
+        self.max_weight = float(max_weight)
+        self.normalize_budget = bool(normalize_budget)
+
+    def compute_prior_anchor(
+        self,
+        cross_asset_prior: dict[str, float],
+        local_quality: dict[str, float] | None = None,
+        is_n_purged: dict[str, int] | int | None = None,
+        unit_forensic_meta: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, float]:
+        """
+        计算静态先验锚定权重 w_{i,k}^{prior}：
+        - 70% (λ_prior) 锚定跨品种池化先验权重 w_pool,k；
+        - 30% (1 - λ_prior) 锚定单品种样本量自适应调整后的局部权重 w_local,i,k。
+        """
+        lam_p = self.prior_anchor_lambda
+        priors: dict[str, float] = {}
+
+        # 若提供 unit_forensic_meta 但未直接提供 local_quality，从法医元数据提取局部质量修正
+        derived_local: dict[str, float] = {}
+        if local_quality is None and unit_forensic_meta:
+            raw_q: dict[str, float] = {}
+            for uid in cross_asset_prior:
+                meta = unit_forensic_meta.get(uid, {})
+                n_p = max(int(meta.get("is_n_purged", 20)), 5)
+                saf = float(np.clip(float(meta.get("is_safety_margin_pct", 4.0)), 0.5, 15.0))
+                r_atr = float(np.clip(float(meta.get("pooled_r_atr", meta.get("norm_r_atr", 0.5))), -1.0, 3.0))
+                raw_q[uid] = float(np.log(n_p) * saf * (1.0 + 0.15 * r_atr))
+            if len(raw_q) > 1:
+                q_vals = np.asarray(list(raw_q.values()), dtype=np.float64)
+                q_mean, q_std = float(q_vals.mean()), float(q_vals.std() + 1e-6)
+            else:
+                q_mean, q_std = 0.0, 1.0
+            for uid, w_pool in cross_asset_prior.items():
+                z_u = float(np.clip((raw_q[uid] - q_mean) / q_std, -1.2, 1.6)) if len(raw_q) > 1 else 0.0
+                derived_local[uid] = float(np.clip(w_pool * (1.0 + 0.25 * z_u), self.min_weight, self.max_weight))
+
+        eff_local_map = local_quality if local_quality is not None else (derived_local if derived_local else None)
+
+        for uid, w_pool_raw in cross_asset_prior.items():
+            w_pool = float(w_pool_raw)
+            if eff_local_map is not None and uid in eff_local_map:
+                w_loc_raw = float(eff_local_map[uid])
+                n_obs: int | None = None
+                if isinstance(is_n_purged, dict) and uid in is_n_purged:
+                    n_obs = int(is_n_purged[uid])
+                elif isinstance(is_n_purged, int):
+                    n_obs = int(is_n_purged)
+                elif unit_forensic_meta and uid in unit_forensic_meta and "is_n_purged" in unit_forensic_meta[uid]:
+                    n_obs = int(unit_forensic_meta[uid]["is_n_purged"])
+
+                if n_obs is not None:
+                    eta = float(max(n_obs, 0) / max(max(n_obs, 0) + self.shrink_k, 1))
+                    w_loc_adj = (1.0 - eta) * w_pool + eta * w_loc_raw
+                else:
+                    w_loc_adj = w_loc_raw
+                w_prior = lam_p * w_pool + (1.0 - lam_p) * w_loc_adj
+            else:
+                w_prior = w_pool
+            priors[uid] = float(np.clip(w_prior, self.min_weight, self.max_weight))
+
+        return priors
+
+    @staticmethod
+    def build_causal_unit_net_returns(
+        df_grid: pd.DataFrame,
+        unit_weights_on_grid: dict[str, np.ndarray],
+        fee_rate: float = 0.0002,
+    ) -> dict[str, np.ndarray]:
+        """
+        从价格序列与各单元时序仓位构造严格因果的已实现单步净收益序列 r_{k, s}：
+        在时刻 s >= 1，已实现净收益为 s-1 时刻持仓在 (s-1 -> s) 价格变动上的收益扣除调仓成本：
+            r_{k, s} = w_{k, s-1} * (close_s - close_{s-1}) / close_{s-1} - fee_rate * |w_{k, s-1} - w_{k, s-2}|
+        保证 r_{k, s} 仅依赖 <= s 的已知价格与 <= s-1 的持仓。
+        """
+        close_arr = np.asarray(df_grid["close"].values, dtype=np.float64)
+        n = len(close_arr)
+        realized_price_ret = np.zeros(n, dtype=np.float64)
+        if n > 1:
+            realized_price_ret[1:] = (close_arr[1:] - close_arr[:-1]) / np.maximum(close_arr[:-1], 1e-8)
+
+        unit_rets: dict[str, np.ndarray] = {}
+        for uid, w_raw in unit_weights_on_grid.items():
+            w = np.asarray(w_raw, dtype=np.float64)
+            r_u = np.zeros(n, dtype=np.float64)
+            if n > 1:
+                w_prev = w[:-1]
+                w_prev2 = np.concatenate(([0.0], w[:-2])) if n > 2 else np.zeros_like(w_prev)
+                dw_prev = np.abs(w_prev - w_prev2)
+                r_u[1:] = w_prev * realized_price_ret[1:] - fee_rate * dw_prev
+            unit_rets[uid] = r_u
+        return unit_rets
+
+    def compute_weights(
+        self,
+        cross_asset_prior: dict[str, float],
+        realized_net_returns: dict[str, np.ndarray] | pd.DataFrame | None = None,
+        *,
+        local_quality: dict[str, float] | None = None,
+        is_n_purged: dict[str, int] | int | None = None,
+        unit_forensic_meta: dict[str, dict[str, Any]] | None = None,
+        df_grid: pd.DataFrame | None = None,
+        unit_weights_on_grid: dict[str, np.ndarray] | None = None,
+        fee_rate: float = 0.0002,
+        rolling_perf_override: dict[str, np.ndarray] | None = None,
+    ) -> RollingEBWeightsResult:
+        """
+        执行零前视因果滚动/扩展窗口经验贝叶斯收缩配权：
+            w_{i,k,t}^{EB} = λ_prior * w_{i,k}^{prior} + (1 - λ_prior) * w_{i,k,t-1}^{rolling_perf}
+        """
+        prior_map = self.compute_prior_anchor(
+            cross_asset_prior=cross_asset_prior,
+            local_quality=local_quality,
+            is_n_purged=is_n_purged,
+            unit_forensic_meta=unit_forensic_meta,
+        )
+        uids = list(prior_map.keys())
+
+        if realized_net_returns is None:
+            if df_grid is not None and unit_weights_on_grid is not None:
+                realized_net_returns = self.build_causal_unit_net_returns(
+                    df_grid, unit_weights_on_grid, fee_rate=fee_rate
+                )
+            elif rolling_perf_override is not None:
+                first_arr = next(iter(rolling_perf_override.values()))
+                realized_net_returns = {u: np.zeros(len(first_arr), dtype=np.float64) for u in uids}
+            else:
+                raise ValueError(
+                    "Must provide either realized_net_returns or (df_grid, unit_weights_on_grid) to compute_weights."
+                )
+
+        if isinstance(realized_net_returns, pd.DataFrame):
+            ret_dict = {
+                col: realized_net_returns[col].to_numpy(dtype=np.float64) for col in uids if col in realized_net_returns
+            }
+        else:
+            ret_dict = {
+                u: np.asarray(realized_net_returns[u], dtype=np.float64) for u in uids if u in realized_net_returns
+            }
+
+        if not ret_dict:
+            raise ValueError("No matching unit keys found between cross_asset_prior and realized_net_returns.")
+
+        n = len(next(iter(ret_dict.values())))
+        lam_p = self.prior_anchor_lambda
+        sqrt_ann = np.sqrt(self.annualization_factor)
+        w_lb = self.lookback_bars if (self.lookback_bars is not None and self.lookback_bars > 0) else None
+
+        rolling_ir_map: dict[str, np.ndarray] = {u: np.zeros(n, dtype=np.float64) for u in uids}
+        rolling_perf_map: dict[str, np.ndarray] = {u: np.full(n, prior_map[u], dtype=np.float64) for u in uids}
+        eb_weights_map: dict[str, np.ndarray] = {u: np.full(n, prior_map[u], dtype=np.float64) for u in uids}
+
+        if rolling_perf_override is not None:
+            # 若显式传入滚动表现目标序列 (调试或直接收缩验证)，严格执行 shift(1) 后按 L2 公式线性收缩
+            for u in uids:
+                if u in rolling_perf_override:
+                    raw_perf = np.asarray(rolling_perf_override[u], dtype=np.float64)
+                    shifted_perf = np.empty(n, dtype=np.float64)
+                    shifted_perf[0] = prior_map[u]
+                    if n > 1:
+                        shifted_perf[1:] = np.clip(raw_perf[:-1], self.min_weight, self.max_weight)
+                    rolling_perf_map[u] = shifted_perf
+                    eb_weights_map[u] = lam_p * prior_map[u] + (1.0 - lam_p) * shifted_perf
+            return RollingEBWeightsResult(
+                eb_weights=eb_weights_map,
+                prior_weights=prior_map,
+                rolling_perf_weights=rolling_perf_map,
+                rolling_ir=rolling_ir_map,
+                prior_anchor_lambda=lam_p,
+            )
+
+        prior_sum = sum(prior_map.values())
+        for t in range(self.min_bars, n):
+            # 严格只取 [start_idx, t) 即截至 t-1 的历史已实现净收益 (shift(1) 零前视)
+            start_idx = max(0, t - w_lb) if w_lb is not None else 0
+            raw_perf_t: dict[str, float] = {}
+            for u in uids:
+                r_win = ret_dict[u][start_idx:t]
+                if len(r_win) < self.min_bars:
+                    ir_val = 0.0
+                else:
+                    std_v = float(np.std(r_win, ddof=1))
+                    ir_val = float((np.mean(r_win) / std_v) * sqrt_ann) if std_v > 1e-10 else 0.0
+                rolling_ir_map[u][t] = ir_val
+                tilt = float(np.tanh(ir_val / 2.0))
+                w_perf = float(
+                    np.clip(prior_map[u] * (1.0 + self.perf_tilt_scale * tilt), self.min_weight, self.max_weight)
+                )
+                raw_perf_t[u] = w_perf
+
+            if self.normalize_budget and prior_sum > 1e-9:
+                cur_sum = sum(raw_perf_t.values())
+                if cur_sum > 1e-9:
+                    scale_f = prior_sum / cur_sum
+                    for u in uids:
+                        raw_perf_t[u] = float(np.clip(raw_perf_t[u] * scale_f, self.min_weight, self.max_weight))
+
+            for u in uids:
+                w_perf_u = raw_perf_t[u]
+                rolling_perf_map[u][t] = w_perf_u
+                eb_weights_map[u][t] = lam_p * prior_map[u] + (1.0 - lam_p) * w_perf_u
+
+        return RollingEBWeightsResult(
+            eb_weights=eb_weights_map,
+            prior_weights=prior_map,
+            rolling_perf_weights=rolling_perf_map,
+            rolling_ir=rolling_ir_map,
+            prior_anchor_lambda=lam_p,
+        )
+
+
+def compute_rolling_empirical_bayes_weights(
+    cross_asset_prior: dict[str, float],
+    realized_net_returns: dict[str, np.ndarray] | pd.DataFrame | None = None,
+    *,
+    local_quality: dict[str, float] | None = None,
+    is_n_purged: dict[str, int] | int | None = None,
+    unit_forensic_meta: dict[str, dict[str, Any]] | None = None,
+    df_grid: pd.DataFrame | None = None,
+    unit_weights_on_grid: dict[str, np.ndarray] | None = None,
+    prior_anchor_lambda: float = 0.70,
+    lookback_bars: int | None = 90,
+    min_bars: int = 15,
+    shrink_k: int = 60,
+    annualization_factor: float = 252.0,
+    perf_tilt_scale: float = 0.55,
+    min_weight: float = 0.05,
+    max_weight: float = 1.00,
+    normalize_budget: bool = False,
+    fee_rate: float = 0.0002,
+    rolling_perf_override: dict[str, np.ndarray] | None = None,
+) -> RollingEBWeightsResult:
+    """
+    模块级便捷函数：计算零前视滚动/扩展窗口经验贝叶斯收缩权重序列 w_{i,k,t}^{EB}。
+    """
+    weighter = RollingEmpiricalBayesWeighter(
+        prior_anchor_lambda=prior_anchor_lambda,
+        lookback_bars=lookback_bars,
+        min_bars=min_bars,
+        shrink_k=shrink_k,
+        annualization_factor=annualization_factor,
+        perf_tilt_scale=perf_tilt_scale,
+        min_weight=min_weight,
+        max_weight=max_weight,
+        normalize_budget=normalize_budget,
+    )
+    return weighter.compute_weights(
+        cross_asset_prior=cross_asset_prior,
+        realized_net_returns=realized_net_returns,
+        local_quality=local_quality,
+        is_n_purged=is_n_purged,
+        unit_forensic_meta=unit_forensic_meta,
+        df_grid=df_grid,
+        unit_weights_on_grid=unit_weights_on_grid,
+        fee_rate=fee_rate,
+        rolling_perf_override=rolling_perf_override,
+    )

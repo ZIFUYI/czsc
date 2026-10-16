@@ -86,8 +86,20 @@ class RuleFactorRegistry:
             raise ValueError(f"Unknown archetype: {spec.archetype}. Must be one of {list(ARCHETYPE_RULERS)}")
         self._factors[spec.factor_id] = spec
 
+    @staticmethod
+    def _resolve_factor_id(factor_id: str) -> str:
+        alias_map = {
+            "F01L": "FC02L",
+            "F01S": "FC02S",
+            "F02L": "FC03L",
+            "F02S": "FC03S",
+            "F03L": "FC04L",
+            "F03S": "FC04S",
+        }
+        return alias_map.get(factor_id, factor_id)
+
     def get(self, factor_id: str) -> RuleFactorSpec:
-        return self._factors[factor_id]
+        return self._factors[self._resolve_factor_id(factor_id)]
 
     def all_specs(self) -> dict[str, RuleFactorSpec]:
         return dict(self._factors)
@@ -121,14 +133,20 @@ class RuleFactorRegistry:
         return float(np.clip(p75_atr / ref, 0.75, 1.80))
 
     def evaluate_factor_on_tf(
-        self, df_tf: pd.DataFrame, factor_id: str, tf: str, adaptive_vol_scale: bool = False
+        self,
+        df_tf: pd.DataFrame,
+        factor_id: str,
+        tf: str,
+        adaptive_vol_scale: bool = False,
+        soft_gate: Any = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         在指定品种、指定周期 K 线 DataFrame 上计算规则因子的：
         1. 原始触发脉冲序列 `triggers` ∈ {0, 1}
         2. 状态机闭环持仓权重序列 `weights` ∈ [-1.0, +1.0]
         """
-        spec = self._factors[factor_id]
+        resolved_id = self._resolve_factor_id(factor_id)
+        spec = self._factors[resolved_id]
         base_scale = TF_SCALE_MAP.get(tf, 1.0)
         vol_mult = (
             1.0
@@ -138,15 +156,25 @@ class RuleFactorRegistry:
         scale = base_scale * vol_mult
 
         if spec.mode == "custom_func" and spec.custom_eval_func is not None:
-            return spec.custom_eval_func(df_tf, scale)
+            trig, w = spec.custom_eval_func(df_tf, scale)
+        elif spec.mode == "czsc_position" and spec.czsc_position_builder is not None:
+            trig, w = self._eval_czsc_native_position(df_tf, spec.czsc_position_builder(tf), tf)
+        elif resolved_id in ALL_SIGNAL_SPECS:
+            trig, w = compute_signal_triggers_and_weights(df_tf, resolved_id, scale=scale)
+        else:
+            raise KeyError(f"Factor {factor_id} has no valid evaluation backend.")
 
-        if spec.mode == "czsc_position" and spec.czsc_position_builder is not None:
-            return self._eval_czsc_native_position(df_tf, spec.czsc_position_builder(tf), tf)
+        if soft_gate is not None and soft_gate is not False:
+            from examples.multi_factor_cta.atomic_factors import SoftCrossSectionalGate
 
-        if factor_id in ALL_SIGNAL_SPECS:
-            return compute_signal_triggers_and_weights(df_tf, factor_id, scale=scale)
-
-        raise KeyError(f"Factor {factor_id} has no valid evaluation backend.")
+            gate_obj = soft_gate if isinstance(soft_gate, SoftCrossSectionalGate) else SoftCrossSectionalGate()
+            cs_rank = gate_obj.extract_cs_rank(df_tf)
+            if cs_rank is not None:
+                er = gate_obj.extract_causal_er(df_tf)
+                trig, w = gate_obj.apply_to_triggers_and_weights(
+                    trig, w, cs_rank, er, archetype=spec.archetype, direction=spec.direction or 1
+                )
+        return trig, w
 
     @staticmethod
     def _eval_czsc_native_position(df_tf: pd.DataFrame, pos: Position, tf: str) -> tuple[np.ndarray, np.ndarray]:
