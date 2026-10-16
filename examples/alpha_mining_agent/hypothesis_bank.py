@@ -148,7 +148,7 @@ ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
         min_alpha_bp=8.0,
         min_safety_pct=3.5,
         max_boot_pval=0.22,
-        quota_max_units=6,
+        quota_max_units=8,
         min_excursion_ratio=1.00,
         min_net_sharpe=0.0,
         pool_tier=1,
@@ -583,6 +583,9 @@ _ATOMIC_SPEC_ROWS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     ("EC01", "挤压后波动率扩张点火", ARCH_E, _TFS_ALL),
     ("EC02", "NR7窄幅突破", ARCH_E, _TFS_ALL),
     ("FC01", "大级别结构锚定小级别分型扳机", ARCH_F, _TFS_RESONANCE),
+    ("FC02", "F01_板块龙头共振补涨补跌", ARCH_F, _TFS_ALL),
+    ("FC03", "F02_截面比价超跌超涨背驰反包", ARCH_F, _TFS_ALL),
+    ("FC04", "F03_截面TopK斜率时序突破双共振", ARCH_F, _TFS_ALL),
 )
 ATOMIC_EXIT_MODE = "continuous"
 CANDIDATE_HYPOTHESIS_POOL += [

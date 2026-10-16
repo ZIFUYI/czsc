@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -24,7 +25,12 @@ from examples.alpha_mining_agent.hypothesis_bank import (
     attach_native_czsc_signals,
     enrich_kline_features,
 )
-from examples.multi_factor_cta.atomic_factors import link_higher_timeframes
+from examples.multi_factor_cta.atomic_factors import (
+    CS_FEATURE_COLS,
+    DataFrameCrossSectionProvider,
+    link_higher_timeframes,
+    set_factor_context,
+)
 
 
 class AssetClass(str, Enum):
@@ -307,3 +313,337 @@ class CrossAssetDataEngine:
             for col in ("open", "high", "low", "close"):
                 df[col] = df[col].astype(np.float64) / norm_factor
         return df
+
+    @staticmethod
+    def compute_causal_cross_sectional_features(
+        asset_tf_dfs: Mapping[str, pd.DataFrame | Mapping[str, pd.DataFrame]],
+        specs: Mapping[str, AssetSpec | str] | Sequence[AssetSpec] | None = None,
+        tf: str = "60m",
+        *,
+        slope_window: int = 20,
+        spread_window: int = 20,
+        lag_window: int = 5,
+        attach_to_dfs: bool = True,
+    ) -> dict[str, pd.DataFrame]:
+        """
+        零前视因果截面特征引擎 (Causal Cross-Sectional Feature Engine)：
+        对齐全市场活跃品种在指定周期 `tf` 的已收盘时间戳面板 (严格 `merge_asof(..., direction="backward")`)，
+        预计算并挂载：
+        1. `cs_slope_rank` (R_{i,t} ∈ [0, 1]) 与中心化强度 `cs_strength` (X_{i,t} = 2 R_{i,t} - 1 ∈ [-1, 1])；
+        2. `sector_leader_dir` (∈ [-1, 1]) 与相对龙头短期滞涨/滞跌差 `leader_lag_gap`；
+        3. `sector_spread_zscore` (本品种相对于所属板块等权均值的滚动超额残差 Z-score)。
+        """
+        return CrossSectionalFeatureEngine(
+            slope_window=slope_window,
+            spread_window=spread_window,
+            lag_window=lag_window,
+        ).compute_and_attach(
+            asset_tf_dfs=asset_tf_dfs,
+            specs=specs,
+            tf=tf,
+            attach_to_dfs=attach_to_dfs,
+        )
+
+
+class CrossSectionalFeatureEngine:
+    """
+    跨品种零前视因果截面特征计算器：
+    - 严禁任何跨期未来信息泄露及停牌/夜盘未收盘前视 (全部通过 backward merge_asof 仅读取 <= t 已收盘价格)；
+    - 所有底层动量与残差均以单品种因果 ATR 无量纲标准化，严格满足全市场价格镜像翻转 P'_{i,t} = M_i - P_{i,t}
+      下 `cs_slope_rank -> 1 - R_{i,t}`、`sector_leader_dir -> -sector_leader_dir`、
+      `leader_lag_gap -> -leader_lag_gap`、`sector_spread_zscore -> -sector_spread_zscore` 100% 镜像对称。
+    """
+
+    def __init__(
+        self,
+        slope_window: int = 20,
+        spread_window: int = 20,
+        lag_window: int = 5,
+    ) -> None:
+        self.slope_window = int(max(2, slope_window))
+        self.spread_window = int(max(3, spread_window))
+        self.lag_window = int(max(1, lag_window))
+
+    @staticmethod
+    def _resolve_sector_map(
+        symbols: list[str],
+        specs: Mapping[str, AssetSpec | str] | Sequence[AssetSpec] | None,
+        raw_dfs: Mapping[str, pd.DataFrame],
+    ) -> dict[str, str]:
+        sector_map: dict[str, str] = {}
+        if isinstance(specs, Mapping):
+            for k, v in specs.items():
+                sector_map[str(k)] = v.sector if isinstance(v, AssetSpec) else str(v)
+        elif isinstance(specs, Sequence):
+            for item in specs:
+                if isinstance(item, AssetSpec):
+                    sector_map[item.symbol] = item.sector
+        for sym in symbols:
+            if sym not in sector_map:
+                df_s = raw_dfs[sym]
+                if "sector" in df_s.columns and len(df_s) > 0:
+                    sector_map[sym] = str(df_s["sector"].iloc[0])
+                elif "sector" in df_s.attrs:
+                    sector_map[sym] = str(df_s.attrs["sector"])
+                else:
+                    sector_map[sym] = "DEFAULT_SECTOR"
+        return sector_map
+
+    @staticmethod
+    def _causal_atr(df: pd.DataFrame, period: int = 14) -> np.ndarray:
+        c = df["close"].to_numpy(dtype=np.float64)
+        h = df["high"].to_numpy(dtype=np.float64)
+        low_arr = df["low"].to_numpy(dtype=np.float64)
+        n = len(c)
+        if n == 0:
+            return np.zeros(0, dtype=np.float64)
+        tr = np.empty(n, dtype=np.float64)
+        tr[0] = max(h[0] - low_arr[0], 1e-9)
+        if n > 1:
+            prev_c = c[:-1]
+            tr[1:] = np.maximum(
+                h[1:] - low_arr[1:],
+                np.maximum(np.abs(h[1:] - prev_c), np.abs(low_arr[1:] - prev_c)),
+            )
+        atr = pd.Series(tr).rolling(period, min_periods=1).mean().to_numpy(dtype=np.float64)
+        return np.maximum(atr, 1e-9)
+
+    def _compute_single_asset_primitives(self, df: pd.DataFrame) -> pd.DataFrame:
+        n = len(df)
+        if n == 0:
+            return pd.DataFrame(columns=["dt", "norm_slope", "short_slope", "cum_norm_price"])
+        c = df["close"].to_numpy(dtype=np.float64)
+        atr = self._causal_atr(df, period=14)
+        idx = np.arange(n, dtype=int)
+
+        # 1. 因果波动率标准化斜率 NormSlope_{i,t} = (P_{i,t} - P_{i,t-w}) / (w * ATR_{i,t})
+        w_idx = np.maximum(0, idx - self.slope_window)
+        w_span = np.maximum(1, idx - w_idx).astype(np.float64)
+        norm_slope = np.zeros(n, dtype=np.float64)
+        if n > 1:
+            norm_slope[1:] = (c[1:] - c[w_idx[1:]]) / (w_span[1:] * atr[1:])
+
+        # 2. 因果短期标准化斜率 ShortSlope_{i,t} ∈ [-1, 1]
+        l_idx = np.maximum(0, idx - self.lag_window)
+        l_span = np.maximum(1, idx - l_idx).astype(np.float64)
+        short_raw = np.zeros(n, dtype=np.float64)
+        if n > 1:
+            short_raw[1:] = (c[1:] - c[l_idx[1:]]) / (l_span[1:] * atr[1:])
+        short_slope = np.tanh(2.0 * short_raw)
+
+        # 3. 因果 1-bar ATR 归一化累积价格路径 (用于计算零前视板块残差)
+        step_norm = np.zeros(n, dtype=np.float64)
+        if n > 1:
+            step_norm[1:] = (c[1:] - c[:-1]) / atr[1:]
+        cum_norm_price = np.cumsum(step_norm)
+
+        out = pd.DataFrame(
+            {
+                "dt": pd.to_datetime(df["dt"]).to_numpy(),
+                "norm_slope": norm_slope,
+                "short_slope": short_slope,
+                "cum_norm_price": cum_norm_price,
+            }
+        )
+        return out.sort_values("dt").drop_duplicates(subset=["dt"], keep="last").reset_index(drop=True)
+
+    def compute_and_attach(
+        self,
+        asset_tf_dfs: Mapping[str, pd.DataFrame | Mapping[str, pd.DataFrame]],
+        specs: Mapping[str, AssetSpec | str] | Sequence[AssetSpec] | None = None,
+        tf: str = "60m",
+        *,
+        attach_to_dfs: bool = True,
+    ) -> dict[str, pd.DataFrame]:
+        # 提取各品种在目标周期 tf 上的 DataFrame
+        target_dfs: dict[str, pd.DataFrame] = {}
+        is_nested = False
+        for sym, val in asset_tf_dfs.items():
+            if isinstance(val, pd.DataFrame):
+                target_dfs[sym] = val
+            elif isinstance(val, Mapping):
+                is_nested = True
+                if tf in val and isinstance(val[tf], pd.DataFrame):
+                    target_dfs[sym] = val[tf]
+                elif len(val) > 0:
+                    first_df = next(iter(val.values()))
+                    if isinstance(first_df, pd.DataFrame):
+                        target_dfs[sym] = first_df
+
+        symbols = list(target_dfs.keys())
+        if not symbols:
+            return {}
+
+        sector_map = self._resolve_sector_map(symbols, specs, target_dfs)
+        primitives: dict[str, pd.DataFrame] = {
+            sym: self._compute_single_asset_primitives(target_dfs[sym]) for sym in symbols
+        }
+
+        all_dts = [p["dt"].to_numpy() for p in primitives.values() if not p.empty]
+        if not all_dts:
+            return {sym: target_dfs[sym].copy() for sym in symbols}
+
+        grid_dt = np.unique(np.concatenate(all_dts))
+        grid_dt.sort()
+        t_len = len(grid_dt)
+        m_syms = len(symbols)
+        grid_frame = pd.DataFrame({"dt": grid_dt})
+
+        ns_mat = np.full((t_len, m_syms), np.nan, dtype=np.float64)
+        ss_mat = np.full((t_len, m_syms), np.nan, dtype=np.float64)
+        pn_mat = np.full((t_len, m_syms), np.nan, dtype=np.float64)
+
+        for j, sym in enumerate(symbols):
+            p_df = primitives[sym]
+            if p_df.empty:
+                continue
+            if len(p_df) == t_len and np.array_equal(p_df["dt"].to_numpy(), grid_dt):
+                ns_mat[:, j] = p_df["norm_slope"].to_numpy(dtype=np.float64)
+                ss_mat[:, j] = p_df["short_slope"].to_numpy(dtype=np.float64)
+                pn_mat[:, j] = p_df["cum_norm_price"].to_numpy(dtype=np.float64)
+            else:
+                merged = pd.merge_asof(grid_frame, p_df, on="dt", direction="backward")
+                ns_mat[:, j] = merged["norm_slope"].to_numpy(dtype=np.float64)
+                ss_mat[:, j] = merged["short_slope"].to_numpy(dtype=np.float64)
+                pn_mat[:, j] = merged["cum_norm_price"].to_numpy(dtype=np.float64)
+
+        # 1. 全市场横截面百分位排名 cs_slope_rank ∈ [0, 1] 与中心化强度 cs_strength ∈ [-1, 1]
+        rk_mat = pd.DataFrame(ns_mat).rank(axis=1, method="average", na_option="keep").to_numpy(dtype=np.float64)
+        valid_cnt = np.sum(np.isfinite(ns_mat), axis=1, keepdims=True)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cs_rank_mat = np.where(valid_cnt > 1, (rk_mat - 1.0) / np.maximum(valid_cnt - 1.0, 1.0), 0.5)
+        cs_rank_mat = np.clip(np.nan_to_num(cs_rank_mat, nan=0.5), 0.0, 1.0)
+        cs_strength_mat = np.clip(2.0 * cs_rank_mat - 1.0, -1.0, 1.0)
+
+        # 2. 按板块分组计算龙头趋势方向 sector_leader_dir ∈ [-1, 1]、滞涨差 leader_lag_gap 与板块等权均值路径
+        sector_to_indices: dict[str, list[int]] = {}
+        for j, sym in enumerate(symbols):
+            sector_to_indices.setdefault(sector_map[sym], []).append(j)
+
+        leader_dir_mat = np.zeros((t_len, m_syms), dtype=np.float64)
+        lag_gap_mat = np.zeros((t_len, m_syms), dtype=np.float64)
+        sector_mean_pn_mat = np.zeros((t_len, m_syms), dtype=np.float64)
+
+        for _sec, col_idxs in sector_to_indices.items():
+            sec_pn = pn_mat[:, col_idxs]
+            with np.errstate(invalid="ignore"):
+                sec_mean_pn = np.nanmean(sec_pn, axis=1)
+            sec_mean_pn = np.nan_to_num(sec_mean_pn, nan=0.0)
+
+            for j in col_idxs:
+                sector_mean_pn_mat[:, j] = sec_mean_pn
+                peer_idxs = [k for k in col_idxs if k != j] if len(col_idxs) > 1 else [j]
+                peer_ns = ns_mat[:, peer_idxs]
+                peer_ss = ss_mat[:, peer_idxs]
+                abs_ns = np.abs(peer_ns)
+                valid_peer = np.isfinite(abs_ns)
+                any_valid = np.any(valid_peer, axis=1)
+
+                safe_abs = np.where(valid_peer, abs_ns, -1.0)
+                max_abs = np.max(safe_abs, axis=1, keepdims=True)
+                is_top = valid_peer & (abs_ns >= max_abs - 1e-12)
+                top_cnt = np.maximum(np.sum(is_top, axis=1), 1).astype(np.float64)
+
+                leader_ns = np.sum(np.where(is_top, peer_ns, 0.0), axis=1) / top_cnt
+                leader_ss = np.sum(np.where(is_top, peer_ss, 0.0), axis=1) / top_cnt
+
+                leader_dir_j = np.where(any_valid, np.tanh(2.5 * leader_ns), 0.0)
+                self_ss = np.nan_to_num(ss_mat[:, j], nan=0.0)
+                lag_gap_j = np.where(any_valid, leader_ss - self_ss, 0.0)
+
+                leader_dir_mat[:, j] = np.clip(leader_dir_j, -1.0, 1.0)
+                lag_gap_mat[:, j] = np.clip(lag_gap_j, -2.0, 2.0)
+
+        # 3. 映射回各品种自身 K 线时间戳并计算因果滚动残差 Z-score (sector_spread_zscore)
+        result_dfs: dict[str, pd.DataFrame] = {}
+        for j, sym in enumerate(symbols):
+            base_df = target_dfs[sym]
+            p_df = primitives[sym]
+            panel_j = pd.DataFrame(
+                {
+                    "dt": grid_dt,
+                    "cs_slope_rank": cs_rank_mat[:, j],
+                    "cs_strength": cs_strength_mat[:, j],
+                    "sector_leader_dir": leader_dir_mat[:, j],
+                    "leader_lag_gap": lag_gap_mat[:, j],
+                    "_sec_mean_pn": sector_mean_pn_mat[:, j],
+                }
+            )
+            if len(p_df) == t_len and np.array_equal(p_df["dt"].to_numpy(), grid_dt):
+                aligned_j = panel_j.copy()
+                aligned_j["cum_norm_price"] = p_df["cum_norm_price"].to_numpy(dtype=np.float64)
+            else:
+                aligned_j = pd.merge_asof(p_df, panel_j, on="dt", direction="backward")
+
+            excess_spread = aligned_j["cum_norm_price"].to_numpy(dtype=np.float64) - aligned_j["_sec_mean_pn"].to_numpy(
+                dtype=np.float64
+            )
+            s_exc = pd.Series(excess_spread)
+            roll_mean = s_exc.rolling(self.spread_window, min_periods=3).mean().to_numpy(dtype=np.float64)
+            roll_std = s_exc.rolling(self.spread_window, min_periods=3).std(ddof=0).to_numpy(dtype=np.float64)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                z_raw = np.where(roll_std > 1e-8, (excess_spread - roll_mean) / roll_std, 0.0)
+            spread_z = np.clip(np.nan_to_num(z_raw, nan=0.0), -5.0, 5.0)
+
+            cs_only_df = pd.DataFrame(
+                {
+                    "dt": aligned_j["dt"].to_numpy(),
+                    "cs_slope_rank": np.clip(
+                        np.nan_to_num(aligned_j["cs_slope_rank"].to_numpy(dtype=np.float64), nan=0.5), 0.0, 1.0
+                    ),
+                    "cs_strength": np.clip(
+                        np.nan_to_num(aligned_j["cs_strength"].to_numpy(dtype=np.float64), nan=0.0), -1.0, 1.0
+                    ),
+                    "sector_leader_dir": np.clip(
+                        np.nan_to_num(aligned_j["sector_leader_dir"].to_numpy(dtype=np.float64), nan=0.0), -1.0, 1.0
+                    ),
+                    "leader_lag_gap": np.clip(
+                        np.nan_to_num(aligned_j["leader_lag_gap"].to_numpy(dtype=np.float64), nan=0.0), -2.0, 2.0
+                    ),
+                    "sector_spread_zscore": spread_z,
+                }
+            )
+            provider = DataFrameCrossSectionProvider(cs_only_df, default_tf=tf)
+
+            if attach_to_dfs:
+                if is_nested and isinstance(asset_tf_dfs[sym], Mapping):
+                    for _sub_tf, sub_df in asset_tf_dfs[sym].items():  # type: ignore[union-attr]
+                        self._attach_cs_to_single_df(sub_df, provider)
+                else:
+                    self._attach_cs_to_single_df(base_df, provider)
+
+            out_df = base_df.copy()
+            self._attach_cs_to_single_df(out_df, provider)
+            result_dfs[sym] = out_df
+
+        return result_dfs
+
+    @staticmethod
+    def _attach_cs_to_single_df(df: pd.DataFrame, provider: DataFrameCrossSectionProvider) -> pd.DataFrame:
+        feats = provider.features(df)
+        for col in CS_FEATURE_COLS:
+            df[col] = feats[col]
+        set_factor_context(df, cross_section=provider)
+        return df
+
+
+def compute_causal_cross_sectional_features(
+    asset_tf_dfs: Mapping[str, pd.DataFrame | Mapping[str, pd.DataFrame]],
+    specs: Mapping[str, AssetSpec | str] | Sequence[AssetSpec] | None = None,
+    tf: str = "60m",
+    *,
+    slope_window: int = 20,
+    spread_window: int = 20,
+    lag_window: int = 5,
+    attach_to_dfs: bool = True,
+) -> dict[str, pd.DataFrame]:
+    """模块级便捷函数：计算并挂载跨品种零前视因果截面特征。"""
+    return CrossAssetDataEngine.compute_causal_cross_sectional_features(
+        asset_tf_dfs=asset_tf_dfs,
+        specs=specs,
+        tf=tf,
+        slope_window=slope_window,
+        spread_window=spread_window,
+        lag_window=lag_window,
+        attach_to_dfs=attach_to_dfs,
+    )
