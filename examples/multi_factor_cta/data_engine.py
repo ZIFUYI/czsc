@@ -194,15 +194,32 @@ class CrossAssetDataEngine:
         result: dict[str, pd.DataFrame] = {}
         for tf in spec.eligible_tfs:
             if tf == "1d":
-                kdf = df_base.groupby("date", as_index=False, sort=False).agg(
-                    dt=("dt", "last"),
-                    open=("open", "first"),
-                    high=("high", "max"),
-                    low=("low", "min"),
-                    close=("close", "last"),
-                    volume=("volume", "sum"),
-                )
-                kdf["grp"] = 0
+                bars_per_day = max(1, tf_mins["1d"] // base_mins)
+                tmp = df_base.copy()
+                if len(tmp) > 0 and spec.base_tf != "1d":
+                    last_date = tmp["date"].iloc[-1]
+                    last_dt = pd.to_datetime(tmp["dt"].iloc[-1])
+                    last_day_cnt = int((tmp["date"] == last_date).sum())
+                    prev_days = tmp[tmp["date"] != last_date]
+                    expected_day_bars = (
+                        int(prev_days.groupby("date")["close"].count().median()) if len(prev_days) > 0 else bars_per_day
+                    )
+                    if (last_day_cnt < expected_day_bars and (last_dt.hour * 60 + last_dt.minute) < 15 * 60) or (
+                        last_day_cnt < bars_per_day and expected_day_bars >= bars_per_day
+                    ):
+                        tmp = prev_days
+                if len(tmp) > 0:
+                    kdf = tmp.groupby("date", as_index=False, sort=False).agg(
+                        dt=("dt", "last"),
+                        open=("open", "first"),
+                        high=("high", "max"),
+                        low=("low", "min"),
+                        close=("close", "last"),
+                        volume=("volume", "sum"),
+                    )
+                    kdf["grp"] = 0
+                else:
+                    kdf = pd.DataFrame(columns=["date", "dt", "open", "high", "low", "close", "volume", "grp"])
             elif tf == spec.base_tf:
                 kdf = df_base[["date", "dt", "open", "high", "low", "close", "volume"]].copy()
                 kdf["grp"] = df_base["bar_in_day"]
@@ -210,24 +227,31 @@ class CrossAssetDataEngine:
                 bars_per_grp = max(1, tf_mins[tf] // base_mins)
                 tmp = df_base.copy()
                 tmp["grp"] = tmp["bar_in_day"] // bars_per_grp
-                kdf = tmp.groupby(["date", "grp"], as_index=False, sort=False).agg(
-                    dt=("dt", "last"),
-                    open=("open", "first"),
-                    high=("high", "max"),
-                    low=("low", "min"),
-                    close=("close", "last"),
-                    volume=("volume", "sum"),
-                )
+                grp_cnt = tmp.groupby(["date", "grp"], sort=False)["close"].transform("count")
+                tmp = tmp[grp_cnt >= bars_per_grp]
+                if len(tmp) > 0:
+                    kdf = tmp.groupby(["date", "grp"], as_index=False, sort=False).agg(
+                        dt=("dt", "last"),
+                        open=("open", "first"),
+                        high=("high", "max"),
+                        low=("low", "min"),
+                        close=("close", "last"),
+                        volume=("volume", "sum"),
+                    )
+                else:
+                    kdf = pd.DataFrame(columns=["date", "grp", "dt", "open", "high", "low", "close", "volume"])
 
             kdf = kdf.sort_values("dt").reset_index(drop=True)
             kdf["symbol"] = spec.symbol
             scale = TF_SCALE_MAP.get(tf, 1)
             kdf = enrich_kline_features(kdf, scale=scale)
-            if attach_czsc:
+            if attach_czsc and not kdf.empty:
                 kdf = attach_native_czsc_signals(kdf, tf, sym_cache_dir)
             result[tf] = kdf
 
         return link_higher_timeframes(result)
+
+    load_and_align_asset = load_asset_multi_timeframes
 
     @staticmethod
     def _read_raw_dataframe(spec: AssetSpec) -> pd.DataFrame:

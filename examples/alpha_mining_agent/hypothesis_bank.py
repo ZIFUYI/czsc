@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# ruff: noqa: SIM102, E741, F841
 """
 6×5 生态位矩阵候选信号生成器与分簇定制状态机引擎
 (MAP-Elites Niche Hypothesis Bank & Archetype-Specific State Machine Engine)
@@ -45,7 +46,7 @@ LEGACY_INTRADAY_ARCHETYPE = "D_日内微结构簇"
 
 @dataclass(frozen=True)
 class ArchetypeRuler:
-    """分方向定制的法医三重屏障检验标尺"""
+    """分方向定制的法医三重屏障检验标尺与分层池化协议"""
 
     archetype: str
     ruler_name: str
@@ -56,6 +57,10 @@ class ArchetypeRuler:
     min_safety_pct: float
     max_boot_pval: float
     quota_max_units: int  # 该战略方向最多允许新入库多少个原子单元 (防单一方向扎堆)
+    min_excursion_ratio: float = 0.90  # 最小 MFE/MAE 路径偏离比门槛 (淘汰扛深亏换微利信号)
+    min_net_sharpe: float = 0.0  # 单因子扣费后最小样本内 Net Sharpe
+    pool_tier: int = 1  # 多标的分层池化检验层级 (1=跨资产普适, 2=同质资产类别, 3=交易制度微结构)
+    stop_plugin: str = "pos_atr_stop"  # 绑定的动态结构止损算子标识
 
 
 ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
@@ -69,6 +74,10 @@ ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
         min_safety_pct=4.5,
         max_boot_pval=0.20,
         quota_max_units=10,  # 基石 5 个 + 接管原 D 簇 ORB/DualThrust/RBreaker 顺势突破信号
+        min_excursion_ratio=1.15,
+        min_net_sharpe=0.0,
+        pool_tier=1,
+        stop_plugin="pos_fx_stop",
     ),
     ARCH_B: ArchetypeRuler(
         archetype=ARCH_B,
@@ -80,6 +89,10 @@ ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
         min_safety_pct=3.5,
         max_boot_pval=0.22,
         quota_max_units=12,  # 接管原 D 簇洗盘 V 反与 TD 序列衰竭反转
+        min_excursion_ratio=0.90,
+        min_net_sharpe=0.0,
+        pool_tier=2,
+        stop_plugin="pos_structure_ext",
     ),
     ARCH_C: ArchetypeRuler(
         archetype=ARCH_C,
@@ -91,28 +104,40 @@ ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
         min_safety_pct=3.0,
         max_boot_pval=0.24,
         quota_max_units=9,  # 接管原 D 簇日内 VWAP 锚定回归
+        min_excursion_ratio=0.90,
+        min_net_sharpe=0.0,
+        pool_tier=2,
+        stop_plugin="pos_zs_mid",
     ),
     ARCH_D: ArchetypeRuler(
         archetype=ARCH_D,
-        ruler_name="量价标尺 (+1.6*ATR止盈 / -1.0*ATR止损 / 10根资金流延续)",
-        tp_atr=1.60,
-        sl_atr=1.00,
-        max_bars=10,
+        ruler_name="量价标尺 (+1.3*ATR止盈 / -0.85*ATR止损 / 8根资金流冲击)",
+        tp_atr=1.30,
+        sl_atr=0.85,
+        max_bars=8,
         min_alpha_bp=8.0,
         min_safety_pct=3.5,
         max_boot_pval=0.22,
         quota_max_units=8,
+        min_excursion_ratio=0.90,
+        min_net_sharpe=0.0,
+        pool_tier=3,
+        stop_plugin="pos_flow_stop",
     ),
     ARCH_E: ArchetypeRuler(
         archetype=ARCH_E,
-        ruler_name="波动率扩张标尺 (+2.0*ATR止盈 / -1.0*ATR止损 / 12根压缩点火)",
+        ruler_name="波动率扩张标尺 (+2.0*ATR止盈 / -0.7*ATR箱体极值止损 / 12根压缩点火)",
         tp_atr=2.00,
-        sl_atr=1.00,
+        sl_atr=0.70,
         max_bars=12,
         min_alpha_bp=10.0,
         min_safety_pct=4.0,
         max_boot_pval=0.22,
         quota_max_units=8,
+        min_excursion_ratio=1.15,
+        min_net_sharpe=0.0,
+        pool_tier=1,
+        stop_plugin="pos_box_stop",
     ),
     ARCH_F: ArchetypeRuler(
         archetype=ARCH_F,
@@ -124,6 +149,10 @@ ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
         min_safety_pct=3.5,
         max_boot_pval=0.22,
         quota_max_units=6,
+        min_excursion_ratio=1.00,
+        min_net_sharpe=0.0,
+        pool_tier=1,
+        stop_plugin="pos_htf_ma_stop",
     ),
 }
 
@@ -641,8 +670,37 @@ def rust_sma(s: pd.Series, n: int) -> pd.Series:
     return pd.Series(czsc.sma(s.to_numpy(dtype=np.float64), n), index=s.index, dtype=np.float64)
 
 
+def _infer_causal_bars_in_day(df: pd.DataFrame, scale: float = 1.0) -> int:
+    """
+    严格因果地推断当前周期的单日标准 K 线根数（不依赖当日未来未收盘的 Bar 计数）：
+    优先根据开篇已知的相邻 Bar 时间间隔（5m->48, 15m->16, 30m->8, 60m->4, 1d->1）判定，
+    若无时间戳则按周期缩放系数 `scale` 映射。
+    """
+    if "dt" in df.columns and len(df) >= 2:
+        head_dts = pd.to_datetime(df["dt"].iloc[: min(len(df), 8)])
+        diffs = head_dts.diff().dropna().dt.total_seconds() / 60.0
+        pos_diffs = diffs[diffs > 0]
+        if len(pos_diffs) > 0:
+            min_step = float(pos_diffs.min())
+            if min_step <= 5.5:
+                return 48
+            if min_step <= 16.0:
+                return 16
+            if min_step <= 32.0:
+                return 8
+            if min_step <= 125.0:
+                return 4
+            return 1
+    for sc, cnt in ((0.15, 48), (0.25, 16), (0.35, 8), (0.50, 4), (1.00, 1)):
+        if abs(scale - sc) < 0.04:
+            return cnt
+    return 8
+
+
 def enrich_kline_features(df: pd.DataFrame, scale: float = 1.0) -> pd.DataFrame:
     df = df.copy()
+    if df.empty:
+        return df
     df["pct_chg"] = df["close"].pct_change().fillna(0.0)
     df["ma5"] = rust_sma(df["close"], 5)
     df["ma10"] = rust_sma(df["close"], 10)
@@ -705,20 +763,28 @@ def enrich_kline_features(df: pd.DataFrame, scale: float = 1.0) -> pd.DataFrame:
     df["high10"] = df["high"].shift(1).rolling(10).max()
     df["low10"] = df["low"].shift(1).rolling(10).min()
 
-    # 日内分时特征 (ORB / 上午高低点 / 日内 VWAP)
+    # 日内分时特征 (ORB / 因果早盘累积极值 / 日内 VWAP) —— 严格零前视
+    expected_bars = _infer_causal_bars_in_day(df, scale=scale)
     df["bar_idx_in_day"] = df.groupby("date").cumcount()
-    df["bars_in_day"] = df.groupby("date")["close"].transform("count")
+    df["bars_in_day"] = expected_bars
 
     df["orb_high"] = df.groupby("date")["high"].transform("first")
     df["orb_low"] = df.groupby("date")["low"].transform("first")
 
-    # 上午盘高低点 (前一半日内K线的高低极值)
-    half_bars = np.maximum(1, df["bars_in_day"] // 2)
-    is_morning = df["bar_idx_in_day"] < half_bars
-    am_h = df["high"].where(is_morning).groupby(df["date"]).transform("max")
-    am_l = df["low"].where(is_morning).groupby(df["date"]).transform("min")
-    df["am_high"] = am_h
-    df["am_low"] = am_l
+    # 上午盘高低点 (严格因果：早盘窗口内采用 cummax/cummin，午盘冻结早盘极值，彻底消除 transform('max'/'count') 日内前视)
+    half_bars = max(1, expected_bars // 2)
+    if "dt" in df.columns and expected_bars > 1:
+        dt_times = pd.to_datetime(df["dt"]).dt.time
+        is_morning = (df["bar_idx_in_day"] < half_bars) & (dt_times <= time(11, 30))
+        if not bool(is_morning.any()):
+            is_morning = df["bar_idx_in_day"] < half_bars
+    else:
+        is_morning = df["bar_idx_in_day"] < half_bars
+
+    am_h_cum = df.groupby("date")["high"].cummax()
+    am_l_cum = df.groupby("date")["low"].cummin()
+    df["am_high"] = am_h_cum.where(is_morning).groupby(df["date"]).ffill().fillna(df["high"])
+    df["am_low"] = am_l_cum.where(is_morning).groupby(df["date"]).ffill().fillna(df["low"])
 
     typ_price = (df["high"] + df["low"] + df["close"]) / 3.0
     tp_vol = typ_price * df["volume"]
@@ -810,12 +876,19 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extende
     import json
     from pathlib import Path
 
+    if df.empty:
+        return df.copy()
     suffix = ""
     if extended:
         fingerprint = hashlib.md5(json.dumps(_EXTENDED_NATIVE_SIGNALS, sort_keys=True).encode("utf-8")).hexdigest()[:8]
         suffix = f"_x{fingerprint}"
     cache_path = Path(workspace_dir) / f"native_czsc_signals_{tf}{suffix}.pkl"
-    if not cache_path.exists():
+    sig_df = None
+    if cache_path.exists():
+        cached = pd.read_pickle(cache_path)
+        if len(cached) == len(df):
+            sig_df = cached
+    if sig_df is None:
         import czsc
 
         tf_to_freq = {
@@ -912,10 +985,9 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extende
         df_sig["dt"] = pd.to_datetime(df_sig["dt"]).dt.tz_localize(None)
         merged = pd.merge(df[["dt"]], df_sig[["dt"] + sig_cols], on="dt", how="left").fillna("其他")
         sig_df = merged[sig_cols]
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        sig_df.to_pickle(cache_path)
-    else:
-        sig_df = pd.read_pickle(cache_path)
+        if not cache_path.exists():
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            sig_df.to_pickle(cache_path)
 
     df = pd.concat([df.reset_index(drop=True), sig_df.reset_index(drop=True)], axis=1)
 
@@ -1093,9 +1165,9 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extende
         l = df["low"].values
         ma20 = df["ma20"].values
         ma60 = df["ma60"].values
-        ma240 = df["close"].rolling(240).mean().bfill().values
-        h48 = df["high"].shift(2).rolling(48).max().bfill().values
-        l48 = df["low"].shift(2).rolling(48).min().bfill().values
+        ma240 = df["close"].rolling(240, min_periods=1).mean().values
+        h48 = df["high"].shift(2).rolling(48, min_periods=1).max().bfill().values
+        l48 = df["low"].shift(2).rolling(48, min_periods=1).min().bfill().values
         vol = df["volume"].values
         vma20 = df["vol_ma20"].values
         vwap = df["intraday_vwap"].values
@@ -1103,8 +1175,18 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extende
         h10 = df["high10"].values
         l10 = df["low10"].values
         is_first_30m = df["bar_idx_in_day"] < 6
-        orb30_h = df["high"].where(is_first_30m).groupby(df["date"]).transform("max").values
-        orb30_l = df["low"].where(is_first_30m).groupby(df["date"]).transform("min").values
+        orb30_h = (
+            df.groupby("date")["high"]
+            .cummax()
+            .where(is_first_30m)
+            .groupby(df["date"])
+            .ffill()
+            .fillna(df["high"])
+            .values
+        )
+        orb30_l = (
+            df.groupby("date")["low"].cummin().where(is_first_30m).groupby(df["date"]).ffill().fillna(df["low"]).values
+        )
 
         m501l = np.asarray(
             (df["box_amp"] > 0.012)
