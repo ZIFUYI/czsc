@@ -22,6 +22,12 @@ from examples.multi_factor_cta.synthesis_engine import (
     evaluate_single_asset_backtest,
 )
 from examples.alpha_mining_agent.forensic_pipeline import IS_END_DT
+from examples.alpha_mining_agent.hypothesis_bank import (
+    ARCH_A,
+    ARCH_C,
+    LEGACY_ARCHETYPE_ALIAS,
+    LEGACY_ARCHETYPE_BY_SIG,
+)
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 WORKSPACE_DIR = ROOT_DIR / "examples" / "results" / "alpha_agent_workspace"
@@ -30,18 +36,37 @@ ARTIFACT_DIR = Path(r"C:\Users\zifuy\.gemini\antigravity\brain\011f8ba6-910e-487
 # 24 大在零样本迁移下产生正超额的优质商品主力
 TOP_24_POSITIVE = {
     # 贵金属 (2)
-    "ag", "au",
+    "ag",
+    "au",
     # 有色与特钢材料 (7)
-    "cu", "al", "sn", "ao", "si",
+    "cu",
+    "al",
+    "sn",
+    "ao",
+    "si",
     # 黑色建材 (4)
-    "rb", "hc", "i", "jm", "fg",
+    "rb",
+    "hc",
+    "i",
+    "jm",
+    "fg",
     # 能化 (4)
-    "sc", "eb", "fu",
+    "sc",
+    "eb",
+    "fu",
     # 农产软商 (8)
-    "lh", "p", "cj", "oi", "cf", "y", "m",
+    "lh",
+    "p",
+    "cj",
+    "oi",
+    "cf",
+    "y",
+    "m",
     # 新能源材料 (2)
-    "lc", "ps"
+    "lc",
+    "ps",
 }
+
 
 def main():
     data_engine = CrossAssetDataEngine(cache_dir=WORKSPACE_DIR)
@@ -67,8 +92,12 @@ def main():
             if tf not in spec.eligible_tfs or sid.startswith("CZ") or sid.startswith("M5"):
                 continue
             sig_spec = registry._factors.get(sid)
-            if sig_spec is not None and sig_spec.archetype not in ("A_顺势突破簇", "C_震荡回归簇"):
-                continue
+            # 保持原对比口径：仅纳入旧 A_顺势突破簇 / C_震荡回归簇 (6 簇重构后按迁移前的旧簇过滤)
+            if sig_spec is not None:
+                legacy_arch = LEGACY_ARCHETYPE_BY_SIG.get(sid, sig_spec.archetype)
+                legacy_arch = LEGACY_ARCHETYPE_ALIAS.get(legacy_arch, legacy_arch)
+                if legacy_arch not in (ARCH_A, ARCH_C):
+                    continue
             _, w_arr = registry.evaluate_factor_on_tf(tf_dfs[tf], sid, tf)
             w_on_grid[uid] = map_tf_weight_to_base_grid(tf_dfs[tf], w_arr, df_grid)
             active_alloc[uid] = w_val
@@ -92,19 +121,21 @@ def main():
     print("=" * 145)
     rows = []
     for _k, v in res_24.items():
-        rows.append({
-            "加权方案": v["label"],
-            "名义预算": f"{v['avg_gross_exposure_pct']:.1f}%",
-            "IS净收益": f"{v['is']['cum_ret_pct']:+.2f}%",
-            "IS夏普": v["is"]["sharpe"],
-            "OOS净收益": f"{v['oos']['cum_ret_pct']:+.2f}%",
-            "OOS夏普": v["oos"]["sharpe"],
-            "全周期总收益": f"{v['full']['cum_ret_pct']:+.2f}%",
-            "全周期年化": f"{v['full']['ann_ret_pct']:+.2f}%",
-            "全周期夏普": v["full"]["sharpe"],
-            "最大回撤": f"{v['full']['mdd_pct']:.2f}%",
-            "全周期卡玛": v["full"]["calmar"],
-        })
+        rows.append(
+            {
+                "加权方案": v["label"],
+                "名义预算": f"{v['avg_gross_exposure_pct']:.1f}%",
+                "IS净收益": f"{v['is']['cum_ret_pct']:+.2f}%",
+                "IS夏普": v["is"]["sharpe"],
+                "OOS净收益": f"{v['oos']['cum_ret_pct']:+.2f}%",
+                "OOS夏普": v["oos"]["sharpe"],
+                "全周期总收益": f"{v['full']['cum_ret_pct']:+.2f}%",
+                "全周期年化": f"{v['full']['ann_ret_pct']:+.2f}%",
+                "全周期夏普": v["full"]["sharpe"],
+                "最大回撤": f"{v['full']['mdd_pct']:.2f}%",
+                "全周期卡玛": v["full"]["calmar"],
+            }
+        )
     print(pd.DataFrame(rows).to_string(index=False))
 
     # 实际仓位
@@ -125,30 +156,40 @@ def main():
     dynamic_shape = vol_mult * ec_mult
 
     tier_records = []
-    for tier_name, target_u in [("基准18%实际仓位", 0.18), ("平衡50%实际仓位", 0.50), ("进取80%实际仓位", 0.80), ("满仓100%实际仓位", 1.00)]:
+    for tier_name, target_u in [
+        ("基准18%实际仓位", 0.18),
+        ("平衡50%实际仓位", 0.50),
+        ("进取80%实际仓位", 0.80),
+        ("满仓100%实际仓位", 1.00),
+    ]:
         k_t = (target_u / np.maximum(u_lag1, 0.02)) * dynamic_shape
         w_scaled = base_w.multiply(k_t, axis=0)
         act_gross_exposure = (w_scaled * sub_abs).sum(axis=1)
         dr_scaled = (ret_df.reindex(base_w.index) * w_scaled).sum(axis=1)
         st_full = CrossAssetHRPSynthesizer._calc_return_series_stats(dr_scaled)
-        st_oos = CrossAssetHRPSynthesizer._calc_return_series_stats(dr_scaled.loc[ret_df.index > pd.Timestamp(IS_END_DT.date())])
-        tier_records.append({
-            "仓位级别": tier_name,
-            "平均实际仓位": f"{act_gross_exposure.mean()*100:.1f}%",
-            "平均保证金": f"{act_gross_exposure.mean()*12:.1f}%",
-            "OOS净收益": f"{st_oos['cum_ret_pct']:+.2f}%",
-            "OOS夏普": st_oos["sharpe"],
-            "全期总收益": f"{st_full['cum_ret_pct']:+.2f}%",
-            "全期年化": f"{st_full['ann_ret_pct']:+.2f}%",
-            "全期夏普": st_full["sharpe"],
-            "最大回撤": f"{st_full['mdd_pct']:.2f}%",
-            "全期卡玛": st_full["calmar"],
-        })
+        st_oos = CrossAssetHRPSynthesizer._calc_return_series_stats(
+            dr_scaled.loc[ret_df.index > pd.Timestamp(IS_END_DT.date())]
+        )
+        tier_records.append(
+            {
+                "仓位级别": tier_name,
+                "平均实际仓位": f"{act_gross_exposure.mean() * 100:.1f}%",
+                "平均保证金": f"{act_gross_exposure.mean() * 12:.1f}%",
+                "OOS净收益": f"{st_oos['cum_ret_pct']:+.2f}%",
+                "OOS夏普": st_oos["sharpe"],
+                "全期总收益": f"{st_full['cum_ret_pct']:+.2f}%",
+                "全期年化": f"{st_full['ann_ret_pct']:+.2f}%",
+                "全期夏普": st_full["sharpe"],
+                "最大回撤": f"{st_full['mdd_pct']:.2f}%",
+                "全期卡玛": st_full["calmar"],
+            }
+        )
 
     print("\n" + "-" * 145)
     print("  【Top 24 优质正阿尔法组合 · SecHRP】 —— 四档真实在途持仓 (Vol+EC Guard 动态守护)")
     print("-" * 145)
     print(pd.DataFrame(tier_records).to_string(index=False))
+
 
 if __name__ == "__main__":
     main()

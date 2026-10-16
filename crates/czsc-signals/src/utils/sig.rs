@@ -251,6 +251,14 @@ pub fn make_kline_signal_v3(
     make_signal7(k1, k2, k3, v1, v2, v3, 0)
 }
 
+/// K线级：仅设置 v1，`score` 写入 `0~100` 的结构强度分（越界按 `[0, 100]` 截断）。
+///
+/// 约定 `score = round(100·Q)`，其中 `Q ∈ (0, 1]` 为结构质量连续分；
+/// Python 端以 `score / 100` 解码为 `[0, 1]` 并结合 v1 方向得到 `[-1, 1]` 连续强度。
+pub fn make_kline_signal_scored(k1: &str, k2: &str, k3: &str, v1: &str, score: i32) -> Vec<Signal> {
+    make_signal7(k1, k2, k3, v1, "任意", "任意", score.clamp(0, 100))
+}
+
 /// 周内中文标签（周一到周日）
 pub fn weekday_cn(dt: chrono::DateTime<chrono::Utc>) -> &'static str {
     match dt.weekday().num_days_from_monday() {

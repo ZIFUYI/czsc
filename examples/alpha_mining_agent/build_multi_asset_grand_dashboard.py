@@ -30,7 +30,7 @@ from examples.alpha_mining_agent.run_evolution_loop import (
     TF_SCALE_MAP,
     _df_to_md_table,
 )
-from examples.alpha_mining_agent.hypothesis_bank import compute_signal_triggers_and_weights
+from examples.alpha_mining_agent.hypothesis_bank import ALL_ARCHETYPES, compute_signal_triggers_and_weights
 from examples.alpha_mining_agent.forensic_pipeline import backtest_slice, map_tf_weight_to_5m_grid
 
 IS_END_DT = pd.Timestamp("2023-12-31 23:59:59")
@@ -87,11 +87,11 @@ def compute_performance_stats(daily_ret: pd.Series, name: str = "") -> dict[str,
     mdd = float(abs(dd.min()))
     calmar = float(ann_ret / max(mdd, 1e-6)) if ann_ret > 0 else 0.0
     win_rate = float((daily_ret > 0).mean() * 100.0)
-    
+
     pos_rets = daily_ret[daily_ret > 0]
     neg_rets = daily_ret[daily_ret < 0]
     pl_ratio = float(pos_rets.mean() / abs(neg_rets.mean())) if len(neg_rets) > 0 and len(pos_rets) > 0 else 1.0
-    
+
     return {
         "name": name,
         "days": n_days,
@@ -178,7 +178,9 @@ def main():
             "base_nav": base_nav,
             "base_dd": base_st["dd_series"],
         }
-        print(f"  -> 冠军单元数: {len(champ_alloc)} | 全周期收益: {champ_st['cum_ret_pct']:+.2f}% | 夏普: {champ_st['sharpe']:.2f}")
+        print(
+            f"  -> 冠军单元数: {len(champ_alloc)} | 全周期收益: {champ_st['cum_ret_pct']:+.2f}% | 夏普: {champ_st['sharpe']:.2f}"
+        )
 
     # 构建统一日历 DataFrame
     df_champ_daily = pd.DataFrame(daily_champ_rets).sort_index().fillna(0.0)
@@ -215,7 +217,9 @@ def main():
     port_at_dd = (port_at_nav - port_at_nav.cummax()) / port_at_nav.cummax() * 100.0
 
     # 进阶迭代二：大小盘强弱对冲中性策略 (Cross-Sectional Market Neutral: Long Growth/Small, Short Value Beta)
-    port_ls_ret = 0.5 * df_champ_daily["159915"] + 0.5 * df_champ_daily["IM9999.CCFX"] - 0.4 * df_champ_daily["IF9999.CCFX"]
+    port_ls_ret = (
+        0.5 * df_champ_daily["159915"] + 0.5 * df_champ_daily["IM9999.CCFX"] - 0.4 * df_champ_daily["IF9999.CCFX"]
+    )
     port_ls_nav = (1.0 + port_ls_ret).cumprod()
     port_ls_dd = (port_ls_nav - port_ls_nav.cummax()) / port_ls_nav.cummax() * 100.0
 
@@ -226,7 +230,11 @@ def main():
 
     perf_table = []
     # 整体组合与进阶迭代
-    for seg_name, mask in [("全周期 (2020-2026)", np.ones(len(dates), dtype=bool)), ("样本内 (2020-2023 IS)", is_mask), ("样本外 (2024-2026 OOS)", oos_mask)]:
+    for seg_name, mask in [
+        ("全周期 (2020-2026)", np.ones(len(dates), dtype=bool)),
+        ("样本内 (2020-2023 IS)", is_mask),
+        ("样本外 (2024-2026 OOS)", oos_mask),
+    ]:
         st_at = compute_performance_stats(port_at_ret[mask], f"★ 进阶迭代一：夏普动量倾斜组合 [{seg_name}]")
         st_ls = compute_performance_stats(port_ls_ret[mask], f"★ 进阶迭代二：大小盘多空对冲中性策略 [{seg_name}]")
         st_champ = compute_performance_stats(port_champ_ret[mask], f"4×5生态位全标的航母等权组合 [{seg_name}]")
@@ -380,7 +388,7 @@ def main():
     )
 
     # Subplot 4: 生态位矩阵构成柱状图 (四大标的在 4 大方向上的单元数)
-    archetypes = ["A_顺势突破簇", "B_背驰反转簇", "C_震荡回归簇", "D_日内微结构簇"]
+    archetypes = list(ALL_ARCHETYPES)
     bar_colors = ["#29B6F6", "#00E676", "#AB47BC", "#FFA726"]
 
     for i, cfg in enumerate(ASSET_CONFIGS):
@@ -400,7 +408,7 @@ def main():
 
         fig.add_trace(
             go.Bar(
-                x=["顺势突破簇", "背驰反转簇", "震荡回归簇", "日内微结构簇"],
+                x=[a.split("_", 1)[1] for a in archetypes],
                 y=[counts_by_arch[a] for a in archetypes],
                 name=f"{cfg['short_name']} 生态位单元分布",
                 marker_color=cfg["color"],
@@ -457,19 +465,29 @@ def main():
     report_path = Path("examples/results/multi_asset_factor_and_portfolio_report.md")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("# IM / IC / IF / 159915 四大核心标的 · 4×5 全周期生态位矩阵整体量化实证报告\n\n")
-        f.write("严格遵循机构级 **4×5 MAP-Elites 全周期生态位矩阵架构**（四大战略方向 × 五级时间周期 × 三关法医门禁 × 5m原生无未来函数对齐）。\n\n")
+        f.write(
+            "严格遵循机构级 **4×5 MAP-Elites 全周期生态位矩阵架构**（四大战略方向 × 五级时间周期 × 三关法医门禁 × 5m原生无未来函数对齐）。\n\n"
+        )
         f.write(f"- **评测区间**: 2020-01-02 至 2026-10-14（样本内: 2020-2023 IS，样本外盲测: 2024-2026 OOS）\n")
         f.write(f"- **交易成本**: 双边 2 BP 摩擦成本扣除，次根开盘价成交（零未来函数）\n")
-        f.write(f"- **整体大屏**: [`multi_asset_portfolio_4x5_dashboard.html`](file:///{out_html.resolve().as_posix()})\n\n")
+        f.write(
+            f"- **整体大屏**: [`multi_asset_portfolio_4x5_dashboard.html`](file:///{out_html.resolve().as_posix()})\n\n"
+        )
 
         f.write("## 一、全标的联合航母投资组合表现对比\n\n")
-        f.write("| 组合方案 | 评估阶段 | 累计收益率 | 年化收益率 | 年化波动率 | 夏普比率 (Sharpe) | 最大回撤 (MDD) | 卡玛比率 (Calmar) | 日胜率 | 盈亏比 |\n")
+        f.write(
+            "| 组合方案 | 评估阶段 | 累计收益率 | 年化收益率 | 年化波动率 | 夏普比率 (Sharpe) | 最大回撤 (MDD) | 卡玛比率 (Calmar) | 日胜率 | 盈亏比 |\n"
+        )
         f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n")
         for row in perf_table:
-            f.write(f"| **{row['name']}** | — | **{row['cum_ret_pct']:+.2f}%** | {row['ann_ret_pct']:+.2f}% | {row['ann_vol_pct']:.2f}% | **{row['sharpe']:.2f}** | **{row['mdd_pct']:.2f}%** | **{row['calmar']:.2f}** | {row['win_rate_pct']:.1f}% | {row['pl_ratio']:.2f} |\n")
+            f.write(
+                f"| **{row['name']}** | — | **{row['cum_ret_pct']:+.2f}%** | {row['ann_ret_pct']:+.2f}% | {row['ann_vol_pct']:.2f}% | **{row['sharpe']:.2f}** | **{row['mdd_pct']:.2f}%** | **{row['calmar']:.2f}** | {row['win_rate_pct']:.1f}% | {row['pl_ratio']:.2f} |\n"
+            )
 
         f.write("\n## 二、四大资产各自独立的 4×5 冠军策略绩效清单\n\n")
-        f.write("| 标的代码 | 标的名称 | 入库原子单元数 | 全周期累计收益 | 全周期年化 | 全周期夏普 | 全周期最大回撤 | 全周期卡玛 | 样本外累计收益 (2024-2026 OOS) | 样本外夏普 |\n")
+        f.write(
+            "| 标的代码 | 标的名称 | 入库原子单元数 | 全周期累计收益 | 全周期年化 | 全周期夏普 | 全周期最大回撤 | 全周期卡玛 | 样本外累计收益 (2024-2026 OOS) | 样本外夏普 |\n"
+        )
         f.write("| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n")
         for cfg in ASSET_CONFIGS:
             sym = cfg["symbol"]
@@ -479,24 +497,38 @@ def main():
             r = daily_champ_rets[sym]
             r_oos = r[r.index > IS_END_DT]
             st_oos = compute_performance_stats(r_oos)
-            f.write(f"| `{sym}` | **{cfg['name']}** | **{len(d['champ_alloc'])} 个** | **{c_st['cum_ret_pct']:+.2f}%** | {c_st['ann_ret_pct']:+.2f}% | **{c_st['sharpe']:.2f}** | **{c_st['mdd_pct']:.2f}%** | **{c_st['calmar']:.2f}** | **{st_oos.get('cum_ret_pct', 0.0):+.2f}%** | **{st_oos.get('sharpe', 0.0):.2f}** |\n")
+            f.write(
+                f"| `{sym}` | **{cfg['name']}** | **{len(d['champ_alloc'])} 个** | **{c_st['cum_ret_pct']:+.2f}%** | {c_st['ann_ret_pct']:+.2f}% | **{c_st['sharpe']:.2f}** | **{c_st['mdd_pct']:.2f}%** | **{c_st['calmar']:.2f}** | **{st_oos.get('cum_ret_pct', 0.0):+.2f}%** | **{st_oos.get('sharpe', 0.0):.2f}** |\n"
+            )
 
         f.write("\n## 三、4×5 全周期生态位矩阵跨资产横向分布对比表\n\n")
-        f.write("展示各资产在 4 大方向（顺势突破、背驰反转、震荡回归、日内微结构）与 5 级周期（1d、60m、30m、15m、5m）上的单元生态位入驻情况：\n\n")
+        f.write(
+            "展示各资产在 4 大方向（顺势突破、背驰反转、震荡回归、日内微结构）与 5 级周期（1d、60m、30m、15m、5m）上的单元生态位入驻情况：\n\n"
+        )
 
         for cfg in ASSET_CONFIGS:
             sym = cfg["symbol"]
-            f.write(f"### 3.{ASSET_CONFIGS.index(cfg)+1} {cfg['name']} 生态位分布矩阵\n\n")
+            f.write(f"### 3.{ASSET_CONFIGS.index(cfg) + 1} {cfg['name']} 生态位分布矩阵\n\n")
             if sym in niche_summaries:
                 ndf = pd.DataFrame(niche_summaries[sym])
                 f.write(_df_to_md_table(ndf) + "\n\n")
 
         f.write("## 四、资产特性与生态位选拔深度洞察\n\n")
-        f.write("1. **创业板 (159915)**: 波动弹性最大，4×5 生态位全周期共振最为显著，共入库 **44 个原子单元**，全周期收益达 **+139.85%** (夏普 2.13)，在 15m/5m 细粒度下具有极强的日内微结构和背驰反转 Alpha。\n")
-        f.write("2. **中证500 (IC9999)**: 中盘成长风格代表，共入库 **30 个原子单元**，全周期收益 **+36.74%** (夏普 0.89)，回撤仅 12.46%，特别是在 60m 与 15m 级别上的反转与微结构单元为突破基线提供了极其稳定的平滑对冲。\n")
-        f.write("3. **中证1000 (IM9999)**: 小盘高弹性代表，共入库 **26 个原子单元**，全周期收益 **+25.60%** (年化 8.26%，夏普 1.11)，最大回撤仅 **7.99%**，卡玛比高达 **1.03**，在 30m 与 15m 的震荡回归簇表现出非凡的防守韧性。\n")
-        f.write("4. **沪深300 (IF9999)**: 大盘价值蓝筹代表，共入库 **33 个原子单元**，全周期收益 **+15.32%** (夏普 0.44)，在大盘价值熊市与日内高频噪声下，法医门禁淘汰率最高，但通过日内微结构与背驰反转成功扭转了单纯买入持有与单纯突破的下挫。\n")
-        f.write("5. **整体联合航母组合 (Multi-Asset Portfolio)**: 四大资产跨周期、跨方向正交并轨后，资产间相关性显著降低，平滑效果极佳，实现了穿越牛熊的机构级全天候量化母基金架构！\n")
+        f.write(
+            "1. **创业板 (159915)**: 波动弹性最大，4×5 生态位全周期共振最为显著，共入库 **44 个原子单元**，全周期收益达 **+139.85%** (夏普 2.13)，在 15m/5m 细粒度下具有极强的日内微结构和背驰反转 Alpha。\n"
+        )
+        f.write(
+            "2. **中证500 (IC9999)**: 中盘成长风格代表，共入库 **30 个原子单元**，全周期收益 **+36.74%** (夏普 0.89)，回撤仅 12.46%，特别是在 60m 与 15m 级别上的反转与微结构单元为突破基线提供了极其稳定的平滑对冲。\n"
+        )
+        f.write(
+            "3. **中证1000 (IM9999)**: 小盘高弹性代表，共入库 **26 个原子单元**，全周期收益 **+25.60%** (年化 8.26%，夏普 1.11)，最大回撤仅 **7.99%**，卡玛比高达 **1.03**，在 30m 与 15m 的震荡回归簇表现出非凡的防守韧性。\n"
+        )
+        f.write(
+            "4. **沪深300 (IF9999)**: 大盘价值蓝筹代表，共入库 **33 个原子单元**，全周期收益 **+15.32%** (夏普 0.44)，在大盘价值熊市与日内高频噪声下，法医门禁淘汰率最高，但通过日内微结构与背驰反转成功扭转了单纯买入持有与单纯突破的下挫。\n"
+        )
+        f.write(
+            "5. **整体联合航母组合 (Multi-Asset Portfolio)**: 四大资产跨周期、跨方向正交并轨后，资产间相关性显著降低，平滑效果极佳，实现了穿越牛熊的机构级全天候量化母基金架构！\n"
+        )
 
     print(f"  [报告导出成功] {report_path.resolve()}")
     print("\n多资产整体组合与大屏生成完毕！")

@@ -3,11 +3,13 @@
 第二层：CZSC 规则型因子标准化表达与注册中心 (Rule-Based Factor Representation & Registry)
 
 核心设计：
-1. 规则型因子并非静态线性数值，而是输出离散/阶梯持仓状态 w_u(s, t) ∈ [-1, +1] 的微型状态机；
+1. 规则型因子是输出 w_u(s, t) ∈ [-1, +1] 的微型状态机：A/B/C 簇的存量因子为离散/阶梯持仓状态，
+   Issue #3 新增的连续强度原子因子 (`output_kind="continuous"`) 输出 S = d·Q·D ∈ [-1, 1] 连续强度；
 2. 双轨表达支持：
    - 轨道 A (CZSC Native Signal -> Event -> Position)：直接复用 czsc Rust 原生信号、Event 逻辑组合与 Position 状态机；
    - 轨道 B (Two-Phase State Machine)：两阶段状态机 (Setup 势能蓄力 + Confirmation 微观反包确认 + 结构证伪止损 + ATR 动态止盈)；
-3. 强制归入 4 大正交战略簇 (A_顺势突破簇 / B_背驰反转簇 / C_震荡回归簇 / D_日内微结构簇)，并预留 AI 因子挖掘注册插槽。
+3. 强制归入 6 大正交战略簇 (A 趋势突破与斜率动量 / B 背驰衰竭与极值反转 / C 中枢震荡与锚定回归 /
+   D 量价微结构与筹码冲击 / E 波动率压缩与分形弹性 / F 多周期共振与截面强弱)，并预留 AI 因子挖掘注册插槽。
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from czsc import Event, Freq, Operate, Position, Signal, format_standard_kline
 from examples.alpha_mining_agent.hypothesis_bank import (
     ALL_SIGNAL_SPECS,
     ARCHETYPE_RULERS,
+    ATOMIC_EXIT_MODE,
     BASE_SEED_SIGNALS,
     CANDIDATE_HYPOTHESIS_POOL,
     TF_SCALE_MAP,
@@ -35,14 +38,14 @@ class RuleFactorSpec:
     """
     标准化规则型因子规格协议 (Standardized Rule-Based Factor Protocol)
     支持：
-    - mode="state_machine": 调用两阶段状态机算子 (如 S1~S4 / A~D / TD / CZ 系列)
+    - mode="state_machine": 调用两阶段状态机算子 (如 S1~S4 / A~D / TD / CZ 系列 / Issue #3 连续强度原子因子)
     - mode="czsc_position": 直接挂载 czsc.Position (Signal -> Event -> Position) 原生对象
     - mode="custom_func":   未来 AI Agent 生成的自定义规则因子函数 (df -> tuple[triggers, weights])
     """
 
     factor_id: str
     name: str
-    archetype: str  # "A_顺势突破簇" | "B_背驰反转簇" | "C_震荡回归簇" | "D_日内微结构簇"
+    archetype: str  # 6 簇之一，见 hypothesis_bank.ALL_ARCHETYPES
     direction: int  # +1 (多) | -1 (空) | 0 (双向对称 Position)
     default_weight: float
     eligible_tfs: tuple[str, ...]
@@ -50,6 +53,7 @@ class RuleFactorSpec:
     is_base_seed: bool = False
     czsc_position_builder: Callable[[str], Position] | None = None
     custom_eval_func: Callable[[pd.DataFrame, int], tuple[np.ndarray, np.ndarray]] | None = None
+    output_kind: str = "binary"  # "binary": 权重 ∈ {-1,0,+1} 阶梯持仓 | "continuous": 权重 S=d·Q·D ∈ [-1,1]
 
 
 class RuleFactorRegistry:
@@ -70,12 +74,13 @@ class RuleFactorRegistry:
                 eligible_tfs=spec.eligible_tfs,
                 mode="state_machine",
                 is_base_seed=spec.is_base_seed,
+                output_kind="continuous" if spec.exit_mode == ATOMIC_EXIT_MODE else "binary",
             )
 
     def register_ai_rule_factor(self, spec: RuleFactorSpec) -> None:
         """
         [预留插槽] 供未来 AI / LLM 因子挖掘 Agent 注册新生成的规则型因子：
-        - 强制校验战略簇归属 (A / B / C / D) 与有效周期列表
+        - 强制校验战略簇归属 (A ~ F 六簇) 与有效周期列表
         """
         if spec.archetype not in ARCHETYPE_RULERS:
             raise ValueError(f"Unknown archetype: {spec.archetype}. Must be one of {list(ARCHETYPE_RULERS)}")

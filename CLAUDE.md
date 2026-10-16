@@ -149,7 +149,8 @@ git diff -- czsc/_native/__init__.pyi
    - 优化工具位于 `czsc/utils/optimize.py`：`OpensOptimize / ExitsOptimize / CzscOpenOptimStrategy / CzscExitOptimStrategy`
 
 4. **`czsc._native.signals`** - Rust 信号分发器的内部 Python 命名空间：
-   - 当前注册 7 个分类子模块（bar/cvolp/cxt/obv/pressure/tas/vol）；分类注册以 `crates/czsc-python/src/signals_dispatcher.rs` 为准，不等于 Rust 信号模块的完整清单
+   - 当前注册 17 个分类子模块（bar/cxt/tas/vol/pressure/obv/cvolp/ang/byi/clv/coo/jcc/kcatr/ntmdk/xl/zdy/strength）；分类映射以 `crates/czsc-signals/src/registry.rs::KLINE_CATEGORY_PREFIXES` 为准（`list_signal_names(category)` 按 Rust 模块边界过滤，例如 `ang` 含 `amv_*`/`adtm_*`、`tas` 含 `cci_*`），trader 状态信号（pos/cat/cxt_trader/zdy_trader）不在 K 线分类内
+   - `strength_*` 是首批写入 `Signal.score`（`round(100·Q)`，0~100）的结构强度信号，Python 端以 `±score/100` 解码为 `[-1, 1]` 连续强度
    - Rust 模块以 `crates/czsc-signals/src/lib.rs` 为准，可用 `rg --files crates/czsc-signals/src -g '*.rs'` 查看源码；不要依赖固定文件数或信号数量
    - 用户通过 `uv run --no-sync czsc signals list --json` 查询信号目录，通过 `czsc.get_signals_config / czsc.get_signals_freqs` 解析配置，通过 `czsc.generate_czsc_signals` 等接口计算信号
    - 原 `czsc/signals/` 已删除，不恢复历史 Python 信号实现；依赖 trader 状态的信号通过交易器更新路径分发

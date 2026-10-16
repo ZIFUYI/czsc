@@ -106,6 +106,11 @@ pub mod zdy {
     include!("zdy.rs");
 }
 
+#[signal_module(category = "kline")]
+pub mod strength {
+    include!("strength.rs");
+}
+
 #[signal_module(category = "trader")]
 pub mod zdy_trader {
     include!("zdy_trader.rs");

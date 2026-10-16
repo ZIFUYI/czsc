@@ -7,6 +7,18 @@
 3. 商品期货主力连续 (Commodity Futures with Night Sessions: SHFE / DCE / CZCE / INE / GFEX)
 """
 
+from examples.multi_factor_cta.atomic_factors import (
+    ATOMIC_FACTOR_DEFS,
+    ATOMIC_SIGNAL_IDS,
+    CrossSectionProvider,
+    DecayConfig,
+    FactorContext,
+    NeutralCrossSection,
+    apply_dynamic_structure_decay,
+    compute_atomic_signal,
+    compute_family,
+    two_stage_trigger,
+)
 from examples.multi_factor_cta.data_engine import (
     AssetClass,
     AssetSpec,
@@ -32,17 +44,27 @@ from examples.multi_factor_cta.synthesis_engine import (
 
 __all__ = [
     "ARCHETYPE_RULERS",
+    "ATOMIC_FACTOR_DEFS",
+    "ATOMIC_SIGNAL_IDS",
     "AssetClass",
     "AssetSpec",
     "CrossAssetDataEngine",
     "CrossAssetHRPSynthesizer",
+    "CrossSectionProvider",
+    "DecayConfig",
     "ExecutionMode",
+    "FactorContext",
     "IntraAssetThreePillarSynthesizer",
+    "NeutralCrossSection",
     "RuleFactorForensicValidator",
     "RuleFactorRegistry",
     "RuleFactorSpec",
+    "apply_dynamic_structure_decay",
+    "compute_atomic_signal",
     "compute_cross_sectional_concurrency",
+    "compute_family",
     "compute_signed_jaccard",
     "joint_is_coordinate_reweight",
     "map_tf_weight_to_base_grid",
+    "two_stage_trigger",
 ]

@@ -3115,7 +3115,7 @@ mod tests {
             bi(2, Direction::Down, 95.0, 112.0),
             bi(3, Direction::Up, 92.0, 108.0),
         ];
-        let mut c = CZSC::new(bars_raw, 50);
+        let mut c = CZSC::new(bars_raw, 50, 6);
         c.bars_ubi = Vec::new();
         c.bi_list = bi_list;
         c.freq = Freq::F15;

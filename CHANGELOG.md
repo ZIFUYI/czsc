@@ -9,6 +9,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- **新增 `strength` 信号模块（6 个 `strength_*_V260601`）**：首批真正写入 `Signal.score`（`round(100·Q)`，`Q ∈ (0, 1]`）的 K 线信号——`strength_fx`（分型强度）、`strength_bi_div`（笔背驰强度 `Q_div = clip(1 − min(R_slope, R_area), 0.1, 1)`）、`strength_zs_revert`（中枢偏离回归）、`strength_zs_break`（三买/三卖脱离安全边际）、`strength_flow`（量价资金流）、`strength_squeeze`（波动率压缩后扩张）。公式只使用价差/ATR 比值，价格镜像后多空严格对称；Rust 端自带截断因果与镜像对称单测。
+- `czsc._native.signals` 子模块由 7 个扩为 17 个（新增 `ang / byi / clv / coo / jcc / kcatr / ntmdk / xl / zdy / strength`），分类映射表 `KLINE_CATEGORY_PREFIXES` 位于 `crates/czsc-signals/src/registry.rs`。
+
+### Changed
+
+- **（Breaking）`list_signal_names(category)` / `get_signal_category(name)` 改按 Rust 信号模块分类**：此前按名字前缀，`ang` 模块内的 `amv_* / adtm_* / ...` 无法通过 `category="ang"` 发现，`cci_*` 不属于 `tas`、`obvm_*` 不属于 `obv`。现在 `category` 取值为 17 个模块名；trader 状态信号（`pos_* / cat_*`）仍回退为名字前缀。不传 `category` 的行为不变。
+
+### Fixed
+
+- `czsc-signals` 单测中 `CZSC::new` 缺少 `min_bi_len` 参数导致 `cargo test -p czsc-signals` 无法编译（`cxt.rs` / `tas.rs` 测试夹具）。
+
 ## [1.0.1] — 2026-08-09
 
 ### Added

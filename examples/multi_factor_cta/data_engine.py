@@ -24,6 +24,7 @@ from examples.alpha_mining_agent.hypothesis_bank import (
     attach_native_czsc_signals,
     enrich_kline_features,
 )
+from examples.multi_factor_cta.atomic_factors import link_higher_timeframes
 
 
 class AssetClass(str, Enum):
@@ -226,7 +227,7 @@ class CrossAssetDataEngine:
                 kdf = attach_native_czsc_signals(kdf, tf, sym_cache_dir)
             result[tf] = kdf
 
-        return result
+        return link_higher_timeframes(result)
 
     @staticmethod
     def _read_raw_dataframe(spec: AssetSpec) -> pd.DataFrame:

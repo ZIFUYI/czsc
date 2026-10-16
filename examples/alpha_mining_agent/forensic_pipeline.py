@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 from czsc import WeightBacktest
-from examples.alpha_mining_agent.hypothesis_bank import ALL_SIGNAL_SPECS, ArchetypeRuler
+from examples.alpha_mining_agent.hypothesis_bank import ALL_ARCHETYPES, ALL_SIGNAL_SPECS, ARCH_A, ArchetypeRuler
 
 IS_END_DT = pd.Timestamp("2023-12-31 23:59:59")
 
@@ -402,9 +402,9 @@ def synthesize_atomic_units_portfolio(
 ) -> np.ndarray:
     """
     三支柱分层复合引擎 (Three-Pillar Hierarchical Portfolio Synthesis Engine)：
-    1. 四簇×五周期双通道分层聚合 (Cluster-Aware Dual-Channel Aggregation)：
-       在各周期层 (1d, 60m, 30m, 15m, 5m) 内，将 A_顺势突破簇 与 B/C/D 正交战术簇 (背驰反转/震荡回归/日内微结构)
-       分别独立截断，彻底消除 30m/60m 顺势单元饱和截断对正交信号的淹没；
+    1. 六簇×五周期双通道分层聚合 (Cluster-Aware Dual-Channel Aggregation)：
+       在各周期层 (1d, 60m, 30m, 15m, 5m) 内，将 A_趋势突破与斜率动量簇 与 B/C/D/E/F 正交战术簇
+       (背驰衰竭/中枢回归/量价筹码/波动率压缩/多周期共振) 分别独立截断，彻底消除 30m/60m 顺势单元饱和截断对正交信号的淹没；
     2. 跨簇多空非对称反向断路器 (Asymmetric Cross-Cluster Reversal Brake)：
        当顺势簇持有多头而正交簇发出顶部背驰/破位空头信号时，对多头底仓施加乘法衰减 (b_long=0.35)；
        当顺势簇持有空头而正交簇发出底部超跌/V型反转多头信号时，对空头底仓施加快速平空保护 (b_short=0.50)；
@@ -414,33 +414,25 @@ def synthesize_atomic_units_portfolio(
     """
     n = len(df_grid)
     tf_weights = {"1d": 0.65, "60m": 0.55, "30m": 0.45, "15m": 0.40, "5m": 0.30}
-    w_tf_arch = {
-        tf: {
-            "A_顺势突破簇": np.zeros(n, dtype=np.float64),
-            "B_背驰反转簇": np.zeros(n, dtype=np.float64),
-            "C_震荡回归簇": np.zeros(n, dtype=np.float64),
-            "D_日内微结构簇": np.zeros(n, dtype=np.float64),
-        }
-        for tf in tf_weights
-    }
+    w_tf_arch = {tf: {arch: np.zeros(n, dtype=np.float64) for arch in ALL_ARCHETYPES} for tf in tf_weights}
 
     has_ortho = False
     for unit_id, coeff in unit_alloc_map.items():
         sid, tf = unit_id.split("@")
         spec = ALL_SIGNAL_SPECS.get(sid)
-        arch = spec.archetype if spec is not None else "A_顺势突破簇"
-        if arch != "A_顺势突破簇":
+        arch = spec.archetype if spec is not None else ARCH_A
+        if arch != ARCH_A:
             has_ortho = True
         w_tf_arch[tf][arch] += coeff * unit_weights_on_grid[unit_id]
 
     if not has_ortho:
         # 仅含顺势突破基石种子时 (Step 0)，保持原始五周期分形基准不变
         w_seed = (
-            0.65 * np.clip(w_tf_arch["1d"]["A_顺势突破簇"], -1.0, 1.0)
-            + 0.55 * np.clip(w_tf_arch["60m"]["A_顺势突破簇"], -1.0, 1.0)
-            + 0.45 * np.clip(w_tf_arch["30m"]["A_顺势突破簇"], -1.0, 1.0)
-            + 0.35 * np.clip(w_tf_arch["15m"]["A_顺势突破簇"], -1.0, 1.0)
-            + 0.25 * np.clip(w_tf_arch["5m"]["A_顺势突破簇"], -1.0, 1.0)
+            0.65 * np.clip(w_tf_arch["1d"][ARCH_A], -1.0, 1.0)
+            + 0.55 * np.clip(w_tf_arch["60m"][ARCH_A], -1.0, 1.0)
+            + 0.45 * np.clip(w_tf_arch["30m"][ARCH_A], -1.0, 1.0)
+            + 0.35 * np.clip(w_tf_arch["15m"][ARCH_A], -1.0, 1.0)
+            + 0.25 * np.clip(w_tf_arch["5m"][ARCH_A], -1.0, 1.0)
         )
         return apply_rebalance_deadzone(np.clip(w_seed, -1.0, 1.0), deadzone=rebalance_deadzone)
 
@@ -449,12 +441,10 @@ def synthesize_atomic_units_portfolio(
     w_bcd_pos = np.zeros(n, dtype=np.float64)
     w_bcd_neg = np.zeros(n, dtype=np.float64)
 
+    tactical_archs = [a for a in ALL_ARCHETYPES if a != ARCH_A]
     for tf, tw in tf_weights.items():
-        wa = np.clip(w_tf_arch[tf]["A_顺势突破簇"], -1.0, 1.0)
-        wb = np.clip(w_tf_arch[tf]["B_背驰反转簇"], -1.0, 1.0)
-        wc = np.clip(w_tf_arch[tf]["C_震荡回归簇"], -1.0, 1.0)
-        wd = np.clip(w_tf_arch[tf]["D_日内微结构簇"], -1.0, 1.0)
-        wbcd = np.clip(wb + wc + wd, -1.0, 1.0)
+        wa = np.clip(w_tf_arch[tf][ARCH_A], -1.0, 1.0)
+        wbcd = np.clip(sum(w_tf_arch[tf][a] for a in tactical_archs), -1.0, 1.0)
         w_a_total += tw * wa
         w_bcd_total += tw * wbcd
         w_bcd_pos += tw * np.maximum(wbcd, 0.0)

@@ -383,17 +383,29 @@ df = generate_symbol_kines("000001", "30分钟", "20240101", "20240601")
 
 ## 附录 B：信号函数（`czsc._native.signals`）
 
-信号函数由 Rust 实现，通过 PyO3 暴露为 `czsc._native.signals.*`。Python 端有 7 个子模块：
+信号函数由 Rust 实现，通过 PyO3 暴露为 `czsc._native.signals.*`。Python 端有 17 个子模块（与 Rust 信号模块一一对应）：
 
 | 子模块 | 说明 |
 |--------|------|
 | `czsc._native.signals.bar` | 基于 K 线形态的信号 |
-| `czsc._native.signals.cvolp` | 量价关系信号 |
 | `czsc._native.signals.cxt` | 基于缠论结构（分型/笔/中枢）的信号 |
-| `czsc._native.signals.obv` | OBV 指标信号 |
-| `czsc._native.signals.pressure` | 压力/支撑信号 |
-| `czsc._native.signals.tas` | 技术分析指标信号（MACD/KDJ/RSI/BOLL 等） |
+| `czsc._native.signals.tas` | 技术分析指标信号（MACD/KDJ/RSI/BOLL/ATR/CCI 等） |
 | `czsc._native.signals.vol` | 成交量信号 |
+| `czsc._native.signals.pressure` | 压力/支撑信号 |
+| `czsc._native.signals.obv` | OBV 指标信号（含 `obvm_*`） |
+| `czsc._native.signals.cvolp` | 筹码/量价关系信号 |
+| `czsc._native.signals.ang` | AMV / ADTM / ASI / BIAS / CMO / DEMA / EMV / ER / SKDJ 等指标信号 |
+| `czsc._native.signals.byi` | 笔内（表里）与对称中枢信号 |
+| `czsc._native.signals.clv` | 收盘位置资金流（CLV）信号 |
+| `czsc._native.signals.coo` | TD 序列 / CCI / KDJ / SAR 信号 |
+| `czsc._native.signals.jcc` | 酒田（日本蜡烛）形态信号 |
+| `czsc._native.signals.kcatr` | Keltner 通道 / ATR 信号 |
+| `czsc._native.signals.ntmdk` | NTMDK 信号 |
+| `czsc._native.signals.xl` | 相对位置 / 斜率 / 趋势信号 |
+| `czsc._native.signals.zdy` | 中枢扩展与 MACD 自定义信号 |
+| `czsc._native.signals.strength` | 结构强度信号：`Signal.score = round(100·Q)`（FX / 笔背驰 / 中枢回归·脱离 / 资金流 / 波动率压缩扩张） |
+
+`list_signal_names(category)` 按 Rust 模块边界过滤（例如 `category="ang"` 返回 `amv_*` / `adtm_*` 等，`category="tas"` 含 `cci_*`），不传返回全部 K 线信号；`get_signal_category(name)` 返回信号所属模块。
 
 底层 Rust 源文件位于 `crates/czsc-signals/src/`（22 个 `.rs` 文件），信号通过 `#[signal]` 宏自动注册到 `SIGNAL_REGISTRY`。
 
