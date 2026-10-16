@@ -33,10 +33,11 @@ fn lookup(name: &str) -> Option<&'static SignalDescriptor> {
         .find(|d| d.name == name)
 }
 
-/// 从信号名中提取分类前缀（如从 ``bar_amount_acc_V230214`` 中取出
-/// ``bar``）。名字里不含下划线时返回 ``None``。
-fn name_prefix(name: &str) -> Option<&str> {
-    name.split_once('_').map(|(p, _)| p)
+/// 信号所属分类（Rust 模块名，如 ``bar_amount_acc_V230214`` → ``bar``、
+/// ``amv_up_dw_line_V230603`` → ``ang``）。映射表由 ``czsc-signals`` 提供，
+/// 未登记前缀时返回 ``None``。
+fn category_of(name: &str) -> Option<&'static str> {
+    czsc_signals::registry::kline_category_of(name)
 }
 
 /// 把 Python 端传入的 params 字典（或 ``None``）转换为所有 K 线类信号函数
@@ -84,8 +85,11 @@ pub fn call_signal(
 
 /// 列出 inventory 中注册的所有信号名。
 ///
-/// ``category`` 用来按信号名前缀（首个下划线之前的部分）过滤；常见取值：
-/// ``bar``、``cxt``、``tas``、``vol``、``pressure``、``obv``、``cvolp``。
+/// ``category`` 按 Rust 信号模块（而非名字前缀）过滤，取值见
+/// ``czsc_signals::registry::KLINE_CATEGORY_PREFIXES``：``bar``、``cxt``、``tas``、
+/// ``vol``、``pressure``、``obv``、``cvolp``、``ang``、``byi``、``clv``、``coo``、
+/// ``jcc``、``kcatr``、``ntmdk``、``xl``、``zdy``、``strength``。
+/// 例如 ``ang`` 模块内的信号以 ``amv`` / ``adtm`` 等开头，``tas`` 含 ``cci_*``。
 /// 传 ``None`` 返回所有 K 线类信号。
 #[pyfunction]
 #[pyo3(signature = (category=None))]
@@ -93,7 +97,7 @@ pub fn list_signal_names(category: Option<&str>) -> Vec<String> {
     let mut out: Vec<String> = inventory::iter::<SignalDescriptor>()
         .filter(|d| matches!(d.func_ref, SignalFnRef::Kline(_)))
         .filter(|d| match category {
-            Some(c) => name_prefix(d.name).map(|p| p == c).unwrap_or(false),
+            Some(c) => category_of(d.name) == Some(c),
             None => true,
         })
         .map(|d| d.name.to_string())
@@ -110,12 +114,16 @@ pub fn get_signal_template(name: &str) -> Option<String> {
     lookup(name).map(|d| d.template.to_string())
 }
 
-/// 返回 ``name`` 的分类前缀（``"bar"`` / ``"cxt"`` / ...）。信号未注册
-/// 或名字里不含下划线时返回 ``None``。
+/// 返回 ``name`` 所属的信号分类（``"bar"`` / ``"cxt"`` / ``"ang"`` / ...）。
+///
+/// K 线信号返回其 Rust 模块分类；trader 状态信号（``pos_*`` / ``cat_*`` 等）没有
+/// K 线模块，回退为名字前缀。信号未注册或名字里不含下划线时返回 ``None``。
 #[pyfunction]
 pub fn get_signal_category(name: &str) -> Option<String> {
     let descriptor = lookup(name)?;
-    name_prefix(descriptor.name).map(|p| p.to_string())
+    category_of(descriptor.name)
+        .map(str::to_string)
+        .or_else(|| descriptor.name.split_once('_').map(|(p, _)| p.to_string()))
 }
 
 /// 把分发器相关符号同时挂到 ``czsc._native``（顶层）和
@@ -146,7 +154,10 @@ pub fn register(
     //
     // Python 侧的 `czsc/signals/<cat>.py` 在此基础上叠加 __getattr__，
     // 把单个信号函数暴露成可直接调用的属性。
-    let categories = ["bar", "cxt", "tas", "vol", "pressure", "obv", "cvolp"];
+    let categories = czsc_signals::registry::KLINE_CATEGORY_PREFIXES
+        .iter()
+        .map(|(cat, _)| *cat);
+
     let sys = py.import("sys")?;
     let py_modules = sys.getattr("modules")?;
     for cat in categories {

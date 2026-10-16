@@ -108,6 +108,46 @@ pub fn list_all_signals(include_kline: bool, include_trader: bool) -> Vec<Regist
     out
 }
 
+/// K 线信号的“分类模块 → 信号名前缀”映射。
+///
+/// 分类即 Rust 源文件模块名（与 `czsc._native.signals.<cat>` 子模块一一对应）；
+/// 但信号名前缀并不总等于模块名：`ang` 模块内的信号以 `adtm/amv/asi/...` 开头，
+/// `tas` 模块含 `cci_*`，`obv` 模块含 `obvm_*`。分发器据此映射，保证
+/// `list_signal_names(category)` 与 Rust 模块边界一致。
+pub const KLINE_CATEGORY_PREFIXES: &[(&str, &[&str])] = &[
+    ("bar", &["bar"]),
+    ("cxt", &["cxt"]),
+    ("tas", &["tas", "cci"]),
+    ("vol", &["vol"]),
+    ("pressure", &["pressure"]),
+    ("obv", &["obv", "obvm"]),
+    ("cvolp", &["cvolp"]),
+    (
+        "ang",
+        &[
+            "adtm", "amv", "asi", "bias", "cmo", "dema", "demakder", "emv", "er", "skdj",
+        ],
+    ),
+    ("byi", &["byi"]),
+    ("clv", &["clv"]),
+    ("coo", &["coo"]),
+    ("jcc", &["jcc"]),
+    ("kcatr", &["kcatr"]),
+    ("ntmdk", &["ntmdk"]),
+    ("xl", &["xl"]),
+    ("zdy", &["zdy"]),
+    ("strength", &["strength"]),
+];
+
+/// 返回 K 线信号名所属的分类模块；未知前缀返回 `None`。
+pub fn kline_category_of(name: &str) -> Option<&'static str> {
+    let prefix = name.split_once('_').map(|(p, _)| p)?;
+    KLINE_CATEGORY_PREFIXES
+        .iter()
+        .find(|(_, prefixes)| prefixes.contains(&prefix))
+        .map(|(cat, _)| *cat)
+}
+
 fn normalize_generated_signal_descriptors(
     mut out: Vec<crate::types::SignalDescriptor>,
 ) -> Result<Vec<crate::types::SignalDescriptor>, String> {
@@ -188,6 +228,47 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for s in all {
             assert!(seen.insert((s.category, s.name)));
+        }
+    }
+
+    #[test]
+    fn test_every_kline_signal_has_exactly_one_category() {
+        let all = list_all_signals(true, false);
+        assert!(all.len() > 200);
+        for s in all.iter().filter(|s| !s.name.starts_with("__")) {
+            let hits: Vec<&str> = super::KLINE_CATEGORY_PREFIXES
+                .iter()
+                .filter(|(_, prefixes)| {
+                    prefixes.contains(&s.name.split('_').next().unwrap_or_default())
+                })
+                .map(|(cat, _)| *cat)
+                .collect();
+            assert_eq!(hits.len(), 1, "信号 {} 归属分类应唯一: {:?}", s.name, hits);
+            assert_eq!(super::kline_category_of(&s.name), Some(hits[0]));
+        }
+        assert_eq!(
+            super::kline_category_of("amv_up_dw_line_V230603"),
+            Some("ang")
+        );
+        assert_eq!(super::kline_category_of("cci_x_V1"), Some("tas"));
+        assert_eq!(super::kline_category_of("obvm_line_V230610"), Some("obv"));
+    }
+
+    #[test]
+    fn test_strength_signals_registered() {
+        for name in [
+            "strength_fx_V260601",
+            "strength_bi_div_V260601",
+            "strength_zs_revert_V260601",
+            "strength_zs_break_V260601",
+            "strength_flow_V260601",
+            "strength_squeeze_V260601",
+        ] {
+            assert!(
+                super::SIGNAL_REGISTRY.contains_key(name),
+                "missing kline signal registration: {name}"
+            );
+            assert_eq!(super::kline_category_of(name), Some("strength"));
         }
     }
 

@@ -1,13 +1,18 @@
 #!/usr/bin/env python
 """
-4×5 生态位矩阵候选信号生成器与分簇定制状态机引擎
+6×5 生态位矩阵候选信号生成器与分簇定制状态机引擎
 (MAP-Elites Niche Hypothesis Bank & Archetype-Specific State Machine Engine)
 
-四大战略方向 (Archetypes) × 五级独立周期 (1d, 60m, 30m, 15m, 5m)：
-1. A_顺势突破簇 (exit_mode="trend",    适用周期: 1d, 60m, 30m, 15m, 5m)
-2. B_背驰反转簇 (exit_mode="reversal", 适用周期: 1d, 60m, 30m, 15m, 5m)
-3. C_震荡回归簇 (exit_mode="range",    适用周期: 1d, 60m, 30m, 15m, 5m)
-4. D_日内微结构簇 (exit_mode="intraday", 适用周期: 60m, 30m, 15m, 5m)
+六大正交战略簇 (Archetypes, 按底层收益生成机制 DGP 划分) × 五级独立周期 (1d, 60m, 30m, 15m, 5m)：
+1. A_趋势突破与斜率动量簇 (exit_mode="trend")     中枢脱离/通道突破/斜率加速/日内 ORB·DualThrust 顺势突破
+2. B_背驰衰竭与极值反转簇 (exit_mode="reversal")  背驰/2B 假突破/TD 九转·十三转/急杀洗盘 V 反
+3. C_中枢震荡与锚定回归簇 (exit_mode="range")     对称中枢/BOLL·KC 箱体/日内 VWAP 锚定均值回归
+4. D_量价微结构与筹码冲击簇 (连续强度因子, 见 examples/multi_factor_cta/atomic_factors.py)
+5. E_波动率压缩与分形弹性簇 (连续强度因子, 同上)
+6. F_多周期共振与截面强弱簇 (连续强度因子, 同上; 预留跨品种截面接口, 兼容 Issue #6)
+
+“日内/隔夜”属于交易制度 (由 ExecutionMode 与周期纵轴控制)，不再作为战略簇横轴；
+原 D_日内微结构簇已按其实质机制拆入 A/B/C，见 `LEGACY_ARCHETYPE_ALIAS` / `migrate_archetype`。
 """
 
 from __future__ import annotations
@@ -17,6 +22,25 @@ from datetime import time
 
 import numpy as np
 import pandas as pd
+
+import czsc
+
+ARCH_A = "A_趋势突破与斜率动量簇"
+ARCH_B = "B_背驰衰竭与极值反转簇"
+ARCH_C = "C_中枢震荡与锚定回归簇"
+ARCH_D = "D_量价微结构与筹码冲击簇"
+ARCH_E = "E_波动率压缩与分形弹性簇"
+ARCH_F = "F_多周期共振与截面强弱簇"
+ALL_ARCHETYPES: tuple[str, ...] = (ARCH_A, ARCH_B, ARCH_C, ARCH_D, ARCH_E, ARCH_F)
+
+# 旧四簇名 -> 新簇名。旧 D_日内微结构簇 无法一对一映射 (其成员按机制拆入 A/B/C)，
+# 需要借助 sig_id 查表，见 `migrate_archetype`。
+LEGACY_ARCHETYPE_ALIAS: dict[str, str] = {
+    "A_顺势突破簇": ARCH_A,
+    "B_背驰反转簇": ARCH_B,
+    "C_震荡回归簇": ARCH_C,
+}
+LEGACY_INTRADAY_ARCHETYPE = "D_日内微结构簇"
 
 
 @dataclass(frozen=True)
@@ -35,8 +59,8 @@ class ArchetypeRuler:
 
 
 ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
-    "A_顺势突破簇": ArchetypeRuler(
-        archetype="A_顺势突破簇",
+    ARCH_A: ArchetypeRuler(
+        archetype=ARCH_A,
         ruler_name="趋势标尺 (+2.2*ATR止盈 / -1.1*ATR止损 / 16根)",
         tp_atr=2.20,
         sl_atr=1.10,
@@ -44,10 +68,10 @@ ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
         min_alpha_bp=12.0,
         min_safety_pct=4.5,
         max_boot_pval=0.20,
-        quota_max_units=7,  # 基石已有5个突破信号，限制新增突破信号配额 <= 7 个 (含 5m 级别突破)
+        quota_max_units=10,  # 基石 5 个 + 接管原 D 簇 ORB/DualThrust/RBreaker 顺势突破信号
     ),
-    "B_背驰反转簇": ArchetypeRuler(
-        archetype="B_背驰反转簇",
+    ARCH_B: ArchetypeRuler(
+        archetype=ARCH_B,
         ruler_name="反转标尺 (+1.35*ATR止盈 / -0.95*ATR止损 / 8根快进快出)",
         tp_atr=1.35,
         sl_atr=0.95,
@@ -55,10 +79,10 @@ ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
         min_alpha_bp=8.0,
         min_safety_pct=3.5,
         max_boot_pval=0.22,
-        quota_max_units=9,
+        quota_max_units=12,  # 接管原 D 簇洗盘 V 反与 TD 序列衰竭反转
     ),
-    "C_震荡回归簇": ArchetypeRuler(
-        archetype="C_震荡回归簇",
+    ARCH_C: ArchetypeRuler(
+        archetype=ARCH_C,
         ruler_name="回归标尺 (+1.15*ATR止盈 / -0.85*ATR止损 / 6根均值回归)",
         tp_atr=1.15,
         sl_atr=0.85,
@@ -66,18 +90,40 @@ ARCHETYPE_RULERS: dict[str, ArchetypeRuler] = {
         min_alpha_bp=6.0,
         min_safety_pct=3.0,
         max_boot_pval=0.24,
-        quota_max_units=7,
+        quota_max_units=9,  # 接管原 D 簇日内 VWAP 锚定回归
     ),
-    "D_日内微结构簇": ArchetypeRuler(
-        archetype="D_日内微结构簇",
-        ruler_name="日内标尺 (+1.25*ATR止盈 / -0.85*ATR止损 / 6根日内脉冲)",
-        tp_atr=1.25,
-        sl_atr=0.85,
-        max_bars=6,
-        min_alpha_bp=7.0,
-        min_safety_pct=3.0,
-        max_boot_pval=0.24,
+    ARCH_D: ArchetypeRuler(
+        archetype=ARCH_D,
+        ruler_name="量价标尺 (+1.6*ATR止盈 / -1.0*ATR止损 / 10根资金流延续)",
+        tp_atr=1.60,
+        sl_atr=1.00,
+        max_bars=10,
+        min_alpha_bp=8.0,
+        min_safety_pct=3.5,
+        max_boot_pval=0.22,
         quota_max_units=8,
+    ),
+    ARCH_E: ArchetypeRuler(
+        archetype=ARCH_E,
+        ruler_name="波动率扩张标尺 (+2.0*ATR止盈 / -1.0*ATR止损 / 12根压缩点火)",
+        tp_atr=2.00,
+        sl_atr=1.00,
+        max_bars=12,
+        min_alpha_bp=10.0,
+        min_safety_pct=4.0,
+        max_boot_pval=0.22,
+        quota_max_units=8,
+    ),
+    ARCH_F: ArchetypeRuler(
+        archetype=ARCH_F,
+        ruler_name="共振标尺 (+1.8*ATR止盈 / -1.0*ATR止损 / 12根大级别锚定)",
+        tp_atr=1.80,
+        sl_atr=1.00,
+        max_bars=12,
+        min_alpha_bp=8.0,
+        min_safety_pct=3.5,
+        max_boot_pval=0.22,
+        quota_max_units=6,
     ),
 }
 
@@ -90,7 +136,7 @@ class SignalSpec:
     direction: int  # 1 = 多, -1 = 空
     default_weight: float
     eligible_tfs: tuple[str, ...]
-    exit_mode: str  # "trend" | "reversal" | "range" | "intraday"
+    exit_mode: str  # "trend" | "reversal" | "range" | "continuous" (连续强度因子，见 atomic_factors.py)
     is_base_seed: bool = False
 
 
@@ -98,194 +144,485 @@ class SignalSpec:
 # 1. 基石真金信号 (5个) + 四大战略方向候选池 (Round 1 + Round 2 + Round 3 + Round 4 + Round 5 TD序列)
 # ---------------------------------------------------------------------------
 BASE_SEED_SIGNALS: list[SignalSpec] = [
-    SignalSpec("S1L", "S1L_中枢三买确认", "A_顺势突破簇", 1, 0.40, ("1d", "60m", "30m"), "trend", is_base_seed=True),
-    SignalSpec("S1S", "S1S_中枢三卖确认", "A_顺势突破簇", -1, 0.50, ("1d", "60m", "30m"), "trend", is_base_seed=True),
     SignalSpec(
-        "S2L", "S2L_均线粘合一阳穿线", "A_顺势突破簇", 1, 0.35, ("1d", "60m", "30m"), "trend", is_base_seed=True
+        "S1L", "S1L_中枢三买确认", "A_趋势突破与斜率动量簇", 1, 0.40, ("1d", "60m", "30m"), "trend", is_base_seed=True
     ),
-    SignalSpec("S3L", "S3L_内孕线放量突破", "A_顺势突破簇", 1, 0.30, ("1d", "60m", "30m"), "trend", is_base_seed=True),
     SignalSpec(
-        "S4S", "S4S_VCP压缩空头爆发", "A_顺势突破簇", -1, 0.50, ("1d", "60m", "30m"), "trend", is_base_seed=True
+        "S1S", "S1S_中枢三卖确认", "A_趋势突破与斜率动量簇", -1, 0.50, ("1d", "60m", "30m"), "trend", is_base_seed=True
+    ),
+    SignalSpec(
+        "S2L",
+        "S2L_均线粘合一阳穿线",
+        "A_趋势突破与斜率动量簇",
+        1,
+        0.35,
+        ("1d", "60m", "30m"),
+        "trend",
+        is_base_seed=True,
+    ),
+    SignalSpec(
+        "S3L", "S3L_内孕线放量突破", "A_趋势突破与斜率动量簇", 1, 0.30, ("1d", "60m", "30m"), "trend", is_base_seed=True
+    ),
+    SignalSpec(
+        "S4S",
+        "S4S_VCP压缩空头爆发",
+        "A_趋势突破与斜率动量簇",
+        -1,
+        0.50,
+        ("1d", "60m", "30m"),
+        "trend",
+        is_base_seed=True,
     ),
 ]
 
 CANDIDATE_HYPOTHESIS_POOL: list[SignalSpec] = [
     # === 方向 B：背驰反转簇 (Round 1 候选, 适用 60m / 30m / 15m) ===
-    SignalSpec("B01L", "B01L_MACD底背驰放量反包", "B_背驰反转簇", 1, 0.28, ("60m", "30m", "15m"), "reversal"),
-    SignalSpec("B01S", "B01S_MACD顶背驰放量反杀", "B_背驰反转簇", -1, 0.28, ("60m", "30m", "15m"), "reversal"),
-    SignalSpec("B02L", "B02L_恐慌长下影锤子确认反转", "B_背驰反转簇", 1, 0.26, ("60m", "30m", "15m"), "reversal"),
-    SignalSpec("B02S", "B02S_亢奋长上影流星确认反杀", "B_背驰反转簇", -1, 0.26, ("60m", "30m", "15m"), "reversal"),
-    SignalSpec("B03L", "B03L_超跌底分型停顿放量反抽", "B_背驰反转簇", 1, 0.26, ("60m", "30m", "15m"), "reversal"),
-    SignalSpec("B03S", "B03S_超涨顶分型停顿放量回落", "B_背驰反转簇", -1, 0.26, ("60m", "30m", "15m"), "reversal"),
+    SignalSpec("B01L", "B01L_MACD底背驰放量反包", "B_背驰衰竭与极值反转簇", 1, 0.28, ("60m", "30m", "15m"), "reversal"),
+    SignalSpec(
+        "B01S", "B01S_MACD顶背驰放量反杀", "B_背驰衰竭与极值反转簇", -1, 0.28, ("60m", "30m", "15m"), "reversal"
+    ),
+    SignalSpec(
+        "B02L", "B02L_恐慌长下影锤子确认反转", "B_背驰衰竭与极值反转簇", 1, 0.26, ("60m", "30m", "15m"), "reversal"
+    ),
+    SignalSpec(
+        "B02S", "B02S_亢奋长上影流星确认反杀", "B_背驰衰竭与极值反转簇", -1, 0.26, ("60m", "30m", "15m"), "reversal"
+    ),
+    SignalSpec(
+        "B03L", "B03L_超跌底分型停顿放量反抽", "B_背驰衰竭与极值反转簇", 1, 0.26, ("60m", "30m", "15m"), "reversal"
+    ),
+    SignalSpec(
+        "B03S", "B03S_超涨顶分型停顿放量回落", "B_背驰衰竭与极值反转簇", -1, 0.26, ("60m", "30m", "15m"), "reversal"
+    ),
     # === 方向 C：震荡回归簇 (Round 1 候选, 适用 60m / 30m / 15m) ===
-    SignalSpec("C01L", "C01L_震荡市布林下轨2B收回", "C_震荡回归簇", 1, 0.26, ("60m", "30m", "15m"), "range"),
-    SignalSpec("C01S", "C01S_震荡市布林上轨2B跌回", "C_震荡回归簇", -1, 0.26, ("60m", "30m", "15m"), "range"),
-    SignalSpec("C02L", "C02L_宽幅箱体RSI超卖勾头反包", "C_震荡回归簇", 1, 0.26, ("60m", "30m", "15m"), "range"),
-    SignalSpec("C02S", "C02S_宽幅箱体RSI超买勾头反杀", "C_震荡回归簇", -1, 0.26, ("60m", "30m", "15m"), "range"),
-    SignalSpec("C03L", "C03L_Keltner下轨企稳回归中轨", "C_震荡回归簇", 1, 0.26, ("60m", "30m", "15m"), "range"),
-    SignalSpec("C03S", "C03S_Keltner上轨受阻回归中轨", "C_震荡回归簇", -1, 0.26, ("60m", "30m", "15m"), "range"),
+    SignalSpec("C01L", "C01L_震荡市布林下轨2B收回", "C_中枢震荡与锚定回归簇", 1, 0.26, ("60m", "30m", "15m"), "range"),
+    SignalSpec("C01S", "C01S_震荡市布林上轨2B跌回", "C_中枢震荡与锚定回归簇", -1, 0.26, ("60m", "30m", "15m"), "range"),
+    SignalSpec(
+        "C02L", "C02L_宽幅箱体RSI超卖勾头反包", "C_中枢震荡与锚定回归簇", 1, 0.26, ("60m", "30m", "15m"), "range"
+    ),
+    SignalSpec(
+        "C02S", "C02S_宽幅箱体RSI超买勾头反杀", "C_中枢震荡与锚定回归簇", -1, 0.26, ("60m", "30m", "15m"), "range"
+    ),
+    SignalSpec(
+        "C03L", "C03L_Keltner下轨企稳回归中轨", "C_中枢震荡与锚定回归簇", 1, 0.26, ("60m", "30m", "15m"), "range"
+    ),
+    SignalSpec(
+        "C03S", "C03S_Keltner上轨受阻回归中轨", "C_中枢震荡与锚定回归簇", -1, 0.26, ("60m", "30m", "15m"), "range"
+    ),
     # === 方向 D：日内分时微结构簇 (Round 1 候选, 适用 15m / 30m) ===
-    SignalSpec("D01L", "D01L_早盘ORB首区放量上破", "D_日内微结构簇", 1, 0.26, ("15m", "30m"), "intraday"),
-    SignalSpec("D01S", "D01S_早盘ORB首区放量下破", "D_日内微结构簇", -1, 0.26, ("15m", "30m"), "intraday"),
-    SignalSpec("D02L", "D02L_日内VWAP回踩不破阳包", "D_日内微结构簇", 1, 0.26, ("15m", "30m"), "intraday"),
-    SignalSpec("D02S", "D02S_日内VWAP反抽受阻阴杀", "D_日内微结构簇", -1, 0.26, ("15m", "30m"), "intraday"),
-    SignalSpec("D03L", "D03L_午盘异动放量突破早盘高点", "D_日内微结构簇", 1, 0.26, ("15m", "30m"), "intraday"),
-    SignalSpec("D03S", "D03S_午盘异动放量跌破早盘低点", "D_日内微结构簇", -1, 0.26, ("15m", "30m"), "intraday"),
+    SignalSpec("D01L", "D01L_早盘ORB首区放量上破", "A_趋势突破与斜率动量簇", 1, 0.26, ("15m", "30m"), "trend"),
+    SignalSpec("D01S", "D01S_早盘ORB首区放量下破", "A_趋势突破与斜率动量簇", -1, 0.26, ("15m", "30m"), "trend"),
+    SignalSpec("D02L", "D02L_日内VWAP回踩不破阳包", "C_中枢震荡与锚定回归簇", 1, 0.26, ("15m", "30m"), "range"),
+    SignalSpec("D02S", "D02S_日内VWAP反抽受阻阴杀", "C_中枢震荡与锚定回归簇", -1, 0.26, ("15m", "30m"), "range"),
+    SignalSpec("D03L", "D03L_午盘异动放量突破早盘高点", "A_趋势突破与斜率动量簇", 1, 0.26, ("15m", "30m"), "trend"),
+    SignalSpec("D03S", "D03S_午盘异动放量跌破早盘低点", "A_趋势突破与斜率动量簇", -1, 0.26, ("15m", "30m"), "trend"),
     # === 方向 A：顺势突破簇补充候选 (适用 1d / 60m / 30m) ===
-    SignalSpec("A01L", "A01L_OBV能量潮领先新高突破", "A_顺势突破簇", 1, 0.28, ("1d", "60m", "30m"), "trend"),
-    SignalSpec("A01S", "A01S_OBV能量潮领先新低破位", "A_顺势突破簇", -1, 0.28, ("1d", "60m", "30m"), "trend"),
-    SignalSpec("A02L", "A02L_Keltner挤压向上点火", "A_顺势突破簇", 1, 0.30, ("1d", "60m", "30m"), "trend"),
-    SignalSpec("A02S", "A02S_Keltner挤压向下破位", "A_顺势突破簇", -1, 0.32, ("1d", "60m", "30m"), "trend"),
-    SignalSpec("A03L", "A03L_缩量星线后放量长阳破局", "A_顺势突破簇", 1, 0.28, ("1d", "60m", "30m"), "trend"),
-    SignalSpec("A03S", "A03S_缩量星线后放量长阴破位", "A_顺势突破簇", -1, 0.30, ("1d", "60m", "30m"), "trend"),
-    SignalSpec("A04L", "A04L_宽幅期唐奇安10期放量突破", "A_顺势突破簇", 1, 0.30, ("1d", "60m", "30m"), "trend"),
-    SignalSpec("A04S", "A04S_宽幅期唐奇安10期放量破位", "A_顺势突破簇", -1, 0.30, ("1d", "60m", "30m"), "trend"),
+    SignalSpec(
+        "A01L", "A01L_OBV能量潮领先新高突破", "D_量价微结构与筹码冲击簇", 1, 0.28, ("1d", "60m", "30m"), "trend"
+    ),
+    SignalSpec(
+        "A01S", "A01S_OBV能量潮领先新低破位", "D_量价微结构与筹码冲击簇", -1, 0.28, ("1d", "60m", "30m"), "trend"
+    ),
+    SignalSpec("A02L", "A02L_Keltner挤压向上点火", "E_波动率压缩与分形弹性簇", 1, 0.30, ("1d", "60m", "30m"), "trend"),
+    SignalSpec("A02S", "A02S_Keltner挤压向下破位", "E_波动率压缩与分形弹性簇", -1, 0.32, ("1d", "60m", "30m"), "trend"),
+    SignalSpec(
+        "A03L", "A03L_缩量星线后放量长阳破局", "E_波动率压缩与分形弹性簇", 1, 0.28, ("1d", "60m", "30m"), "trend"
+    ),
+    SignalSpec(
+        "A03S", "A03S_缩量星线后放量长阴破位", "E_波动率压缩与分形弹性簇", -1, 0.30, ("1d", "60m", "30m"), "trend"
+    ),
+    SignalSpec(
+        "A04L", "A04L_宽幅期唐奇安10期放量突破", "A_趋势突破与斜率动量簇", 1, 0.30, ("1d", "60m", "30m"), "trend"
+    ),
+    SignalSpec(
+        "A04S", "A04S_宽幅期唐奇安10期放量破位", "A_趋势突破与斜率动量簇", -1, 0.30, ("1d", "60m", "30m"), "trend"
+    ),
     # =========================================================================
     # === Round 2 二期定向深挖候选池 (聚焦 B/C/D 空白生态位与空头反转/震荡回归/日内共振) ===
     # =========================================================================
     # --- Round 2 方向 B：双底/双顶结构与假突破 2B 反转 (覆盖 1d / 60m / 30m / 15m) ---
     SignalSpec(
-        "B04L", "B04L_W双底缩量二次回踩不破反包", "B_背驰反转簇", 1, 0.26, ("1d", "60m", "30m", "15m"), "reversal"
+        "B04L",
+        "B04L_W双底缩量二次回踩不破反包",
+        "B_背驰衰竭与极值反转簇",
+        1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "reversal",
     ),
     SignalSpec(
-        "B04S", "B04S_M双顶二次冲高受阻放量反杀", "B_背驰反转簇", -1, 0.26, ("1d", "60m", "30m", "15m"), "reversal"
+        "B04S",
+        "B04S_M双顶二次冲高受阻放量反杀",
+        "B_背驰衰竭与极值反转簇",
+        -1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "reversal",
     ),
     SignalSpec(
-        "B05L", "B05L_极度超跌三连阴缩量止跌阳包", "B_背驰反转簇", 1, 0.26, ("1d", "60m", "30m", "15m"), "reversal"
+        "B05L",
+        "B05L_极度超跌三连阴缩量止跌阳包",
+        "B_背驰衰竭与极值反转簇",
+        1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "reversal",
     ),
     SignalSpec(
-        "B05S", "B05S_高位假突破2B放量阴吞没反杀", "B_背驰反转簇", -1, 0.26, ("1d", "60m", "30m", "15m"), "reversal"
+        "B05S",
+        "B05S_高位假突破2B放量阴吞没反杀",
+        "B_背驰衰竭与极值反转簇",
+        -1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "reversal",
     ),
     # --- Round 2 方向 C：箱体双针探底/受阻与通道十字星均值回归 (覆盖 1d / 60m / 30m / 15m) ---
-    SignalSpec("C04L", "C04L_箱体下沿缩量双针探底回归", "C_震荡回归簇", 1, 0.26, ("1d", "60m", "30m", "15m"), "range"),
     SignalSpec(
-        "C04S", "C04S_弱势箱体反抽Keltner上中轨受阻", "C_震荡回归簇", -1, 0.26, ("1d", "60m", "30m", "15m"), "range"
+        "C04L", "C04L_箱体下沿缩量双针探底回归", "C_中枢震荡与锚定回归簇", 1, 0.26, ("1d", "60m", "30m", "15m"), "range"
     ),
     SignalSpec(
-        "C05L", "C05L_通道下轨缩量十字星次根阳线回归", "C_震荡回归簇", 1, 0.26, ("1d", "60m", "30m", "15m"), "range"
+        "C04S",
+        "C04S_弱势箱体反抽Keltner上中轨受阻",
+        "C_中枢震荡与锚定回归簇",
+        -1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "range",
     ),
     SignalSpec(
-        "C05S", "C05S_通道上轨缩量十字星次根阴线回归", "C_震荡回归簇", -1, 0.26, ("1d", "60m", "30m", "15m"), "range"
+        "C05L",
+        "C05L_通道下轨缩量十字星次根阳线回归",
+        "C_中枢震荡与锚定回归簇",
+        1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "range",
+    ),
+    SignalSpec(
+        "C05S",
+        "C05S_通道上轨缩量十字星次根阴线回归",
+        "C_中枢震荡与锚定回归簇",
+        -1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "range",
     ),
     # --- Round 2 方向 D：日内分时洗盘 V 反、诱多跌破 VWAP 与午后企稳脉冲 (覆盖 15m / 30m / 60m) ---
     SignalSpec(
-        "D04L", "D04L_早盘急杀洗盘V型放量站回VWAP", "D_日内微结构簇", 1, 0.26, ("15m", "30m", "60m"), "intraday"
+        "D04L", "D04L_早盘急杀洗盘V型放量站回VWAP", "B_背驰衰竭与极值反转簇", 1, 0.26, ("15m", "30m", "60m"), "reversal"
     ),
-    SignalSpec("D04S", "D04S_早盘冲高诱多放量跌破VWAP", "D_日内微结构簇", -1, 0.26, ("15m", "30m", "60m"), "intraday"),
-    SignalSpec("D05L", "D05L_午后回踩VWAP缩量企稳拉升", "D_日内微结构簇", 1, 0.26, ("15m", "30m", "60m"), "intraday"),
-    SignalSpec("D05S", "D05S_午后反抽VWAP无力放量杀跌", "D_日内微结构簇", -1, 0.26, ("15m", "30m", "60m"), "intraday"),
+    SignalSpec(
+        "D04S", "D04S_早盘冲高诱多放量跌破VWAP", "B_背驰衰竭与极值反转簇", -1, 0.26, ("15m", "30m", "60m"), "reversal"
+    ),
+    SignalSpec(
+        "D05L", "D05L_午后回踩VWAP缩量企稳拉升", "C_中枢震荡与锚定回归簇", 1, 0.26, ("15m", "30m", "60m"), "range"
+    ),
+    SignalSpec(
+        "D05S", "D05S_午后反抽VWAP无力放量杀跌", "C_中枢震荡与锚定回归簇", -1, 0.26, ("15m", "30m", "60m"), "range"
+    ),
     # =========================================================================
     # === Round 3 三期原生 Rust `czsc-signals` 组合挖掘池 (直连 cxt/byi/jcc/bar/obv/vol) ===
     # =========================================================================
     # --- Round 3 方向 A：原生缠论五笔/七笔突破与三买卖辅助 + 通道/OBV/加速 (覆盖 1d / 60m / 30m / 15m) ---
     SignalSpec(
-        "CZ01L", "CZ01L_缠论五笔颈线突破放量共振", "A_顺势突破簇", 1, 0.28, ("1d", "60m", "30m", "15m"), "trend"
+        "CZ01L",
+        "CZ01L_缠论五笔颈线突破放量共振",
+        "A_趋势突破与斜率动量簇",
+        1,
+        0.28,
+        ("1d", "60m", "30m", "15m"),
+        "trend",
     ),
     SignalSpec(
-        "CZ01S", "CZ01S_缠论五笔下颈线破位通道共振", "A_顺势突破簇", -1, 0.28, ("1d", "60m", "30m", "15m"), "trend"
+        "CZ01S",
+        "CZ01S_缠论五笔下颈线破位通道共振",
+        "A_趋势突破与斜率动量簇",
+        -1,
+        0.28,
+        ("1d", "60m", "30m", "15m"),
+        "trend",
     ),
     SignalSpec(
-        "CZ02L", "CZ02L_缠论三买均线新高加速突破", "A_顺势突破簇", 1, 0.28, ("1d", "60m", "30m", "15m"), "trend"
+        "CZ02L",
+        "CZ02L_缠论三买均线新高加速突破",
+        "A_趋势突破与斜率动量簇",
+        1,
+        0.28,
+        ("1d", "60m", "30m", "15m"),
+        "trend",
     ),
     SignalSpec(
-        "CZ02S", "CZ02S_缠论三卖均线新低加速破位", "A_顺势突破簇", -1, 0.28, ("1d", "60m", "30m", "15m"), "trend"
+        "CZ02S",
+        "CZ02S_缠论三卖均线新低加速破位",
+        "A_趋势突破与斜率动量簇",
+        -1,
+        0.28,
+        ("1d", "60m", "30m", "15m"),
+        "trend",
     ),
     # --- Round 3 方向 B：原生缠论一二买卖/双中枢背驰 + 分型停顿/验证分型/吞没 (覆盖 1d / 60m / 30m / 15m) ---
     SignalSpec(
-        "CZ03L", "CZ03L_缠论一买双中枢底背驰停顿反转", "B_背驰反转簇", 1, 0.26, ("1d", "60m", "30m", "15m"), "reversal"
+        "CZ03L",
+        "CZ03L_缠论一买双中枢底背驰停顿反转",
+        "B_背驰衰竭与极值反转簇",
+        1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "reversal",
     ),
     SignalSpec(
-        "CZ03S", "CZ03S_缠论一卖双中枢顶背驰停顿反杀", "B_背驰反转簇", -1, 0.26, ("1d", "60m", "30m", "15m"), "reversal"
+        "CZ03S",
+        "CZ03S_缠论一卖双中枢顶背驰停顿反杀",
+        "B_背驰衰竭与极值反转簇",
+        -1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "reversal",
     ),
     SignalSpec(
-        "CZ04L", "CZ04L_缠论二买MACD回抽零轴锤子确认", "B_背驰反转簇", 1, 0.26, ("1d", "60m", "30m", "15m"), "reversal"
+        "CZ04L",
+        "CZ04L_缠论二买MACD回抽零轴锤子确认",
+        "B_背驰衰竭与极值反转簇",
+        1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "reversal",
     ),
     SignalSpec(
-        "CZ04S", "CZ04S_缠论二卖MACD回抽零轴上吊反杀", "B_背驰反转簇", -1, 0.26, ("1d", "60m", "30m", "15m"), "reversal"
+        "CZ04S",
+        "CZ04S_缠论二卖MACD回抽零轴上吊反杀",
+        "B_背驰衰竭与极值反转簇",
+        -1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "reversal",
     ),
     # --- Round 3 方向 C：原生对称中枢 + 假突破/神奇九转 TD9 + 酒田战法分型强弱 (覆盖 1d / 60m / 30m / 15m) ---
     SignalSpec(
-        "CZ05L", "CZ05L_对称中枢假突破九转买点回归", "C_震荡回归簇", 1, 0.26, ("1d", "60m", "30m", "15m"), "range"
+        "CZ05L",
+        "CZ05L_对称中枢假突破九转买点回归",
+        "C_中枢震荡与锚定回归簇",
+        1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "range",
     ),
     SignalSpec(
-        "CZ05S", "CZ05S_对称中枢假突破九转卖点回归", "C_震荡回归簇", -1, 0.26, ("1d", "60m", "30m", "15m"), "range"
+        "CZ05S",
+        "CZ05S_对称中枢假突破九转卖点回归",
+        "C_中枢震荡与锚定回归簇",
+        -1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "range",
     ),
     SignalSpec(
-        "CZ06L", "CZ06L_酒田锤子刺透强底分型缩量回归", "C_震荡回归簇", 1, 0.26, ("1d", "60m", "30m", "15m"), "range"
+        "CZ06L",
+        "CZ06L_酒田锤子刺透强底分型缩量回归",
+        "C_中枢震荡与锚定回归簇",
+        1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "range",
     ),
     SignalSpec(
-        "CZ06S", "CZ06S_酒田乌云三鸦强顶分型受阻回归", "C_震荡回归簇", -1, 0.26, ("1d", "60m", "30m", "15m"), "range"
+        "CZ06S",
+        "CZ06S_酒田乌云三鸦强顶分型受阻回归",
+        "C_中枢震荡与锚定回归簇",
+        -1,
+        0.26,
+        ("1d", "60m", "30m", "15m"),
+        "range",
     ),
     # --- Round 3 方向 D：原生 R-Breaker + 双顺中枢中线突破 + 梯量柱/黄金柱脉冲 (覆盖 15m / 30m / 60m) ---
     SignalSpec(
-        "CZ07L", "CZ07L_RBreaker做多梯量黄金柱共振", "D_日内微结构簇", 1, 0.26, ("15m", "30m", "60m"), "intraday"
+        "CZ07L", "CZ07L_RBreaker做多梯量黄金柱共振", "A_趋势突破与斜率动量簇", 1, 0.26, ("15m", "30m", "60m"), "trend"
     ),
     SignalSpec(
-        "CZ07S", "CZ07S_RBreaker做空梯量高量柱反杀", "D_日内微结构簇", -1, 0.26, ("15m", "30m", "60m"), "intraday"
+        "CZ07S", "CZ07S_RBreaker做空梯量高量柱反杀", "A_趋势突破与斜率动量簇", -1, 0.26, ("15m", "30m", "60m"), "trend"
     ),
     SignalSpec(
-        "CZ08L", "CZ08L_中枢中线上破双顺通道梯量脉冲", "D_日内微结构簇", 1, 0.26, ("15m", "30m", "60m"), "intraday"
+        "CZ08L", "CZ08L_中枢中线上破双顺通道梯量脉冲", "A_趋势突破与斜率动量簇", 1, 0.26, ("15m", "30m", "60m"), "trend"
     ),
     SignalSpec(
-        "CZ08S", "CZ08S_中枢中线下破双顺通道梯量杀跌", "D_日内微结构簇", -1, 0.26, ("15m", "30m", "60m"), "intraday"
+        "CZ08S",
+        "CZ08S_中枢中线下破双顺通道梯量杀跌",
+        "A_趋势突破与斜率动量簇",
+        -1,
+        0.26,
+        ("15m", "30m", "60m"),
+        "trend",
     ),
     # =========================================================================
     # === Round 4 四期 5 分钟 (`5m`) 高频跨日锚定与日内微结构原生组合池 ===
     # =========================================================================
     SignalSpec(
-        "M501L", "M501L_5m宽幅唐奇安放量突破DualThrust共振", "A_顺势突破簇", 1, 0.26, ("5m",), "trend"
+        "M501L", "M501L_5m宽幅唐奇安放量突破DualThrust共振", "A_趋势突破与斜率动量簇", 1, 0.26, ("5m",), "trend"
     ),
     SignalSpec(
-        "M501S", "M501S_5m宽幅唐奇安放量破位DualThrust共振", "A_顺势突破簇", -1, 0.26, ("5m",), "trend"
+        "M501S", "M501S_5m宽幅唐奇安放量破位DualThrust共振", "A_趋势突破与斜率动量簇", -1, 0.26, ("5m",), "trend"
     ),
     SignalSpec(
-        "M502L", "M502L_5m跨日48根前低2B弹簧停顿吞没反转", "B_背驰反转簇", 1, 0.26, ("5m",), "reversal"
+        "M502L", "M502L_5m跨日48根前低2B弹簧停顿吞没反转", "B_背驰衰竭与极值反转簇", 1, 0.26, ("5m",), "reversal"
     ),
     SignalSpec(
-        "M502S", "M502S_5m缠论一二卖双中枢吞没停顿反杀", "B_背驰反转簇", -1, 0.26, ("5m",), "reversal"
+        "M502S", "M502S_5m缠论一二卖双中枢吞没停顿反杀", "B_背驰衰竭与极值反转簇", -1, 0.26, ("5m",), "reversal"
     ),
+    SignalSpec("M503L", "M503L_5m对称中枢回踩VWAP企稳放量回归", "C_中枢震荡与锚定回归簇", 1, 0.26, ("5m",), "range"),
     SignalSpec(
-        "M503L", "M503L_5m对称中枢回踩VWAP企稳放量回归", "C_震荡回归簇", 1, 0.26, ("5m",), "range"
+        "M503S", "M503S_5m对称中枢反抽VWAP受阻MACD背驰回归", "C_中枢震荡与锚定回归簇", -1, 0.26, ("5m",), "range"
     ),
+    SignalSpec("M504L", "M504L_5m早盘30m首区上破DualThrust脉冲", "A_趋势突破与斜率动量簇", 1, 0.26, ("5m",), "trend"),
     SignalSpec(
-        "M503S", "M503S_5m对称中枢反抽VWAP受阻MACD背驰回归", "C_震荡回归簇", -1, 0.26, ("5m",), "range"
-    ),
-    SignalSpec(
-        "M504L", "M504L_5m早盘30m首区上破DualThrust脉冲", "D_日内微结构簇", 1, 0.26, ("5m",), "intraday"
-    ),
-    SignalSpec(
-        "M504S", "M504S_5m早盘30m首区下破RBreaker共振杀跌", "D_日内微结构簇", -1, 0.26, ("5m",), "intraday"
+        "M504S", "M504S_5m早盘30m首区下破RBreaker共振杀跌", "A_趋势突破与斜率动量簇", -1, 0.26, ("5m",), "trend"
     ),
     # =========================================================================
     # === Round 5 五期项目原生 TD 序列 (Setup蓄力 + Countdown确认) 状态机策略池 ===
     # =========================================================================
     SignalSpec(
-        "TD01L", "TD01L_TD序列(4,2,3)蓄力三确认做多", "D_日内微结构簇", 1, 0.28, ("5m", "15m", "30m"), "intraday"
+        "TD01L",
+        "TD01L_TD序列(4,2,3)蓄力三确认做多",
+        "B_背驰衰竭与极值反转簇",
+        1,
+        0.28,
+        ("5m", "15m", "30m"),
+        "reversal",
     ),
     SignalSpec(
-        "TD01S", "TD01S_TD序列(4,2,3)蓄力三确认做空", "D_日内微结构簇", -1, 0.28, ("5m", "15m", "30m"), "intraday"
+        "TD01S",
+        "TD01S_TD序列(4,2,3)蓄力三确认做空",
+        "B_背驰衰竭与极值反转簇",
+        -1,
+        0.28,
+        ("5m", "15m", "30m"),
+        "reversal",
     ),
     SignalSpec(
-        "TD02L", "TD02L_TD序列(5,3,6)深度六确认做多", "B_背驰反转簇", 1, 0.28, ("5m", "15m"), "reversal"
+        "TD02L", "TD02L_TD序列(5,3,6)深度六确认做多", "B_背驰衰竭与极值反转簇", 1, 0.28, ("5m", "15m"), "reversal"
     ),
     SignalSpec(
-        "TD02S", "TD02S_TD序列(5,3,6)深度六确认做空", "B_背驰反转簇", -1, 0.28, ("5m", "15m"), "reversal"
+        "TD02S", "TD02S_TD序列(5,3,6)深度六确认做空", "B_背驰衰竭与极值反转簇", -1, 0.28, ("5m", "15m"), "reversal"
     ),
     SignalSpec(
-        "TD03L", "TD03L_跨日TD(4,2,3)波段反转做多", "B_背驰反转簇", 1, 0.28, ("60m", "30m", "15m"), "reversal"
+        "TD03L", "TD03L_跨日TD(4,2,3)波段反转做多", "B_背驰衰竭与极值反转簇", 1, 0.28, ("60m", "30m", "15m"), "reversal"
     ),
     SignalSpec(
-        "TD03S", "TD03S_跨日TD(4,2,3)波段反转做空", "B_背驰反转簇", -1, 0.28, ("60m", "30m", "15m"), "reversal"
+        "TD03S",
+        "TD03S_跨日TD(4,2,3)波段反转做空",
+        "B_背驰衰竭与极值反转簇",
+        -1,
+        0.28,
+        ("60m", "30m", "15m"),
+        "reversal",
     ),
     SignalSpec(
-        "TD04L", "TD04L_跨日TD(5,3,6)中线衰竭反转做多", "C_震荡回归簇", 1, 0.28, ("1d", "60m", "30m", "15m"), "range"
+        "TD04L",
+        "TD04L_跨日TD(5,3,6)中线衰竭反转做多",
+        "B_背驰衰竭与极值反转簇",
+        1,
+        0.28,
+        ("1d", "60m", "30m", "15m"),
+        "reversal",
     ),
     SignalSpec(
-        "TD04S", "TD04S_跨日TD(5,3,6)中线衰竭反转做空", "C_震荡回归簇", -1, 0.28, ("1d", "60m", "30m", "15m"), "range"
+        "TD04S",
+        "TD04S_跨日TD(5,3,6)中线衰竭反转做空",
+        "B_背驰衰竭与极值反转簇",
+        -1,
+        0.28,
+        ("1d", "60m", "30m", "15m"),
+        "reversal",
     ),
 ]
 
+# ---------------------------------------------------------------------------
+# Round 6 (Issue #3)：六簇连续强度原子因子 S = d · Q · D ∈ [-1, 1]
+# Q 来自 Rust `strength_*` 信号的 Signal.score/100，D 为动态结构衰减机；实现见
+# examples/multi_factor_cta/atomic_factors.py (这里只登记元数据，避免循环导入；单测保证两处一致)。
+# ---------------------------------------------------------------------------
+_TFS_ALL = ("1d", "60m", "30m", "15m", "5m")
+_TFS_RESONANCE = ("60m", "30m", "15m", "5m")
+_ATOMIC_SPEC_ROWS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
+    ("AC01", "三买卖中枢脱离安全边际突破确认", ARCH_A, _TFS_ALL),
+    ("AC02", "均线斜率动量唐奇安突破", ARCH_A, _TFS_ALL),
+    ("BC01", "笔背驰衰竭分型确认", ARCH_B, _TFS_ALL),
+    ("BC02", "TD九转极值2B假突破", ARCH_B, _TFS_ALL),
+    ("CC01", "中枢偏离回归", ARCH_C, _TFS_ALL),
+    ("CC02", "KC轨道刺破收回", ARCH_C, _TFS_ALL),
+    ("DC01", "量价资金流CLV共振", ARCH_D, _TFS_ALL),
+    ("DC02", "NTMDK-KCATR多空共振放量突破", ARCH_D, _TFS_ALL),
+    ("EC01", "挤压后波动率扩张点火", ARCH_E, _TFS_ALL),
+    ("EC02", "NR7窄幅突破", ARCH_E, _TFS_ALL),
+    ("FC01", "大级别结构锚定小级别分型扳机", ARCH_F, _TFS_RESONANCE),
+)
+ATOMIC_EXIT_MODE = "continuous"
+CANDIDATE_HYPOTHESIS_POOL += [
+    SignalSpec(
+        f"{fam}{'L' if direction > 0 else 'S'}",
+        f"{fam}{'L' if direction > 0 else 'S'}_{name}{'做多' if direction > 0 else '做空'}",
+        arch,
+        direction,
+        0.26,
+        tfs,
+        ATOMIC_EXIT_MODE,
+    )
+    for fam, name, arch, tfs in _ATOMIC_SPEC_ROWS
+    for direction in (1, -1)
+]
+
 ALL_SIGNAL_SPECS: dict[str, SignalSpec] = {s.sig_id: s for s in (BASE_SEED_SIGNALS + CANDIDATE_HYPOTHESIS_POOL)}
+
+# 6 簇重构中发生簇迁移的信号 -> 其旧 (4 簇时代) 战略簇名；未列出的信号仅是同簇改名 (见 LEGACY_ARCHETYPE_ALIAS)。
+LEGACY_ARCHETYPE_BY_SIG: dict[str, str] = {
+    # 原 A_顺势突破簇 候选：OBV 领先 -> D，Keltner 挤压 / 缩量星线放量 -> E
+    **dict.fromkeys(("A01L", "A01S", "A02L", "A02S", "A03L", "A03S"), "A_顺势突破簇"),
+    # 原 C_震荡回归簇：TD(5,3,6) 中线衰竭反转 -> B
+    **dict.fromkeys(("TD04L", "TD04S"), "C_震荡回归簇"),
+    # 原 D_日内微结构簇：按收益生成机制拆入 A (顺势突破) / B (洗盘 V 反, TD 衰竭) / C (VWAP 锚定回归)
+    **dict.fromkeys(
+        (
+            "D01L",
+            "D01S",
+            "D02L",
+            "D02S",
+            "D03L",
+            "D03S",
+            "D04L",
+            "D04S",
+            "D05L",
+            "D05S",
+            "CZ07L",
+            "CZ07S",
+            "CZ08L",
+            "CZ08S",
+            "M504L",
+            "M504S",
+            "TD01L",
+            "TD01S",
+        ),
+        LEGACY_INTRADAY_ARCHETYPE,
+    ),
+}
+
+
+def migrate_archetype(name: str, sig_id: str | None = None) -> str:
+    """
+    将历史账本 / 冠军名册里的旧四簇名归一为 6 簇新名。
+
+    - 已是新名则原样返回；
+    - 提供 ``sig_id`` 且在注册表中时，以注册表现状为准 (原 D_日内微结构簇 与部分 A/C 候选已按机制迁移)；
+    - 否则旧 A/B/C 名走 `LEGACY_ARCHETYPE_ALIAS`；旧 D_日内微结构簇 缺少 sig_id 无法判定，抛 ``ValueError``。
+    """
+    if name in ALL_ARCHETYPES:
+        return name
+    if sig_id is not None and sig_id in ALL_SIGNAL_SPECS:
+        return ALL_SIGNAL_SPECS[sig_id].archetype
+    if name in LEGACY_ARCHETYPE_ALIAS:
+        return LEGACY_ARCHETYPE_ALIAS[name]
+    if name == LEGACY_INTRADAY_ARCHETYPE:
+        raise ValueError(f"旧 {name} 已拆入 A/B/C，必须提供 sig_id 才能迁移 (sig_id={sig_id!r})")
+    raise ValueError(f"未知战略簇名称: {name}")
+
 
 TF_SCALE_MAP: dict[str, float] = {
     "1d": 1.00,
@@ -299,16 +636,21 @@ TF_SCALE_MAP: dict[str, float] = {
 # ---------------------------------------------------------------------------
 # 2. 统一多维技术与微观结构特征预计算
 # ---------------------------------------------------------------------------
+def rust_sma(s: pd.Series, n: int) -> pd.Series:
+    """Rust 原生简单均线 `czsc.sma`：与 `s.rolling(n).mean()` 数值一致 (前 n-1 个为 NaN)，由 Rust 算子计算。"""
+    return pd.Series(czsc.sma(s.to_numpy(dtype=np.float64), n), index=s.index, dtype=np.float64)
+
+
 def enrich_kline_features(df: pd.DataFrame, scale: float = 1.0) -> pd.DataFrame:
     df = df.copy()
     df["pct_chg"] = df["close"].pct_change().fillna(0.0)
-    df["ma5"] = df["close"].rolling(5).mean()
-    df["ma10"] = df["close"].rolling(10).mean()
-    df["ma20"] = df["close"].rolling(20).mean()
-    df["ma30"] = df["close"].rolling(30).mean()
-    df["ma60"] = df["close"].rolling(60).mean()
+    df["ma5"] = rust_sma(df["close"], 5)
+    df["ma10"] = rust_sma(df["close"], 10)
+    df["ma20"] = rust_sma(df["close"], 20)
+    df["ma30"] = rust_sma(df["close"], 30)
+    df["ma60"] = rust_sma(df["close"], 60)
     df["ma60_slope"] = (df["ma60"] / df["ma60"].shift(5) - 1.0).abs()
-    df["vol_ma20"] = df["volume"].rolling(20).mean()
+    df["vol_ma20"] = rust_sma(df["volume"], 20)
     df["total_range"] = df["high"] - df["low"] + 1e-6
     df["body"] = (df["close"] - df["open"]).abs()
     df["upper_shadow"] = df["high"] - df[["open", "close"]].max(axis=1)
@@ -332,7 +674,7 @@ def enrich_kline_features(df: pd.DataFrame, scale: float = 1.0) -> pd.DataFrame:
     tr2 = (df["high"] - df["close"].shift(1)).abs()
     tr3 = (df["low"] - df["close"].shift(1)).abs()
     df["tr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df["atr14"] = df["tr"].rolling(14).mean()
+    df["atr14"] = rust_sma(df["tr"], 14)
     df["atr_rank_60"] = df["atr14"].rolling(60).apply(lambda s: pd.Series(s).rank(pct=True).iloc[-1], raw=False)
 
     # 滚动 20 期箱体
@@ -387,14 +729,92 @@ def enrich_kline_features(df: pd.DataFrame, scale: float = 1.0) -> pd.DataFrame:
     return df
 
 
-def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir) -> pd.DataFrame:
+STRENGTH_SIGNAL_KINDS: dict[str, str] = {
+    # kind -> 信号 k3 段 (Rust `strength_*_V260601` 的模板尾段，用于在挂载后的列名里定位)
+    "fx": "FX强度V260601",
+    "bi_div": "笔背驰强度V260601",
+    "zs_revert": "中枢回归强度V260601",
+    "zs_break": "中枢脱离强度V260601",
+    "flow": "资金流强度V260601",
+    "squeeze": "压缩扩张强度V260601",
+}
+
+# Issue #3：此前闲置的高价值 Rust 原生算子 (参数均经 `get_signal_template` + 实测校验)。
+# 注：amv_up_dw_line / tas_slope 在 mock 与多组参数下恒为"其他"，暂不挂载，避免产生全常数噪声列。
+_EXTENDED_NATIVE_SIGNALS: tuple[dict, ...] = (
+    # tas: 均线 / 布林 / RSI / ATR 分层
+    {"name": "czsc.signals.tas_ma_base_V221203", "di": 1, "ma_type": "SMA", "timeperiod": 20, "th": 100},
+    {"name": "czsc.signals.tas_boll_power_V221112", "di": 1, "timeperiod": 20},
+    {"name": "czsc.signals.tas_rsi_base_V230227", "di": 1, "timeperiod": 14, "th": 20},
+    {"name": "czsc.signals.tas_atr_V230630", "di": 1, "timeperiod": 14},
+    # cvolp 筹码动量 / clv 收盘资金流 / ang 的 ADTM / kcatr KC 通道 / ntmdk
+    {"name": "czsc.signals.cvolp_up_dw_line_V230612", "di": 1, "n": 20, "m": 10, "up": 10, "dw": 5},
+    {"name": "czsc.signals.clv_up_dw_line_V230605", "di": 1, "n": 20},
+    {"name": "czsc.signals.adtm_up_dw_line_V230603", "di": 1, "n": 20, "m": 10, "th": 5},
+    {"name": "czsc.signals.kcatr_up_dw_line_V230823", "di": 1, "n": 20, "m": 10, "th": 1},
+    {"name": "czsc.signals.ntmdk_V230824", "di": 1, "m": 10},
+    {"name": "czsc.signals.er_up_dw_line_V230604", "di": 1, "w": 20, "n": 10},
+    # xl 相对位置 / pressure 支撑压力 / coo 原生 TD 序列与 CCI
+    {"name": "czsc.signals.xl_bar_position_V240328", "n": 20},
+    {"name": "czsc.signals.xl_bar_trend_V240329", "n": 20, "m": 5},
+    {"name": "czsc.signals.pressure_support_V240222", "di": 1, "w": 20},
+    {"name": "czsc.signals.coo_td_V221111", "di": 1},
+    {"name": "czsc.signals.coo_cci_V230323", "di": 1, "n": 14, "ma_type": "SMA", "m": 5},
+    # zdy 中枢形态 / 中枢空间
+    {"name": "czsc.signals.zdy_zs_V230423", "di": 1},
+    {"name": "czsc.signals.zdy_zs_space_V230421", "di": 1},
+    # strength: 写入 Signal.score 的结构强度信号 (Q ∈ (0, 1] -> score = round(100·Q))
+    {"name": "czsc.signals.strength_fx_V260601", "n": 14},
+    {"name": "czsc.signals.strength_bi_div_V260601", "n": 10},
+    {"name": "czsc.signals.strength_zs_revert_V260601", "k": 15},
+    {"name": "czsc.signals.strength_zs_break_V260601", "n": 10},
+    {"name": "czsc.signals.strength_flow_V260601", "n": 20, "k": 20},
+    {"name": "czsc.signals.strength_squeeze_V260601", "n": 14, "m": 60, "th": 30},
+)
+
+
+def _extended_native_signal_cfgs(freq_str: str) -> list[dict]:
+    """给扩展原生信号表注入周期，得到 `generate_czsc_signals` 的配置列表。"""
+    return [{**cfg, "freq": freq_str} for cfg in _EXTENDED_NATIVE_SIGNALS]
+
+
+def decode_strength(df: pd.DataFrame, kind: str) -> tuple[np.ndarray, np.ndarray]:
     """
-    挂载项目内置 Rust `czsc-signals` 引擎预计算的 35 个原生信号列 (cxt/byi/jcc/bar/obv/vol)，
-    并合成为四大战略方向原生信号组合触发布尔列 (`cz_trig_CZ01L` ~ `cz_trig_CZ08S` 及 5m 专属 `cz_trig_M501L` ~ `cz_trig_M504S`)。
+    把 Rust `strength_*` 信号列 (`v1_v2_v3_score`) 解码为 (方向 d ∈ {-1,0,+1}, 质量 Q ∈ [0,1])。
+
+    仅做边界解析 (宪法第一条允许的 PyO3/DataFrame 边界胶水)：方向取 v1 的 看多/看空，
+    质量取 `Signal.score / 100.0`；`其他` 或缺失 (预热期被填充为 "其他") 解码为 (0, 0)。
     """
+    k3 = STRENGTH_SIGNAL_KINDS[kind]
+    cols = [c for c in df.columns if isinstance(c, str) and c.startswith("cz_") and c.endswith(k3)]
+    if not cols:
+        n = len(df)
+        return np.zeros(n, dtype=np.int8), np.zeros(n, dtype=np.float64)
+    ser = df[cols[0]].astype(str)
+    parts = ser.str.extract(r"^(看多|看空)_[^_]*_[^_]*_(\d+)$")
+    direction = parts[0].map({"看多": 1, "看空": -1}).fillna(0).to_numpy(dtype=np.int8)
+    quality = pd.to_numeric(parts[1], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64) / 100.0
+    return direction, np.clip(quality, 0.0, 1.0)
+
+
+def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extended: bool = True) -> pd.DataFrame:
+    """
+    挂载项目内置 Rust `czsc-signals` 引擎预计算的原生信号列：基础 35 个 (cxt/byi/jcc/bar/obv/vol)，
+    `extended=True` 时再叠加此前闲置的 tas/cvolp/clv/ang/kcatr/ntmdk/xl/pressure/coo/zdy 原生算子
+    与 6 个写入 `Signal.score` 的 `strength_*` 结构强度信号 (列名前缀统一为 `cz_`)，
+    并合成为原生信号组合触发布尔列 (`cz_trig_CZ01L` ~ `cz_trig_CZ08S` 及 5m 专属 `cz_trig_M501L` ~ `cz_trig_M504S`)。
+
+    缓存文件名包含扩展配置指纹，新增/修改信号配置后不会误读旧缓存。
+    """
+    import hashlib
+    import json
     from pathlib import Path
 
-    cache_path = Path(workspace_dir) / f"native_czsc_signals_{tf}.pkl"
+    suffix = ""
+    if extended:
+        fingerprint = hashlib.md5(json.dumps(_EXTENDED_NATIVE_SIGNALS, sort_keys=True).encode("utf-8")).hexdigest()[:8]
+        suffix = f"_x{fingerprint}"
+    cache_path = Path(workspace_dir) / f"native_czsc_signals_{tf}{suffix}.pkl"
     if not cache_path.exists():
         import czsc
 
@@ -414,10 +834,28 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir) -> pd.D
             {"name": "czsc.signals.cxt_five_bi_V230619", "freq": freq_str, "di": 1},
             {"name": "czsc.signals.cxt_seven_bi_V230620", "freq": freq_str, "di": 1},
             {"name": "czsc.signals.cxt_three_bi_V230618", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.cxt_third_bs_V230319", "freq": freq_str, "di": 1, "ma_type": "SMA", "timeperiod": 20},
-            {"name": "czsc.signals.cxt_third_bs_V230318", "freq": freq_str, "di": 1, "ma_type": "SMA", "timeperiod": 20},
+            {
+                "name": "czsc.signals.cxt_third_bs_V230319",
+                "freq": freq_str,
+                "di": 1,
+                "ma_type": "SMA",
+                "timeperiod": 20,
+            },
+            {
+                "name": "czsc.signals.cxt_third_bs_V230318",
+                "freq": freq_str,
+                "di": 1,
+                "ma_type": "SMA",
+                "timeperiod": 20,
+            },
             {"name": "czsc.signals.cxt_third_buy_V230228", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.cxt_second_bs_V230320", "freq": freq_str, "di": 1, "ma_type": "SMA", "timeperiod": 20},
+            {
+                "name": "czsc.signals.cxt_second_bs_V230320",
+                "freq": freq_str,
+                "di": 1,
+                "ma_type": "SMA",
+                "timeperiod": 20,
+            },
             {"name": "czsc.signals.cxt_first_buy_V221126", "freq": freq_str, "di": 1},
             {"name": "czsc.signals.cxt_first_sell_V221126", "freq": freq_str, "di": 1},
             {"name": "czsc.signals.cxt_double_zs_V230311", "freq": freq_str, "di": 1},
@@ -438,15 +876,30 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir) -> pd.D
             {"name": "czsc.signals.jcc_three_crow_V221108", "freq": freq_str, "di": 1},
             {"name": "czsc.signals.jcc_san_fa_V20221115", "freq": freq_str, "di": 1},
             {"name": "czsc.signals.bar_fake_break_V230204", "freq": freq_str, "di": 1, "n": 10, "m": 3},
-            {"name": "czsc.signals.bar_fang_liang_break_V221216", "freq": freq_str, "di": 1, "ma_type": "SMA", "timeperiod": 20, "th": 13},
+            {
+                "name": "czsc.signals.bar_fang_liang_break_V221216",
+                "freq": freq_str,
+                "di": 1,
+                "ma_type": "SMA",
+                "timeperiod": 20,
+                "th": 13,
+            },
             {"name": "czsc.signals.bar_dual_thrust_V230403", "freq": freq_str, "di": 1, "n": 4, "k1": 5, "k2": 5},
             {"name": "czsc.signals.bar_r_breaker_V230326", "freq": freq_str, "n": 1},
             {"name": "czsc.signals.bar_td9_V240616", "freq": freq_str, "n": 9},
             {"name": "czsc.signals.bar_accelerate_V221110", "freq": freq_str, "di": 1, "window": 10},
-            {"name": "czsc.signals.obv_up_dw_line_V230719", "freq": freq_str, "di": 1, "n": 20, "m": 10, "max_overlap": 3},
+            {
+                "name": "czsc.signals.obv_up_dw_line_V230719",
+                "freq": freq_str,
+                "di": 1,
+                "n": 20,
+                "m": 10,
+                "max_overlap": 3,
+            },
             {"name": "czsc.signals.vol_ti_suo_V221216", "freq": freq_str, "di": 1},
             {"name": "czsc.signals.vol_gao_di_V221218", "freq": freq_str, "di": 1},
         ]
+        sigs_cfg += _extended_native_signal_cfgs(freq_str) if extended else []
         df_sig = czsc.generate_czsc_signals(bars, sigs_cfg, sdt="2020-01-01", init_n=20, df=True)
         rename_map = {}
         sig_cols = []
@@ -974,13 +1427,21 @@ def compute_signal_triggers_and_weights(
     scale: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    针对不同战略方向 (trend / reversal / range / intraday) 采用物理匹配的离场状态机：
+    针对 A/B/C 三类战略方向 (trend / reversal / range) 采用物理匹配的离场状态机
+    (旧 intraday 模式随 D_日内微结构簇 取消，其成员已改用目标簇离场逻辑)：
     - trend:    MA20 趋势跟踪 + 保本提损 + 3%*scale 移动止盈
     - reversal: 从偏离区向 MA20 均值回归 (触及 MA20 或盈利达 +1.35*ATR 立即止盈，或满 8 根时间平仓；5m 信号翻倍持仓根数)
     - range:    通道边界向中轨回归 (触及 MA20 或盈利达 +1.15*ATR 立即止盈，或满 6 根时间平仓；5m 信号翻倍持仓根数)
-    - intraday: 日内微结构脉冲 (盈利达 +1.25*ATR 或满 6 根平仓；5m 信号翻倍持仓根数)
+    D/E/F 三簇为连续强度因子，见 examples/multi_factor_cta/atomic_factors.py。
     - TD序列:   直连项目原生 TD(Setup+Countdown) 两阶段状态机与计数极值结构止损
     """
+    spec_atomic = ALL_SIGNAL_SPECS.get(sig_id)
+    if spec_atomic is not None and spec_atomic.exit_mode == ATOMIC_EXIT_MODE:
+        # 连续强度原子因子 (D/E/F 簇及 A/B/C 簇的 Issue #3 新增因子)：延迟导入以避免循环依赖
+        from examples.multi_factor_cta.atomic_factors import compute_atomic_signal
+
+        return compute_atomic_signal(df, sig_id, scale)
+
     if sig_id in TD_SIGNAL_PARAM_MAP:
         direction, n1, n2, n3, sl_th, daily_rst, max_hold, t_flt = TD_SIGNAL_PARAM_MAP[sig_id]
         return compute_td_triggers_and_weights(
@@ -1069,7 +1530,6 @@ def compute_signal_triggers_and_weights(
     sl_scale = 1.20 if is_5m_sig else 1.0
     rev_max_b = 16 if is_5m_sig else 8
     rng_max_b = 12 if is_5m_sig else 6
-    intra_max_b = 12 if is_5m_sig else 6
     start_bar = 240 if is_5m_sig else 60
 
     for i in range(start_bar, n):
@@ -1117,16 +1577,6 @@ def compute_signal_triggers_and_weights(
                 ):
                     pos = 0
                     exited = True
-            elif spec.exit_mode == "intraday":
-                if (
-                    stop_p is not None
-                    and l <= stop_p
-                    or h >= entry_p + 1.25 * tp_scale * atr
-                    or bars_held >= intra_max_b
-                    or (not is_5m_sig and cz_trig_arr is not None and bars_held >= 2 and c < ma20)
-                ):
-                    pos = 0
-                    exited = True
 
         elif pos == -1:
             trough_p = min(trough_p or c, l)
@@ -1161,16 +1611,6 @@ def compute_signal_triggers_and_weights(
                     or l <= entry_p - 1.15 * tp_scale * atr
                     or (not is_5m_sig and c <= ma20)
                     or bars_held >= rng_max_b
-                ):
-                    pos = 0
-                    exited = True
-            elif spec.exit_mode == "intraday":
-                if (
-                    stop_p is not None
-                    and h >= stop_p
-                    or l <= entry_p - 1.25 * tp_scale * atr
-                    or bars_held >= intra_max_b
-                    or (not is_5m_sig and cz_trig_arr is not None and bars_held >= 2 and c > ma20)
                 ):
                     pos = 0
                     exited = True

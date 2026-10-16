@@ -27,7 +27,7 @@ from examples.alpha_mining_agent.forensic_pipeline import (
     evaluate_triple_barrier,
     purge_overlapping_triggers,
 )
-from examples.alpha_mining_agent.hypothesis_bank import ARCHETYPE_RULERS, ArchetypeRuler
+from examples.alpha_mining_agent.hypothesis_bank import ARCH_A, ARCH_C, ARCHETYPE_RULERS, ArchetypeRuler
 
 # 周期自适应最小独立样本数门槛（解决日线/60m 低频高质量信号被固定高样本门槛误杀的问题）
 TF_MIN_PURGED_SAMPLES: dict[str, int] = {
@@ -365,12 +365,12 @@ class RuleFactorForensicValidator:
         trig_regimes = regimes[t_idx]
 
         # 定义该因子战略簇对应的“目标主场状态 (Home Regime)”
-        if archetype == "A_顺势突破簇":
+        if archetype == ARCH_A:
             home_mask = (trig_regimes == 1) if direction == 1 else (trig_regimes == -1)
-        elif archetype == "C_震荡回归簇":
+        elif archetype == ARCH_C:
             home_mask = trig_regimes == 0
         else:
-            # 背驰反转与日内微结构：震荡态或逆势衰竭态均为主场
+            # 背驰衰竭 / 量价筹码 / 波动率压缩 / 多周期共振：震荡态或逆势衰竭态均为主场
             home_mask = (trig_regimes == 0) | (trig_regimes == -direction)
 
         def _calc_safety(rets: np.ndarray) -> float:

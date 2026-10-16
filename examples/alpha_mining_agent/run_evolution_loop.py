@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-159915 长期自主信号挖掘与 4×5 全周期生态位矩阵进化 Agent 主循环
+159915 长期自主信号挖掘与 6×5 全周期生态位矩阵进化 Agent 主循环
 (MAP-Elites Niche Matrix + Archetype-Specific Rulers + 5-Timeframe Atomic Routing)
 
 核心特性：
@@ -38,7 +38,9 @@ from examples.alpha_mining_agent.forensic_pipeline import (
     synthesize_atomic_units_portfolio,
 )
 from examples.alpha_mining_agent.hypothesis_bank import (
+    ALL_ARCHETYPES,
     ALL_SIGNAL_SPECS,
+    ARCH_A,
     ARCHETYPE_RULERS,
     BASE_SEED_SIGNALS,
     CANDIDATE_HYPOTHESIS_POOL,
@@ -52,6 +54,7 @@ from examples.alpha_mining_agent.state_ledger import (
     AdmittedSignalRecord,
     AgentStateLedger,
 )
+from examples.multi_factor_cta.atomic_factors import link_higher_timeframes
 
 REAL_5M_CSV = Path("examples/results/159915_real_5m_2020_2026.csv")
 DASHBOARD_HTML = WORKSPACE_DIR / "autonomous_evolution_dashboard.html"
@@ -108,13 +111,15 @@ def load_all_four_timeframes(
         kdf = enrich_kline_features(kdf, scale=scale)
         return attach_native_czsc_signals(kdf, tf, workspace_dir)
 
-    return {
-        "1d": _agg(48, "1d"),
-        "60m": _agg(12, "60m"),
-        "30m": _agg(6, "30m"),
-        "15m": _agg(3, "15m"),
-        "5m": _agg(1, "5m"),
-    }
+    return link_higher_timeframes(
+        {
+            "1d": _agg(48, "1d"),
+            "60m": _agg(12, "60m"),
+            "30m": _agg(6, "30m"),
+            "15m": _agg(3, "15m"),
+            "5m": _agg(1, "5m"),
+        }
+    )
 
 
 def evaluate_full_is_oos(df_30m: pd.DataFrame, w_multi: np.ndarray) -> dict:
@@ -128,7 +133,7 @@ def evaluate_full_is_oos(df_30m: pd.DataFrame, w_multi: np.ndarray) -> dict:
 
 
 def build_niche_matrix_summary(zoo: dict[str, dict]) -> pd.DataFrame:
-    archetypes = ["A_顺势突破簇", "B_背驰反转簇", "C_震荡回归簇", "D_日内微结构簇"]
+    archetypes = list(ALL_ARCHETYPES)
     tfs = ["1d", "60m", "30m", "15m", "5m"]
     grid = {arch: {tf: [] for tf in tfs} for arch in archetypes}
 
@@ -169,12 +174,12 @@ def generate_markdown_leaderboard(ledger: AgentStateLedger, niche_df: pd.DataFra
 
     new_units = [u for u, v in zoo.items() if not v["is_base_seed"]]
     lines = [
-        "# 159915 自主信号挖掘 Agent · 4×5 全周期生态位矩阵与实时排行榜 (MAP-Elites Signal Zoo)",
+        "# 159915 自主信号挖掘 Agent · 6×5 全周期生态位矩阵与实时排行榜 (MAP-Elites Signal Zoo)",
         "",
         f"- **已入库原子信号单元总数 (`sig_id@tf`)**: `{len(zoo)}` 个（含 15 个基石种子单元 + **`{len(new_units)}` 个 Agent 跨四大战略方向与五级周期新挖正交单元**）",
         f"- **已证伪/拦截进入墓地的原子单元数**: `{len(grave)}` 个",
         "",
-        "## 一、4×5 全周期生态位矩阵分布表 (4 大战略方向 × 5 个独立周期 1d / 60m / 30m / 15m / 5m)",
+        "## 一、6×5 全周期生态位矩阵分布表 (6 大战略方向 × 5 个独立周期 1d / 60m / 30m / 15m / 5m)",
         "",
         _df_to_md_table(niche_df),
         "",
@@ -242,7 +247,7 @@ def export_evolution_dashboard(
         shared_xaxes=False,
         vertical_spacing=0.08,
         subplot_titles=(
-            "【159915 4×5全周期生态位矩阵 Agent】 进化前后五周期复合净值对比 (左侧 2020-2023 样本内 | 右侧 2024-2026 样本外盲测)",
+            "【159915 6×5全周期生态位矩阵 Agent】 进化前后五周期复合净值对比 (左侧 2020-2023 样本内 | 右侧 2024-2026 样本外盲测)",
             "动态回撤深度对比 (Drawdown %)",
             "Agent 跨四大战略方向与五级周期 (1d/60m/30m/15m/5m) 自主进化阶梯轨迹",
         ),
@@ -275,7 +280,7 @@ def export_evolution_dashboard(
         go.Scatter(
             x=dates_str,
             y=nav_champ.values,
-            name=f"★ 进化后：4×5全周期生态位矩阵多方向共振策略 (Step {history_rows[-1]['step']})",
+            name=f"★ 进化后：6×5全周期生态位矩阵多方向共振策略 (Step {history_rows[-1]['step']})",
             line={"color": "#00E676", "width": 3.4},
         ),
         row=1,
@@ -350,7 +355,7 @@ def export_evolution_dashboard(
         paper_bgcolor="#0A0E14",
         plot_bgcolor="#101721",
         title={
-            "text": "159915 创业板 ETF · 4×5 全周期生态位矩阵 (趋势+反转+回归+日内 × 1d/60m/30m/15m/5m) 自主进化大屏",
+            "text": "159915 创业板 ETF · 6×5 全周期生态位矩阵 (趋势+反转+回归+量价+波动率+共振 × 1d/60m/30m/15m/5m) 自主进化大屏",
             "font": {"size": 18, "color": "#FFFFFF"},
             "x": 0.02,
             "y": 0.98,
@@ -375,7 +380,7 @@ def export_evolution_dashboard(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="4×5 全周期生态位矩阵自主信号挖掘与进化 Agent")
+    parser = argparse.ArgumentParser(description="6×5 全周期生态位矩阵自主信号挖掘与进化 Agent")
     parser.add_argument(
         "--symbol",
         type=str,
@@ -395,7 +400,7 @@ def main() -> None:
         help="专属工作区目录 (默认 examples/results/alpha_agent_workspace/{symbol})",
     )
     parser.add_argument(
-        "--reset", action="store_true", help="清空历史账本，从基石种子开始重新运行完整 4×5 全周期生态位进化循环"
+        "--reset", action="store_true", help="清空历史账本，从基石种子开始重新运行完整 6×5 全周期生态位进化循环"
     )
     parser.add_argument(
         "--refresh-grid",
@@ -413,7 +418,7 @@ def main() -> None:
         help="执行存量活跃单元样本内法医先验锚定 + 双半场 (2020-2021/2022-2023) L2 信赖域联合坐标重配权",
     )
     parser.add_argument("--max-candidates", type=int, default=999, help="本轮最多测试多少个原子候选单元")
-    parser.add_argument("--status-only", action="store_true", help="仅打印当前持久态信号库与 4×5 全周期生态位矩阵")
+    parser.add_argument("--status-only", action="store_true", help="仅打印当前持久态信号库与 6×5 全周期生态位矩阵")
     args = parser.parse_args()
 
     symbol = args.symbol
@@ -443,7 +448,7 @@ def main() -> None:
         return
 
     print("=" * 125)
-    print(f"  【{symbol} 4×5 全周期生态位矩阵 · 长期自主信号挖掘与多方向正交进化 Agent】")
+    print(f"  【{symbol} 6×5 全周期生态位矩阵 · 长期自主信号挖掘与多方向正交进化 Agent】")
     print("  四大战略方向 (趋势突破 / 背驰反转 / 震荡回归 / 日内微结构) × 五级独立周期 (1d / 60m / 30m / 15m / 5m)")
     print("  [主时间轴] 原生 5m 无未来函数阶梯对齐网格 (消除 15m/5m 下采样坍缩与延迟 + 0.06 最小调仓死区)")
     print(f"  [数据源] {data_path} | [工作区] {workspace_dir}")
@@ -470,7 +475,7 @@ def main() -> None:
     zoo = ledger.load_signal_zoo()
     if not zoo:
         print("\n[初始化] 正在将 5 大基石真金信号在 (1d, 60m, 30m) 上的种子原子单元写入 signal_zoo.json ...")
-        ruler_a = ARCHETYPE_RULERS["A_顺势突破簇"]
+        ruler_a = ARCHETYPE_RULERS[ARCH_A]
         for spec in BASE_SEED_SIGNALS:
             for tf in spec.eligible_tfs:
                 unit_id = f"{spec.sig_id}@{tf}"
@@ -521,7 +526,7 @@ def main() -> None:
             {
                 "step": 0,
                 "added_unit": "Base5_基石五真金(仅突破簇)",
-                "archetype": "A_顺势突破簇",
+                "archetype": ARCH_A,
                 "timeframe": "1d/60m/30m",
                 "zoo_size": len(step_alloc),
                 "full_trades": step_eval["full"]["trades"],
@@ -613,9 +618,7 @@ def main() -> None:
                         ruler=ruler,
                     )
                     w_alloc = (
-                        float(zoo[uid]["weight_alloc"])
-                        if uid in zoo
-                        else (0.40 if tf == "5m" else spec.default_weight)
+                        float(zoo[uid]["weight_alloc"]) if uid in zoo else (0.40 if tf == "5m" else spec.default_weight)
                     )
                     step_alloc[uid] = w_alloc
                     w_step_multi = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, step_alloc)
@@ -664,7 +667,7 @@ def main() -> None:
             {
                 "step": 0,
                 "added_unit": "Base5_基石五真金(仅突破簇)",
-                "archetype": "A_顺势突破簇",
+                "archetype": ARCH_A,
                 "timeframe": "1d/60m/30m",
                 "zoo_size": len(current_alloc),
                 "full_trades": curr_eval["full"]["trades"],
@@ -695,7 +698,7 @@ def main() -> None:
     atomic_candidates = atomic_candidates[: args.max_candidates]
 
     print(
-        f"\n[启动 4×5 生态位进化循环] 待检验原子候选单元 (sig@tf): {len(atomic_candidates)} 个 | "
+        f"\n[启动 6×5 生态位进化循环] 待检验原子候选单元 (sig@tf): {len(atomic_candidates)} 个 | "
         f"当前基线: 交易 {curr_eval['full']['trades']} 笔, 全周期收益 {curr_eval['full']['cum_ret_pct']:+.2f}%, "
         f"样本外收益 {curr_eval['oos']['cum_ret_pct']:+.2f}%"
     )
@@ -842,7 +845,7 @@ def main() -> None:
             )
             continue
 
-        # --- 连闯三关！正式晋升入库 4×5 生态位矩阵 ---
+        # --- 连闯三关！正式晋升入库 6×5 生态位矩阵 ---
         gate_stats["Admitted"] += 1
         step_counter += 1
         current_alloc = trial_alloc
@@ -1284,7 +1287,9 @@ def main() -> None:
     # 4. 执行存量活跃单元样本内法医先验锚定 + 双半场 (2020-2021/2022-2023) L2 信赖域联合坐标重配权
     if (args.reweight or args.prune_and_replace) and zoo:
         print("\n" + "=" * 125)
-        print("  [启动样本内联合重配权] 基石种子锚定 + 29 个新挖掘单元法医经验贝叶斯先验倾斜与双半场 (H1/H2) L2 坐标精调")
+        print(
+            "  [启动样本内联合重配权] 基石种子锚定 + 29 个新挖掘单元法医经验贝叶斯先验倾斜与双半场 (H1/H2) L2 坐标精调"
+        )
         print("=" * 125)
 
         is_mask = (df_30m["dt"] <= IS_END_DT).values
@@ -1352,10 +1357,7 @@ def main() -> None:
             for u in alloc0
         }
 
-        eb_prior = {
-            u: round(float(np.clip(alloc0[u] * (1.0 + 0.06 * z_q[u]), 0.15, 0.56)), 2)
-            for u in alloc0
-        }
+        eb_prior = {u: round(float(np.clip(alloc0[u] * (1.0 + 0.06 * z_q[u]), 0.15, 0.56)), 2) for u in alloc0}
 
         def _eval_dual_regime(alloc: dict[str, float]) -> tuple[float, dict, dict, dict]:
             w_full = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, alloc)
@@ -1435,7 +1437,7 @@ def main() -> None:
             step_payload = {
                 "step": step_counter,
                 "added_unit": "⚖样本内联合重配权_44单元法医先验双半场精调",
-                "archetype": "四簇联合重配",
+                "archetype": "六簇联合重配",
                 "timeframe": "1d~5m",
                 "zoo_size": len(current_alloc),
                 "full_trades": curr_eval["full"]["trades"],
@@ -1478,7 +1480,7 @@ def main() -> None:
         print(pd.DataFrame(admitted_summary_rows).to_string(index=False))
 
     print("\n" + "=" * 125)
-    print("【二、4×5 全周期生态位矩阵分布总览 (4 大战略方向 × 5 个独立周期 1d / 60m / 30m / 15m / 5m)】")
+    print("【二、6×5 全周期生态位矩阵分布总览 (6 大战略方向 × 5 个独立周期 1d / 60m / 30m / 15m / 5m)】")
     print("=" * 125)
     print(niche_df.to_string(index=False))
 

@@ -5356,7 +5356,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        CZSC::new(bars, 50)
+        CZSC::new(bars, 50, 6)
     }
 
     fn ma_joint_signal(czsc: &CZSC) -> String {

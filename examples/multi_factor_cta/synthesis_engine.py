@@ -4,7 +4,7 @@
 
 包含两级核心合成架构：
 1. 第一级（单品种内 · 时序三支柱分层合成 `IntraAssetThreePillarSynthesizer`）：
-   - 支柱一：四簇 × 五周期双通道分层聚合（顺势突破簇 A 与正交战术簇 B/C/D 独立截断，防止顺势簇饱和淹没正交信号）；
+   - 支柱一：六簇 × 五周期双通道分层聚合（趋势突破簇 A 与正交战术簇 B/C/D/E/F 独立截断，防止顺势簇饱和淹没正交信号）；
    - 支柱二：跨簇多空非对称反向断路器（权益/ETF 采用非对称防逼空 β_S=0.50 > β_L=0.35；商品期货采用对称断路 β_L=β_S=0.40）；
    - 支柱三：因果有效湍流波动率封顶调制 σ_turb = σ_15d * (1 - 0.35 * ER_5d) + 最小调仓死区 + 交易制度边界适配器
      (支持双向多空 `LONG_SHORT`、纯多头现货 `LONG_ONLY_SPOT`、日内 14:55 强平 `INTRADAY_FLAT_1455`)。
@@ -24,12 +24,21 @@ import pandas as pd
 
 from czsc import WeightBacktest
 from examples.alpha_mining_agent.forensic_pipeline import IS_END_DT, apply_rebalance_deadzone
-from examples.alpha_mining_agent.hypothesis_bank import ALL_SIGNAL_SPECS
+from examples.alpha_mining_agent.hypothesis_bank import (
+    ALL_ARCHETYPES,
+    ALL_SIGNAL_SPECS,
+    ARCH_A,
+    ARCH_B,
+    ARCH_C,
+    ARCH_D,
+    ARCH_E,
+    ARCH_F,
+)
 from examples.multi_factor_cta.data_engine import AssetClass, AssetSpec, ExecutionMode
 
 
 class IntraAssetThreePillarSynthesizer:
-    """单品种内四簇×多周期三支柱分层合成器"""
+    """单品种内六簇×多周期三支柱分层合成器"""
 
     TF_WEIGHTS: dict[str, float] = {
         "1d": 0.65,
@@ -57,15 +66,7 @@ class IntraAssetThreePillarSynthesizer:
         enable_regime_gating: bool = True,
     ) -> np.ndarray:
         n = len(df_grid)
-        w_tf_arch = {
-            tf: {
-                "A_顺势突破簇": np.zeros(n, dtype=np.float64),
-                "B_背驰反转簇": np.zeros(n, dtype=np.float64),
-                "C_震荡回归簇": np.zeros(n, dtype=np.float64),
-                "D_日内微结构簇": np.zeros(n, dtype=np.float64),
-            }
-            for tf in self.TF_WEIGHTS
-        }
+        w_tf_arch = {tf: {arch: np.zeros(n, dtype=np.float64) for arch in ALL_ARCHETYPES} for tf in self.TF_WEIGHTS}
 
         has_ortho = False
         for unit_id, coeff in unit_alloc_map.items():
@@ -75,8 +76,8 @@ class IntraAssetThreePillarSynthesizer:
             if tf not in w_tf_arch:
                 continue
             spec = ALL_SIGNAL_SPECS.get(sid)
-            arch = spec.archetype if spec is not None else "A_顺势突破簇"
-            if arch != "A_顺势突破簇":
+            arch = spec.archetype if spec is not None else ARCH_A
+            if arch != ARCH_A:
                 has_ortho = True
             w_tf_arch[tf][arch] += coeff * unit_weights_on_grid[unit_id]
 
@@ -94,24 +95,24 @@ class IntraAssetThreePillarSynthesizer:
         tf_weight_map = self.COMMODITY_TF_WEIGHTS if is_commodity else self.TF_WEIGHTS
 
         for tf, tw in tf_weight_map.items():
-            wa = np.clip(w_tf_arch[tf]["A_顺势突破簇"], -1.0, 1.0)
-            wb = np.clip(w_tf_arch[tf]["B_背驰反转簇"], -1.0, 1.0)
-            wc = np.clip(w_tf_arch[tf]["C_震荡回归簇"], -1.0, 1.0)
-            wd = np.clip(w_tf_arch[tf]["D_日内微结构簇"], -1.0, 1.0)
+            wa = np.clip(w_tf_arch[tf][ARCH_A], -1.0, 1.0)
+            wb = np.clip(w_tf_arch[tf][ARCH_B], -1.0, 1.0)
+            wc = np.clip(w_tf_arch[tf][ARCH_C], -1.0, 1.0)
+            # D/E/F 为连续强度因子簇 (量价筹码 / 波动率压缩 / 多周期共振)，不做主场阻尼
+            wdef = np.clip(w_tf_arch[tf][ARCH_D] + w_tf_arch[tf][ARCH_E] + w_tf_arch[tf][ARCH_F], -1.0, 1.0)
 
             if regimes is not None:
                 if is_commodity:
-                    # 商品期货趋势延续性强：彻底剔除 B_背驰反转簇，强趋势态下对 C_震荡回归簇 逆势信号施加保护阻尼
+                    # 商品期货趋势延续性强：彻底剔除 B_背驰衰竭簇，强趋势态下对 C_中枢震荡簇 逆势信号施加保护阻尼
                     wb = np.zeros_like(wb)
                     wc = np.where((regimes == -1) & (wc > 0.0), wc * 0.15, wc)
                     wc = np.where((regimes == 1) & (wc < 0.0), wc * 0.15, wc)
-                    wd = np.where(regimes != 0, wd * 0.35, wd * 0.50)
                 else:
-                    # 权益/股指标的：仅在强单边趋势态下对 C_震荡回归簇 的逆势头寸施加保护阻尼
+                    # 权益/股指标的：仅在强单边趋势态下对 C_中枢震荡簇 的逆势头寸施加保护阻尼
                     wc = np.where((regimes == -1) & (wc > 0.0), wc * 0.35, wc)
                     wc = np.where((regimes == 1) & (wc < 0.0), wc * 0.35, wc)
 
-            wbcd = np.clip(wb + wc + wd, -1.0, 1.0)
+            wbcd = np.clip(wb + wc + wdef, -1.0, 1.0)
             w_a_total += tw * wa
             w_bcd_total += tw * wbcd
             w_bcd_pos += tw * np.maximum(wbcd, 0.0)

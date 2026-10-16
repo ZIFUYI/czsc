@@ -2,7 +2,7 @@
 
 czsc 的信号体系是事件驱动策略的最底层原料：
 
-- 信号函数（``czsc._native.signals.{bar,cxt,tas,vol,pressure,obv,cvolp}``）由 Rust 实现
+- 信号函数（``czsc._native.signals.{bar,cxt,tas,vol,pressure,obv,cvolp,ang,byi,clv,coo,jcc,kcatr,ntmdk,xl,zdy,strength}``）由 Rust 实现
 - 每个信号产出形如 ``"{freq}_{...}_{name}V{ver}"`` 的 key + ``"{v1}_{v2}_{v3}_{score}"`` 的 value
 - 通过 ``signals_config`` 配置项调度信号函数 + 在哪个周期上算
 

@@ -12,11 +12,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from examples.alpha_mining_agent.hypothesis_bank import migrate_archetype
 
 WORKSPACE_DIR = Path("examples/results/alpha_agent_workspace")
 
@@ -29,7 +32,7 @@ class AdmittedSignalRecord:
     sig_id: str  # 例如 "C01L"
     timeframe: str  # "1d" | "60m" | "30m" | "15m"
     name: str
-    archetype: str  # "A_顺势突破簇" | "B_背驰反转簇" | "C_震荡回归簇" | "D_日内微结构簇"
+    archetype: str  # 6 簇之一 (见 hypothesis_bank.ALL_ARCHETYPES)；旧四簇名在加载时由 migrate_archetype 归一
     ruler_desc: str  # 所用专属法医标尺描述
     direction: int  # 1 = 多, -1 = 空
     weight_alloc: float
@@ -81,11 +84,23 @@ class AgentStateLedger:
             if p.exists():
                 p.unlink()
 
+    @staticmethod
+    def _migrate_record_archetype(rec: dict[str, Any]) -> dict[str, Any]:
+        """旧四簇账本 -> 六簇：按 sig_id 归一 archetype (内存中迁移，不改写磁盘文件)。"""
+        arch = rec.get("archetype")
+        if isinstance(arch, str):
+            sig_id = rec.get("sig_id") or str(rec.get("unit_id", "")).split("@")[0] or None
+            # 无法判定的历史记录原样保留，避免加载失败
+            with contextlib.suppress(ValueError):
+                rec["archetype"] = migrate_archetype(arch, sig_id)
+        return rec
+
     def load_signal_zoo(self) -> dict[str, dict[str, Any]]:
         if not self.zoo_path.exists():
             return {}
         with open(self.zoo_path, encoding="utf-8") as f:
-            return json.load(f)
+            zoo = json.load(f)
+        return {uid: self._migrate_record_archetype(rec) for uid, rec in zoo.items()}
 
     def save_signal_to_zoo(self, record: AdmittedSignalRecord) -> None:
         zoo = self.load_signal_zoo()
@@ -126,7 +141,7 @@ class AgentStateLedger:
             for line in f:
                 line = line.strip()
                 if line:
-                    records.append(json.loads(line))
+                    records.append(self._migrate_record_archetype(json.loads(line)))
         return records
 
     def bury_rejected_signal(
