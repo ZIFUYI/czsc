@@ -1,0 +1,6 @@
+variant,description,avg_factors,oos_days,gross_ret_pct,cost_ret_pct,net_ret_pct,ann_ret_pct,ann_vol_pct,sharpe,max_dd_pct,calmar,daily_win_pct,ann_turnover,avg_exposure_pct,ret_2025_pct,ret_2026_pct
+MVP_Ref_AllTF_Comb3,Gate2_Local + 60m/30m/15m + Comb3(六簇+GS正交) + Alloc3(SectorHRP),20.9,503,7.13,2.34,4.79,2.4,2.21,1.09,2.13,1.13,46.5,81.9,19.4,4.1,0.69
+MVP_Clean_AllTF_Comb2,"Gate2_Local + 60m/30m/15m + Comb2(六簇静态预算,无GS) + Alloc3(SectorHRP)",20.9,503,10.1,3.15,6.95,3.48,2.71,1.29,2.17,1.6,48.7,110.9,23.6,4.98,1.96
+MVP_Pruned_60m30m_Comb2,"Gate2_Local + 仅60m/30m + Comb2(六簇静态预算,无GS) + Alloc3(SectorHRP)",15.2,503,9.35,2.82,6.53,3.27,2.59,1.26,1.97,1.66,49.3,98.8,22.5,5.13,1.4
+MVP_Pruned_60m30m_NoC,Gate2_Local + 仅60m/30m(剔除C簇反转) + Comb2(六簇静态预算) + Alloc3(SectorHRP),13.8,503,9.31,2.79,6.52,3.27,2.59,1.26,2.01,1.63,49.1,97.9,22.4,5.09,1.43
+MVP_Scaled_3x_Exposure,基于最优 MVP_Clean_AllTF_Comb2 的 3.0x 目标敞口归一化版 (平均总敞口 ~58%),20.9,503,30.3,9.45,20.85,10.45,8.13,1.29,6.44,1.62,48.7,332.6,70.7,14.95,5.89

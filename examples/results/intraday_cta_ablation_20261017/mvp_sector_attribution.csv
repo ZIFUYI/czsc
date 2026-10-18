@@ -1,0 +1,6 @@
+sector,sector_cn,asset_count,positive_assets,gross_ret_pct,cost_ret_pct,net_ret_pct,ann_ret_pct,ann_vol_pct,sharpe,max_dd_pct,calmar,win_days_pct,ann_turnover,avg_exposure_pct,ret_2025_pct,ret_2026_pct
+PRECIOUS_METALS,贵金属 (AU/AG),2,2/2,8.95,0.81,8.14,4.08,1.73,2.35,0.79,5.18,45.8,32.81,5.35,6.18,1.95
+ENERGY_CHEM,能源化工 (SC/TA/MA/RU/PP),5,3/5,1.12,0.35,0.77,0.39,0.73,0.53,0.7,0.56,45.2,11.78,1.93,0.58,0.19
+AGRICULTURE,农产品与油脂 (M/P/OI/SR),4,1/4,0.56,0.51,0.05,0.02,0.78,0.03,1.0,0.02,43.8,17.2,4.88,-0.24,0.29
+FERROUS,黑色建材 (RB/HC/I/JM/FG),5,2/5,0.42,0.5,-0.08,-0.04,0.89,-0.04,1.31,-0.03,42.3,16.57,3.81,-0.65,0.57
+BASE_METALS,有色金属 (CU/AL/ZN/NI),4,0/4,-0.96,0.97,-1.93,-0.97,1.37,-0.7,2.96,-0.33,40.0,32.5,7.97,-0.9,-1.03

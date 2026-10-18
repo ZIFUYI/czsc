@@ -1,0 +1,11 @@
+pool,tf,total_evals,pass_gate1,rejected_gate2,pass_gate2,rejected_gate3,pass_gate3,gate1_to_gate3_keep_pct,avg_per_asset_fold
+ExpCD_Legacy125,1d,1240,109,101,8,2,6,5.5,0.15
+ExpCD_Legacy125,60m,1320,355,60,295,8,287,80.8,7.17
+ExpCD_Legacy125,30m,1320,319,22,297,0,297,93.1,7.42
+ExpCD_Legacy125,15m,1120,225,223,2,1,1,0.4,0.03
+ExpCD_Legacy125,ALL,5000,1008,406,602,11,591,58.6,14.78
+ExpE_WithHetero1D15M,1d,1480,177,159,18,3,15,8.5,0.38
+ExpE_WithHetero1D15M,60m,1320,355,61,294,7,287,80.8,7.17
+ExpE_WithHetero1D15M,30m,1320,319,22,297,0,297,93.1,7.42
+ExpE_WithHetero1D15M,15m,1360,316,306,10,0,10,3.2,0.25
+ExpE_WithHetero1D15M,ALL,5480,1167,548,619,10,609,52.2,15.22

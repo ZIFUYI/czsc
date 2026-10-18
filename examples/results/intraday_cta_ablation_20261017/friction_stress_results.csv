@@ -1,0 +1,5 @@
+experiment,oos_days,gross_ret_pct,cost_ret_pct,net_ret_pct,ann_ret_pct,ann_vol_pct,sharpe,max_dd_pct,calmar,daily_win_pct,ann_turnover,avg_exposure_pct,ret_2025_pct,ret_2026_pct,extra_bp
+Friction_+0bp,503,2.77,1.14,1.63,0.81,1.66,0.49,2.49,0.33,28.4,39.2,10.3,1.63,0.0,0
+Friction_+2bp,503,2.77,2.7,0.06,0.03,1.66,0.02,2.78,0.01,27.4,39.2,10.3,0.06,0.0,2
+Friction_+5bp,503,2.77,5.05,-2.28,-1.14,1.66,-0.69,3.57,-0.32,25.6,39.2,10.3,-2.28,0.0,5
+Friction_+10bp,503,2.77,8.96,-6.19,-3.1,1.68,-1.84,7.24,-0.43,22.3,39.2,10.3,-6.19,0.0,10
