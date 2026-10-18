@@ -557,3 +557,17 @@ Fold2_2026,sr,EC01S@1d,EC01S,1d,E_波动率压缩与分形弹性簇,7,0.965,4.7,
 Fold2_2026,sr,BC02L@15m,BC02L,15m,B_背驰衰竭与极值反转簇,17,0.483,4.6,-0.56,0.55,0.327,BC01L@60m,16.99,8.6,0.0028,Gate2_WeakPoolEdge,"15m跨品种普适性不足 (pooled_t=-0.56, pos_ratio=0.55)"
 Fold2_2026,sr,H1D_DV01L@1d,H1D_DV01L,1d,B_背驰衰竭与极值反转簇,19,0.138,11.3,2.49,0.55,0.214,BC01L@60m,15.72,327.5,0.0901,Gate2_Weak1DPoolEdge,"1d池化稳健度或本地夏普不足 (pooled_t=2.49, Shp=0.14)"
 Fold2_2026,sr,H15M_EX01S@15m,H15M_EX01S,15m,B_背驰衰竭与极值反转簇,13,0.362,9.3,-1.25,0.35,0.345,BC01L@60m,37.16,36.9,0.0171,Gate2_WeakPoolEdge,"15m跨品种普适性不足 (pooled_t=-1.25, pos_ratio=0.35)"
+Fold1_2025,ag,H5M_OIB01L@5m,H5M_OIB01L,5m,D_量价微结构与筹码冲击簇,21,1.842,33.8,0.2,0.65,0.0,DC01L@30m,55.76,421.1,0.1471,Gate2_Weak5MPoolEdge,"5m跨品种池化显著性不足 (pooled_t=0.20, pos_ratio=0.65)"
+Fold1_2025,cu,H5M_LQ01L@5m,H5M_LQ01L,5m,B_背驰衰竭与极值反转簇,31,0.452,49.3,0.71,0.55,0.0,H15M_EX01L@15m,85.84,80.0,0.0445,Gate3_Low5MMarginalSharpe,5m扣费后边际净夏普增益不足 (ΔSharpe=+0.0445 < 0.045)
+Fold1_2025,al,H5M_LQ01L@5m,H5M_LQ01L,5m,B_背驰衰竭与极值反转簇,31,1.852,49.8,0.71,0.55,0.0,None,98.33,310.3,0.469,Gate2_WeakBackboneAsset,品种大级别主干趋势不足 (base_IS_Sharpe=0.36 < 0.60)，禁止5m独立激活
+Fold1_2025,ni,H5M_OIB01L@5m,H5M_OIB01L,5m,D_量价微结构与筹码冲击簇,20,0.631,32.2,0.2,0.65,0.0,DC02L@30m,64.92,69.2,0.0193,Gate2_Weak5MPoolEdge,"5m跨品种池化显著性不足 (pooled_t=0.20, pos_ratio=0.65)"
+Fold1_2025,ma,H5M_LQ01L@5m,H5M_LQ01L,5m,B_背驰衰竭与极值反转簇,26,0.802,47.8,0.71,0.55,0.0,None,69.96,865.3,-0.295,Gate3_Low5MMarginalSharpe,5m扣费后边际净夏普增益不足 (ΔSharpe=-0.2950 < 0.045)
+Fold2_2026,ag,H5M_CLV01L@5m,H5M_CLV01L,5m,C_中枢震荡与锚定回归簇,47,1.163,37.7,0.9,0.55,0.0,CC01L@30m,79.71,133.4,0.0041,Gate3_Low5MMarginalSharpe,5m扣费后边际净夏普增益不足 (ΔSharpe=+0.0041 < 0.045)
+Fold2_2026,ag,H5M_OIB01L@5m,H5M_OIB01L,5m,D_量价微结构与筹码冲击簇,37,1.084,29.6,0.57,0.6,0.0,DC01L@30m,61.3,220.8,0.0978,Gate2_Weak5MPoolEdge,"5m跨品种池化显著性不足 (pooled_t=0.57, pos_ratio=0.60)"
+Fold2_2026,al,H5M_LQ01L@5m,H5M_LQ01L,5m,B_背驰衰竭与极值反转簇,58,1.108,46.4,0.7,0.65,0.0,None,100.0,218.2,0.706,Gate2_WeakBackboneAsset,品种大级别主干趋势不足 (base_IS_Sharpe=0.04 < 0.60)，禁止5m独立激活
+Fold2_2026,ni,H5M_OIB01L@5m,H5M_OIB01L,5m,D_量价微结构与筹码冲击簇,38,0.602,30.4,0.57,0.6,0.0,DC01L@60m,58.26,155.2,0.0819,Gate2_Weak5MPoolEdge,"5m跨品种池化显著性不足 (pooled_t=0.57, pos_ratio=0.60)"
+Fold2_2026,sc,H5M_CLV01S@5m,H5M_CLV01S,5m,C_中枢震荡与锚定回归簇,27,1.219,21.8,-0.65,0.4,0.0,CC02S@60m,57.75,384.8,0.2818,Gate2_Weak5MPoolEdge,"5m跨品种池化显著性不足 (pooled_t=-0.65, pos_ratio=0.40)"
+Fold2_2026,ma,H5M_LQ01L@5m,H5M_LQ01L,5m,B_背驰衰竭与极值反转簇,42,0.44,38.0,0.7,0.65,0.0,BC01L@60m,67.22,133.0,-0.1737,Gate3_Low5MMarginalSharpe,5m扣费后边际净夏普增益不足 (ΔSharpe=-0.1737 < 0.045)
+Fold2_2026,ru,H5M_OIB01L@5m,H5M_OIB01L,5m,D_量价微结构与筹码冲击簇,31,0.44,29.7,0.57,0.6,0.0,None,93.39,244.9,0.0351,Gate2_Weak5MPoolEdge,"5m跨品种池化显著性不足 (pooled_t=0.57, pos_ratio=0.60)"
+Fold2_2026,p,H5M_LQ01L@5m,H5M_LQ01L,5m,B_背驰衰竭与极值反转簇,47,0.737,44.6,0.7,0.65,0.0,BC01L@60m,67.47,322.0,0.0048,Gate3_Low5MMarginalSharpe,5m扣费后边际净夏普增益不足 (ΔSharpe=+0.0048 < 0.045)
+Fold2_2026,oi,H5M_OIB01L@5m,H5M_OIB01L,5m,D_量价微结构与筹码冲击簇,25,0.508,23.9,0.57,0.6,0.0,H1D_RV01L@1d,71.24,-118.7,-0.0301,Gate2_Weak5MPoolEdge,"5m跨品种池化显著性不足 (pooled_t=0.57, pos_ratio=0.60)"

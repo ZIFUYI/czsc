@@ -28,6 +28,7 @@ DC01S@1d,DC01S,1d,D_量价微结构与筹码冲击簇,Gate2_Weak1DPoolEdge,7,0.7
 CC01L@1d,CC01L,1d,C_中枢震荡与锚定回归簇,Gate2_Weak1DPoolEdge,7,1.224,4.2,0.489,18.707,0.05,"1d池化稳健度或本地夏普不足 (pooled_t=-5.37, Shp=0.77)"
 EC01S@15m,EC01S,15m,E_波动率压缩与分形弹性簇,Gate2_WeakPoolEdge,6,0.751,144.217,0.586,22.593,0.053,"15m跨品种普适性不足 (pooled_t=-2.31, pos_ratio=0.35)"
 DC01L@15m,DC01L,15m,D_量价微结构与筹码冲击簇,Gate2_WeakPoolEdge,6,0.701,113.333,0.204,18.913,0.001,"15m跨品种普适性不足 (pooled_t=-3.40, pos_ratio=0.40)"
+H5M_OIB01L@5m,H5M_OIB01L,5m,D_量价微结构与筹码冲击簇,Gate2_Weak5MPoolEdge,6,0.851,29.933,0.0,67.478,0.059,"5m跨品种池化显著性不足 (pooled_t=0.20, pos_ratio=0.65)"
 BC01L@15m,BC01L,15m,B_背驰衰竭与极值反转簇,Gate2_WeakPoolEdge,6,0.718,24.283,0.21,32.728,0.014,"15m跨品种普适性不足 (pooled_t=-2.83, pos_ratio=0.35)"
 H15M_EX01S@15m,H15M_EX01S,15m,B_背驰衰竭与极值反转簇,Gate2_WeakPoolEdge,6,0.626,11.75,0.307,26.895,0.038,"15m跨品种普适性不足 (pooled_t=-1.25, pos_ratio=0.35)"
 H1D_DV01S@1d,H1D_DV01S,1d,B_背驰衰竭与极值反转簇,Gate2_HighActiveCorr,6,1.044,9.233,0.6,23.608,0.154,与已入库 BC01L@30m 激活态共线冗余 (|ρ_active|=0.43 >= 0.35)
@@ -51,6 +52,7 @@ FC03S@1d,FC03S,1d,F_多周期共振与截面强弱簇,Gate2_Weak1DPoolEdge,5,0.7
 CC01L@15m,CC01L,15m,C_中枢震荡与锚定回归簇,Gate2_WeakPoolEdge,4,0.414,109.4,0.272,27.882,0.013,"15m跨品种普适性不足 (pooled_t=-3.32, pos_ratio=0.30)"
 DC02S@15m,DC02S,15m,D_量价微结构与筹码冲击簇,Gate2_WeakPoolEdge,4,0.286,88.925,0.337,25.303,-0.038,"15m跨品种普适性不足 (pooled_t=-4.40, pos_ratio=0.25)"
 S1S@30m,S1S,30m,A_趋势突破与斜率动量簇,Gate2_ColinearClone,4,0.398,69.8,0.972,35.195,0.03,同簇激活条件相关过高 (|ρ|=0.97>=0.80 vs S1L@60m)
+H5M_LQ01L@5m,H5M_LQ01L,5m,B_背驰衰竭与极值反转簇,Gate3_Low5MMarginalSharpe,4,0.608,44.925,0.0,72.622,-0.105,5m扣费后边际净夏普增益不足 (ΔSharpe=+0.0445 < 0.045)
 S3L@30m,S3L,30m,A_趋势突破与斜率动量簇,Gate2_ColinearClone,4,0.62,29.475,0.898,12.452,0.058,同簇激活条件相关过高 (|ρ|=0.95>=0.80 vs S4S@30m)
 BC01S@15m,BC01S,15m,B_背驰衰竭与极值反转簇,Gate2_WeakPoolEdge,4,1.981,20.025,0.2,20.822,0.047,"15m跨品种普适性不足 (pooled_t=-1.70, pos_ratio=0.35)"
 FC01S@60m,FC01S,60m,F_多周期共振与截面强弱簇,Gate2_HighActiveCorr,4,0.89,17.05,0.717,3.292,-0.014,与已入库 FC01L@60m 激活态共线冗余 (|ρ_active|=0.71 >= 0.35)
@@ -69,6 +71,7 @@ FC03L@60m,FC03L,60m,F_多周期共振与截面强弱簇,Gate2_HighActiveCorr,3,1
 CC01S@15m,CC01S,15m,C_中枢震荡与锚定回归簇,Gate2_WeakPoolEdge,2,0.818,121.75,0.415,25.31,0.031,"15m跨品种普适性不足 (pooled_t=-4.18, pos_ratio=0.25)"
 CC02L@15m,CC02L,15m,C_中枢震荡与锚定回归簇,Gate2_WeakPoolEdge,2,0.889,90.6,0.13,29.525,0.012,"15m跨品种普适性不足 (pooled_t=-3.54, pos_ratio=0.15)"
 S1L@30m,S1L,30m,A_趋势突破与斜率动量簇,Gate2_ColinearClone,2,0.807,71.7,0.973,10.985,-0.07,同簇激活条件相关过高 (|ρ|=0.97>=0.80 vs S4S@30m)
+H5M_LQ01L@5m,H5M_LQ01L,5m,B_背驰衰竭与极值反转簇,Gate2_WeakBackboneAsset,2,1.48,48.1,0.0,99.165,0.587,品种大级别主干趋势不足 (base_IS_Sharpe=0.36 < 0.60)，禁止5m独立激活
 S1S@60m,S1S,60m,A_趋势突破与斜率动量簇,Gate2_ColinearClone,2,0.55,42.2,0.958,39.945,0.08,同簇激活条件相关过高 (|ρ|=0.96>=0.80 vs S1L@30m)
 S2L@60m,S2L,60m,A_趋势突破与斜率动量簇,Gate2_HighActiveCorr,2,0.867,30.45,0.714,14.025,-0.03,与已入库 S3L@60m 激活态共线冗余 (|ρ_active|=0.78 >= 0.35)
 S1S@60m,S1S,60m,A_趋势突破与斜率动量簇,Gate2_HighActiveCorr,2,0.592,29.9,0.782,11.89,-0.028,与已入库 S1L@60m 激活态共线冗余 (|ρ_active|=0.95 >= 0.35)
@@ -85,11 +88,13 @@ H15M_EX01S@15m,H15M_EX01S,15m,B_背驰衰竭与极值反转簇,Gate2_HighActiveC
 BC01S@60m,BC01S,60m,B_背驰衰竭与极值反转簇,Gate2_HighActiveCorr,2,0.781,6.55,0.497,15.93,-0.007,与已入库 H1D_DV01S@1d 激活态共线冗余 (|ρ_active|=0.64 >= 0.35)
 CC02L@1d,CC02L,1d,C_中枢震荡与锚定回归簇,Gate3_NegativeMarginalSharpe,2,0.617,3.15,0.123,24.17,-0.018,"扣费后边际净夏普无正增益 (ΔSharpe=-0.0060 < 0, 换手=2.2x)"
 CC02L@1d,CC02L,1d,C_中枢震荡与锚定回归簇,Gate2_HighActiveCorr,2,0.856,2.55,0.505,9.445,0.01,与已入库 H1D_SP01L@1d 激活态共线冗余 (|ρ_active|=0.62 >= 0.35)
+H5M_CLV01L@5m,H5M_CLV01L,5m,C_中枢震荡与锚定回归簇,Gate3_Low5MMarginalSharpe,1,1.163,37.7,0.0,79.71,0.004,5m扣费后边际净夏普增益不足 (ΔSharpe=+0.0041 < 0.045)
 EC02L@60m,EC02L,60m,E_波动率压缩与分形弹性簇,Gate2_ColinearClone,1,0.698,35.7,0.819,36.15,-0.314,同簇激活条件相关过高 (|ρ|=0.82>=0.80 vs EC02S@60m)
 FC02L@60m,FC02L,60m,F_多周期共振与截面强弱簇,Gate2_ColinearClone,1,0.177,27.3,0.824,46.7,-0.12,同簇激活条件相关过高 (|ρ|=0.82>=0.80 vs FC02S@60m)
 FC04L@60m,FC04L,60m,F_多周期共振与截面强弱簇,Gate2_ColinearClone,1,0.389,25.9,0.807,1.53,-0.004,同簇激活条件相关过高 (|ρ|=0.81>=0.80 vs FC02S@60m)
 S3L@60m,S3L,60m,A_趋势突破与斜率动量簇,Gate2_HighActiveCorr,1,0.356,24.4,0.672,3.89,0.064,与已入库 AC01S@30m 激活态共线冗余 (|ρ_active|=0.67 >= 0.35)
 EC01L@60m,EC01L,60m,E_波动率压缩与分形弹性簇,Gate2_HighActiveCorr,1,1.784,23.7,0.582,3.01,0.144,与已入库 EC02L@60m 激活态共线冗余 (|ρ_active|=0.58 >= 0.35)
+H5M_CLV01S@5m,H5M_CLV01S,5m,C_中枢震荡与锚定回归簇,Gate2_Weak5MPoolEdge,1,1.219,21.8,0.0,57.75,0.282,"5m跨品种池化显著性不足 (pooled_t=-0.65, pos_ratio=0.40)"
 FC04S@60m,FC04S,60m,F_多周期共振与截面强弱簇,Gate3_NegativeMarginalSharpe,1,0.267,20.2,0.0,5.25,-0.152,"扣费后边际净夏普无正增益 (ΔSharpe=-0.1515 < 0, 换手=20.2x)"
 H1D_RV01L@1d,H1D_RV01L,1d,D_量价微结构与筹码冲击簇,Gate2_Weak1DPoolEdge,1,0.236,14.3,0.547,15.26,-0.008,"1d池化稳健度或本地夏普不足 (pooled_t=1.35, Shp=0.24)"
 AC01S@60m,AC01S,60m,A_趋势突破与斜率动量簇,Gate2_ColinearClone,1,0.472,12.8,0.865,2.67,-0.03,同簇激活条件相关过高 (|ρ|=0.86>=0.80 vs S1L@60m)

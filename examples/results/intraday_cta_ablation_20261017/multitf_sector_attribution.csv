@@ -1,6 +1,6 @@
 sector,sector_cn,num_assets,assets,gross_ret_pct,cost_ret_pct,net_ret_pct,pnl_share_pct,sector_sharpe,sector_max_dd_pct,ret_2025_pct,ret_2026_pct
-PRECIOUS_METALS,贵金属,2,"au,ag",9.34,0.69,8.65,82.2,2.58,0.64,6.56,2.09
-ENERGY_CHEM,能源化工,5,"sc,ma,pp,ta,ru",2.06,0.4,1.66,15.7,0.9,0.84,0.79,0.86
-AGRICULTURE,农产品与油脂,4,"sr,oi,p,m",1.28,0.37,0.91,8.7,0.75,0.73,0.04,0.87
-FERROUS,黑色建材,5,"fg,i,jm,hc,rb",0.86,0.48,0.38,3.6,0.19,0.89,-0.22,0.6
-BASE_METALS,有色金属,4,"zn,cu,al,ni",-0.35,0.73,-1.08,-10.3,-0.45,1.67,-0.54,-0.54
+PRECIOUS_METALS,贵金属,2,"au,ag",10.77,0.69,10.08,71.1,3.14,0.66,8.06,2.01
+ENERGY_CHEM,能源化工,5,"sc,ta,ma,pp,ru",1.94,0.33,1.6,11.3,0.98,0.56,0.67,0.94
+AGRICULTURE,农产品与油脂,4,"sr,p,oi,m",1.7,0.3,1.4,9.9,1.28,0.45,0.58,0.83
+BASE_METALS,有色金属,4,"cu,zn,ni,al",1.91,0.74,1.17,8.3,0.52,1.07,0.79,0.38
+FERROUS,黑色建材,5,"i,fg,hc,jm,rb",0.2,0.29,-0.09,-0.6,-0.06,0.75,-0.27,0.19
