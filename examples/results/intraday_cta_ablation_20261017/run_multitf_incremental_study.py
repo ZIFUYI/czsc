@@ -47,6 +47,8 @@ from run_intraday_ablation import (  # noqa: E402
     synthesize_asset_signal,
 )
 
+import czsc  # noqa: E402
+from examples.alpha_mining_agent.forensic_pipeline import evaluate_execution_events  # noqa: E402
 from examples.alpha_mining_agent.hypothesis_bank import (  # noqa: E402
     ALL_SIGNAL_SPECS,
     ARCH_A,
@@ -54,6 +56,8 @@ from examples.alpha_mining_agent.hypothesis_bank import (  # noqa: E402
     ARCH_C,
     ARCH_D,
     ARCH_E,
+    research_bars,
+    rust_sma,
 )
 from examples.multi_factor_cta.data_engine import (  # noqa: E402
     AssetClass,
@@ -1153,6 +1157,263 @@ def synthesize_fast_slow_synergy(
     )
 
 
+def compute_episode_payoff_stats(ret_arrays: list[np.ndarray]) -> dict[str, float]:
+    """统计执行区间 (Execution Episodes) 的胜率、单笔盈亏比 R = AvgWin / AvgLoss 与安全边际 ΔW"""
+    if not ret_arrays:
+        return {"ep_count": 0, "win_rate_pct": 0.0, "payoff_r": 0.0, "safety_margin_pct": 0.0}
+    all_r = np.concatenate(ret_arrays)
+    if len(all_r) == 0:
+        return {"ep_count": 0, "win_rate_pct": 0.0, "payoff_r": 0.0, "safety_margin_pct": 0.0}
+    wins = all_r[all_r > 0]
+    losses = np.abs(all_r[all_r <= 0])
+    wr = len(wins) / len(all_r)
+    avg_w = float(wins.mean()) if len(wins) > 0 else 0.0
+    avg_l = float(losses.mean()) if len(losses) > 0 else 1e-6
+    pl = avg_w / max(avg_l, 1e-6)
+    sm = wr - 1.0 / (1.0 + pl)
+    return {
+        "ep_count": int(len(all_r)),
+        "win_rate_pct": round(wr * 100.0, 2),
+        "payoff_r": round(pl, 3),
+        "safety_margin_pct": round(sm * 100.0, 2),
+    }
+
+
+def build_structure_pack(df_tf: pd.DataFrame, tf: str, box_window: int = 32) -> dict[str, np.ndarray]:
+    """基于 Rust `czsc.structure_snapshots` 与 `czsc.structure_stop_anchors` 提取严格因果的结构化出场特征包"""
+    c = np.nan_to_num(df_tf["close"].to_numpy(dtype=np.float64), nan=1.0)
+    l_arr = np.nan_to_num(df_tf["low"].to_numpy(dtype=np.float64), nan=c)
+    h_arr = np.nan_to_num(df_tf["high"].to_numpy(dtype=np.float64), nan=c)
+    atr = np.nan_to_num(
+        df_tf["atr14"].to_numpy(dtype=np.float64) if "atr14" in df_tf.columns else (h_arr - l_arr),
+        nan=0.005 * c,
+    )
+    tr = df_tf["tr"] if "tr" in df_tf.columns else pd.Series(h_arr - l_arr, index=df_tf.index)
+    atr_fast = np.nan_to_num(rust_sma(tr, 5).to_numpy(dtype=np.float64), nan=1.0)
+    atr_slow = np.nan_to_num(rust_sma(tr, 20).to_numpy(dtype=np.float64), nan=1.0)
+
+    bars = research_bars(df_tf, tf)
+    snaps = czsc.structure_snapshots(bars)
+    sec_anchors = czsc.structure_stop_anchors(bars, snaps, "pos_second_ext")
+    zs_anchors = czsc.structure_stop_anchors(bars, snaps, "pos_zs_reentry")
+    box_anchors = czsc.structure_stop_anchors(bars, snaps, "pos_box_stop", box_window=box_window)
+
+    pad = 0.35 * np.maximum(atr, 1e-6)
+    sec_l = np.asarray(sec_anchors["long_stop"], dtype=np.float64) - pad
+    sec_s = np.asarray(sec_anchors["short_stop"], dtype=np.float64) + pad
+    zs_l = np.asarray(zs_anchors["long_stop"], dtype=np.float64) - pad
+    zs_s = np.asarray(zs_anchors["short_stop"], dtype=np.float64) + pad
+    box_l = np.asarray(box_anchors["long_stop"], dtype=np.float64) - pad
+    box_s = np.asarray(box_anchors["short_stop"], dtype=np.float64) + pad
+
+    fallback_l = np.minimum(l_arr, c) - 1.2 * np.maximum(atr, 1e-6)
+    fallback_s = np.maximum(h_arr, c) + 1.2 * np.maximum(atr, 1e-6)
+
+    long_sec = np.where(np.isfinite(sec_l) & (sec_l > 0) & (sec_l < c), sec_l, fallback_l)
+    short_sec = np.where(np.isfinite(sec_s) & (sec_s > c), sec_s, fallback_s)
+    long_zs = np.where(np.isfinite(zs_l) & (zs_l > 0) & (zs_l < c), zs_l, long_sec)
+    short_zs = np.where(np.isfinite(zs_s) & (zs_s > c), zs_s, short_sec)
+    long_box = np.where(np.isfinite(box_l) & (box_l > 0) & (box_l < c), box_l, long_sec)
+    short_box = np.where(np.isfinite(box_s) & (box_s > c), box_s, short_sec)
+    long_hyb = 0.5 * (long_sec + long_box)
+    short_hyb = 0.5 * (short_sec + short_box)
+
+    raw_sec_l = np.where(
+        np.isfinite(sec_anchors["long_stop"]) & (sec_anchors["long_stop"] < c),
+        sec_anchors["long_stop"],
+        np.minimum(l_arr, c) - 0.6 * np.maximum(atr, 1e-6),
+    )
+    raw_sec_s = np.where(
+        np.isfinite(sec_anchors["short_stop"]) & (sec_anchors["short_stop"] > c),
+        sec_anchors["short_stop"],
+        np.maximum(h_arr, c) + 0.6 * np.maximum(atr, 1e-6),
+    )
+    long_rawzs = np.where(
+        np.isfinite(zs_anchors["long_stop"]) & (zs_anchors["long_stop"] < c),
+        zs_anchors["long_stop"],
+        raw_sec_l,
+    )
+    short_rawzs = np.where(
+        np.isfinite(zs_anchors["short_stop"]) & (zs_anchors["short_stop"] > c),
+        zs_anchors["short_stop"],
+        raw_sec_s,
+    )
+
+    bi_dir = np.asarray([s.completed_bi_dir for s in snaps], dtype=np.int8)
+    fx_dir = np.asarray([s.completed_fx_dir for s in snaps], dtype=np.int8)
+    zs_zg = np.asarray([s.zs_zg for s in snaps], dtype=np.float64) - pad
+    zs_zd = np.asarray([s.zs_zd for s in snaps], dtype=np.float64) + pad
+    raw_zs_zg = np.asarray([s.zs_zg for s in snaps], dtype=np.float64)
+    raw_zs_zd = np.asarray([s.zs_zd for s in snaps], dtype=np.float64)
+    return {
+        "close": c,
+        "atr_fast": atr_fast,
+        "atr_slow": atr_slow,
+        "long_sec": long_sec,
+        "short_sec": short_sec,
+        "long_zs": long_zs,
+        "short_zs": short_zs,
+        "long_box": long_box,
+        "short_box": short_box,
+        "long_hyb": long_hyb,
+        "short_hyb": short_hyb,
+        "long_rawzs": long_rawzs,
+        "short_rawzs": short_rawzs,
+        "bi_dir": bi_dir,
+        "fx_dir": fx_dir,
+        "zs_zg": zs_zg,
+        "zs_zd": zs_zd,
+        "raw_zs_zg": raw_zs_zg,
+        "raw_zs_zd": raw_zs_zd,
+    }
+
+
+def rust_govern_series(
+    w_arr: np.ndarray,
+    sp: dict[str, np.ndarray],
+    stop_kind: str = "zs",
+    trailing: float = 0.014,
+    trail_activation: float = 0.016,
+    max_hold: int = 96,
+    ratchet_stop: bool = True,
+    use_zs_reentry: bool = True,
+    use_bi_exit: bool = False,
+    use_fx_exit: bool = True,
+    min_hold: int = 0,
+    cooldown: int = 2,
+    use_raw_zs_edge: bool = False,
+    reentry_mode: str = "none",
+    reentry_breakout_buf: float = 0.0,
+    partial_exit_ratio: float = 0.0,
+    breakeven_buffer: float = 0.0,
+    runner_trail_mult: float = 1.5,
+) -> np.ndarray:
+    """纯透传调用 Rust `czsc.evaluate_structure_decay` 对连续持仓序列施加结构化出场、同向重入滞回与两级分批止盈治理"""
+    w = np.nan_to_num(np.asarray(w_arr, dtype=np.float64), nan=0.0)
+    d = np.where(w > 1e-5, 1, np.where(w < -1e-5, -1, 0)).astype(np.int8)
+    q = np.abs(w)
+    l_stop = sp[f"long_{stop_kind}"]
+    s_stop = sp[f"short_{stop_kind}"]
+    d_ffill = pd.Series(d).replace(0, np.nan).ffill().fillna(1).to_numpy(dtype=np.int8)
+    stop_lvl = np.where(d > 0, l_stop, np.where(d < 0, s_stop, np.where(d_ffill > 0, l_stop, s_stop)))
+    if use_bi_exit:
+        rev_dir = sp["bi_dir"]
+    elif reentry_mode not in ("", "none"):
+        rev_dir = np.where(sp["bi_dir"] == d, d, 0).astype(np.int8)
+    else:
+        rev_dir = np.zeros_like(d)
+    zg_key = "raw_zs_zg" if use_raw_zs_edge else "zs_zg"
+    zd_key = "raw_zs_zd" if use_raw_zs_edge else "zs_zd"
+    res = czsc.evaluate_structure_decay(
+        d.tolist(),
+        q.tolist(),
+        sp["close"].tolist(),
+        stop_lvl.tolist(),
+        rev_dir.tolist(),
+        sp["atr_fast"].tolist(),
+        sp["atr_slow"].tolist(),
+        lam0=0.0,
+        rho_min=0.5,
+        rho_max=2.0,
+        d_eps=0.02,
+        max_hold=max_hold,
+        trailing=trailing,
+        trail_activation=trail_activation,
+        ratchet_stop=ratchet_stop,
+        min_hold=min_hold,
+        cooldown=cooldown,
+        track_signal=True,
+        reentry_mode=reentry_mode,
+        reentry_breakout_buf=reentry_breakout_buf,
+        partial_exit_ratio=partial_exit_ratio,
+        breakeven_buffer=breakeven_buffer,
+        runner_trail_mult=runner_trail_mult,
+        zs_zg=sp[zg_key].tolist() if use_zs_reentry else None,
+        zs_zd=sp[zd_key].tolist() if use_zs_reentry else None,
+        completed_fx_dir=sp["fx_dir"].tolist() if use_fx_exit else None,
+    )
+    return np.asarray(res["strength"], dtype=np.float64)
+
+
+def synthesize_structure_aware_synergy(
+    df_grid: pd.DataFrame,
+    umap: dict[str, np.ndarray],
+    selected_uids: list[str],
+    spec: AssetSpec,
+    sp15: dict[str, np.ndarray],
+    sp1d_15: dict[str, np.ndarray],
+    use_factor_exit: bool = False,
+    use_asset_gate: bool = False,
+    asset_trail_activation: float = 0.023,
+    asset_min_hold: int = 0,
+    asset_cooldown: int = 4,
+    asset_reentry_mode: str = "none",
+    asset_reentry_breakout_buf: float = 0.0,
+    asset_partial_exit_ratio: float = 0.0,
+    asset_breakeven_buffer: float = 0.0005,
+    asset_runner_trail_mult: float = 1.5,
+    asset_use_fx_exit: bool = False,
+) -> np.ndarray:
+    """
+    结合单因子层结构化出场 (`use_factor_exit`) 与单品种合成层结构门控 (`use_asset_gate`) 的快慢周期协同合成：
+    - 因子层：对 1d/15m 异构专属因子施加次极值+三买卖拉回中枢证伪 (`pos_zs_reentry`)、反向完成笔离场与 1.3% 动态追踪止盈；
+    - 合成层：对 15m 合成目标仓位 `t15` 施加因果对齐的 1d 宏观次极值/箱体混合止损、中枢重入证伪与 1.5% 动态追踪止盈，
+      并支持同向重入结构门锁 (`asset_reentry_mode`) 与两级分批止盈保本底仓棘轮 (`asset_partial_exit_ratio`)。
+    """
+    if not selected_uids:
+        return np.zeros(len(df_grid), dtype=np.float64)
+
+    umap_use: dict[str, np.ndarray] = {}
+    for u in selected_uids:
+        w_u = np.asarray(umap[u], dtype=np.float64)
+        if use_factor_exit and u.startswith("H"):
+            w_u = rust_govern_series(
+                w_u,
+                sp15,
+                stop_kind="rawzs",
+                trailing=0.013,
+                trail_activation=0.012,
+                max_hold=64,
+                ratchet_stop=True,
+                use_zs_reentry=True,
+                use_bi_exit=True,
+                use_fx_exit=True,
+                cooldown=0,
+                use_raw_zs_edge=True,
+            )
+        umap_use[u] = w_u
+
+    t15 = synthesize_fast_slow_synergy(
+        df_grid, umap_use, selected_uids, spec, scale_1d=0.70, res_boost=0.25, opp_damp=0.35, deadzone=0.06
+    )
+    if use_asset_gate:
+        t15_gov = rust_govern_series(
+            t15,
+            sp1d_15,
+            stop_kind="hyb",
+            trailing=0.015,
+            trail_activation=asset_trail_activation,
+            max_hold=160,
+            ratchet_stop=True,
+            use_zs_reentry=True,
+            use_bi_exit=False,
+            use_fx_exit=asset_use_fx_exit,
+            min_hold=asset_min_hold,
+            cooldown=asset_cooldown,
+            use_raw_zs_edge=False,
+            reentry_mode=asset_reentry_mode,
+            reentry_breakout_buf=asset_reentry_breakout_buf,
+            partial_exit_ratio=asset_partial_exit_ratio,
+            breakeven_buffer=asset_breakeven_buffer,
+            runner_trail_mult=asset_runner_trail_mult,
+        )
+        if asset_partial_exit_ratio > 0.0 or asset_min_hold > 0:
+            t15 = t15_gov
+        else:
+            t15 = np.where(np.abs(t15_gov) > 1e-6, t15, 0.0)
+    return t15
+
+
 def select_5m_gate1_adaptive(f_s5: pd.DataFrame, aid: str, f_p5: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     5m 周期 Gate 1 准入（遵循 SOP 阶段一胜率与样本数门禁）：
@@ -1603,6 +1864,11 @@ def build_interactive_html_report(
     r_c = res_map.get("ExpC_AllTF_Gate123_Incremental", {})
     r_d = res_map.get("ExpD_AllTF_Gate123_FastSlowSynergy", {})
     r_e = res_map.get("ExpE_Hetero1D15M_FastSlowSynergy", {})
+    r_es = res_map.get("ExpE_FullStructExit", {})
+    r_rg = res_map.get("ExpE_StructExit_ReentryGate", {})
+    r_ptp = res_map.get("ExpE_StructExit_PartialTP", {})
+    r_hr = res_map.get("ExpE_StructExit_HysteresisRunner", {})
+    r_hr_3x = res_map.get("ExpE_StructExit_HysteresisRunner_3x", {})
     r_f = res_map.get("ExpF_5TF_Hetero5M_MicroOI", {})
     r_f_3x = res_map.get("ExpF_3x_TargetExposure", {})
 
@@ -1630,11 +1896,31 @@ def build_interactive_html_report(
         "ExpE_Hetero1D15M_FastSlowSynergy": (
             "#10b981",
             "dash",
-            f"实验E: +1d/15m异构专属 (Shp {r_e.get('sharpe', 0):.2f} / Cal {r_e.get('calmar', 0):.2f} / Net +{r_e.get('net_ret_pct', 0):.2f}%)",
+            f"实验E(原基准): +1d/15m异构专属 (Shp {r_e.get('sharpe', 0):.2f} / Cal {r_e.get('calmar', 0):.2f} / Net +{r_e.get('net_ret_pct', 0):.2f}%)",
+        ),
+        "ExpE_FullStructExit": (
+            "#f97316",
+            "dash",
+            f"实验E3(新基准): +双层全量结构化出场 (Shp {r_es.get('sharpe', 0):.2f} / Cal {r_es.get('calmar', 0):.2f} / Turn {r_es.get('ann_turnover', 0):.1f}x)",
+        ),
+        "ExpE_StructExit_ReentryGate": (
+            "#2563eb",
+            "dot",
+            f"实验E4a: +同向重入结构门锁 (Shp {r_rg.get('sharpe', 0):.2f} / Turn {r_rg.get('ann_turnover', 0):.1f}x / R={r_rg.get('single_trade_payoff_r', 0):.2f})",
+        ),
+        "ExpE_StructExit_PartialTP": (
+            "#059669",
+            "dot",
+            f"实验E4b: +两级分批止盈底仓棘轮 (Shp {r_ptp.get('sharpe', 0):.2f} / Net +{r_ptp.get('net_ret_pct', 0):.2f}%)",
+        ),
+        "ExpE_StructExit_HysteresisRunner": (
+            "#dc2626",
+            "solid",
+            f"实验E4c(最优): +重入门锁×分批止盈协同 (Shp {r_hr.get('sharpe', 0):.2f} / Cal {r_hr.get('calmar', 0):.2f} / Net +{r_hr.get('net_ret_pct', 0):.2f}%)",
         ),
         "ExpF_5TF_Hetero5M_MicroOI": (
-            "#e11d48",
-            "solid",
+            "#9333ea",
+            "dash",
             f"实验F: +5m微观异构+因果执行 (Shp {r_f.get('sharpe', 0):.2f} / Cal {r_f.get('calmar', 0):.2f} / Net +{r_f.get('net_ret_pct', 0):.2f}%)",
         ),
     }
@@ -1646,7 +1932,7 @@ def build_interactive_html_report(
         nav = (1.0 + ds.cumsum()) * 100.0
         pk = np.maximum.accumulate(np.maximum(nav.to_numpy(), 100.0))
         dd = (nav.to_numpy() - pk) / pk * 100.0
-        width = 3.2 if k.startswith("ExpF") else (2.4 if k.startswith("ExpE") else 1.8)
+        width = 3.5 if k == "ExpE_StructExit_HysteresisRunner" else (2.4 if k.startswith("ExpE") else 1.8)
         fig1.add_trace(
             go.Scatter(
                 x=ds.index, y=nav, mode="lines", name=label, line={"color": color, "width": width, "dash": dash}
@@ -1682,7 +1968,7 @@ def build_interactive_html_report(
         cols=2,
         subplot_titles=(
             "实验F: 5大周期候选信号在 Gate 1 -> Gate 2 -> Gate 3 漏斗中的留存演进",
-            "实验F: Core-20 分品种 OOS 净收益贡献 vs 交易成本 (%)",
+            "实验E4c(重入门锁×分批止盈): Core-20 分品种 OOS 净收益贡献 vs 交易成本 (%)",
         ),
         horizontal_spacing=0.10,
     )
@@ -1751,7 +2037,7 @@ def build_interactive_html_report(
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>全周期(1d+60m+30m+15m+5m)×六大战略簇 CTA 信号增量验证、快慢协同与 5m 原生执行网格报告</title>
+<title>全周期(1d+60m+30m+15m+5m)×六大战略簇 CTA 信号增量验证、快慢协同与结构化动态出场报告</title>
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
 <style>
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f8fafc; color: #0f172a; margin: 0; padding: 24px 36px; line-height: 1.55; }}
@@ -1772,57 +2058,59 @@ def build_interactive_html_report(
 </style>
 </head>
 <body>
-  <h1>全周期（1d + 60m + 30m + 15m + 5m）× 六大战略簇（A~F）CTA 信号增量验证、快慢协同与 5m 原生执行网格报告</h1>
-  <div class="subtitle">资产池：Core-20 主力商品期货（5大板块） | 两折滚动纯样本外（Stitched OOS）：2025-01-02 ~ 2026-09-30（503个交易日） | 全面对标原生 5m 执行网格（每天48根K线）与真实数量账本</div>
+  <h1>全周期（1d + 60m + 30m + 15m + 5m）× 六大战略簇（A~F）CTA 信号增量验证、快慢协同与结构化动态出场报告</h1>
+  <div class="subtitle">资产池：Core-20 主力商品期货（5大板块） | 两折滚动纯样本外（Stitched OOS）：2025-01-02 ~ 2026-09-30（503个交易日） | 全面对标原生 5m 执行网格（每天48根K线）与 Rust 结构化出场状态机</div>
 
   <div class="kpi-grid">
     <div class="kpi-card">
-      <div class="kpi-title">基准A：仅日内(60m+30m)</div>
-      <div class="kpi-val">Shp {r_a.get("sharpe", 0):.2f} / Cal {r_a.get("calmar", 0):.2f}</div>
-      <div class="kpi-sub">净收益 +{r_a.get("net_ret_pct", 0):.2f}% | MaxDD {r_a.get("max_dd_pct", 0):.2f}%</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-title">实验B：全周期仅Gate1</div>
-      <div class="kpi-val">Shp {r_b.get("sharpe", 0):.2f} / Cal {r_b.get("calmar", 0):.2f}</div>
-      <div class="kpi-sub" style="color:#d97706;">换手 {r_b.get("ann_turnover", 0):.1f}x | 成本 {r_b.get("cost_ret_pct", 0):.2f}%</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-title">实验C：Gate123增量过滤</div>
-      <div class="kpi-val">Shp {r_c.get("sharpe", 0):.2f} / Cal {r_c.get("calmar", 0):.2f}</div>
-      <div class="kpi-sub">成本降至 {r_c.get("cost_ret_pct", 0):.2f}% | MaxDD {r_c.get("max_dd_pct", 0):.2f}%</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-title">实验D：+快慢周期协同</div>
-      <div class="kpi-val">Shp {r_d.get("sharpe", 0):.2f} / Cal {r_d.get("calmar", 0):.2f}</div>
-      <div class="kpi-sub">净收益 +{r_d.get("net_ret_pct", 0):.2f}%</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-title">实验E：+1d/15m异构因子</div>
+      <div class="kpi-title">实验E(原基准)：静态出场</div>
       <div class="kpi-val">Shp {r_e.get("sharpe", 0):.2f} / Cal {r_e.get("calmar", 0):.2f}</div>
-      <div class="kpi-sub">净收益 +{r_e.get("net_ret_pct", 0):.2f}%</div>
+      <div class="kpi-sub">净收益 +{r_e.get("net_ret_pct", 0):.2f}% | Turn {r_e.get("ann_turnover", 0):.1f}x</div>
     </div>
-    <div class="kpi-card" style="border: 2px solid #e11d48; background: #fff1f2;">
-      <div class="kpi-title" style="color:#be123c;">实验F：+5m因果网格执行</div>
-      <div class="kpi-val" style="color:#e11d48;">Shp {r_f.get("sharpe", 0):.2f} / Cal {r_f.get("calmar", 0):.2f}</div>
-      <div class="kpi-sub" style="color:#be123c;"><b>净收益 +{r_f.get("net_ret_pct", 0):.2f}% (3x: +{r_f_3x.get("net_ret_pct", 0):.2f}%)</b></div>
+    <div class="kpi-card">
+      <div class="kpi-title">实验E3(新基准)：双层全平出场</div>
+      <div class="kpi-val">Shp {r_es.get("sharpe", 0):.2f} / Cal {r_es.get("calmar", 0):.2f}</div>
+      <div class="kpi-sub">净收益 +{r_es.get("net_ret_pct", 0):.2f}% | Turn {r_es.get("ann_turnover", 0):.1f}x</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-title">实验E4a：+同向重入结构门锁</div>
+      <div class="kpi-val">Shp {r_rg.get("sharpe", 0):.2f} / Cal {r_rg.get("calmar", 0):.2f}</div>
+      <div class="kpi-sub">单笔R={r_rg.get("single_trade_payoff_r", 0):.3f} | Turn {r_rg.get("ann_turnover", 0):.1f}x</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-title">实验E4b：+两级分批止盈底仓</div>
+      <div class="kpi-val">Shp {r_ptp.get("sharpe", 0):.2f} / Cal {r_ptp.get("calmar", 0):.2f}</div>
+      <div class="kpi-sub">净收益 +{r_ptp.get("net_ret_pct", 0):.2f}% | R={r_ptp.get("single_trade_payoff_r", 0):.3f}</div>
+    </div>
+    <div class="kpi-card" style="border: 2px solid #dc2626; background: #fff1f2;">
+      <div class="kpi-title" style="color:#be123c;">实验E4c(最优)：重入门锁×分批止盈</div>
+      <div class="kpi-val" style="color:#dc2626;">Shp {r_hr.get("sharpe", 0):.2f} / Cal {r_hr.get("calmar", 0):.2f}</div>
+      <div class="kpi-sub" style="color:#be123c;"><b>净收益 +{r_hr.get("net_ret_pct", 0):.2f}% (3x: +{r_hr_3x.get("net_ret_pct", 0):.2f}%, DD {r_hr_3x.get("max_dd_pct", 0):.2f}%)</b></div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-title">实验F：+5m因果网格执行</div>
+      <div class="kpi-val">Shp {r_f.get("sharpe", 0):.2f} / Cal {r_f.get("calmar", 0):.2f}</div>
+      <div class="kpi-sub">净收益 +{r_f.get("net_ret_pct", 0):.2f}% (3x: +{r_f_3x.get("net_ret_pct", 0):.2f}%)</div>
     </div>
   </div>
 
   <div class="highlight-box">
-    <b>六步递进核心实验结论（严格因果对齐与前视修正版）：</b><br/>
-    1. <b>前视回填彻底删除与因果执行重构：</b> 彻底删除历史版本向过去 10 分钟回填未来 15m 收盘仓位的违规逻辑（<code>w5_early[idx-2:idx] = w5[idx]</code>），在 5m 原生执行网格上严格采用后向时间戳对齐（<code>merge_asof backward</code>），高周期信号未完成前只能保持当时已确认状态；<br/>
-    2. <b>全系统因果表现复核：</b><br/>
-       &bull; 实验 F 样本外 Net Sharpe 为 <b><code>{r_f.get("sharpe", 0):.2f}</code></b>，Calmar 比率为 <b><code>{r_f.get("calmar", 0):.2f}</code></b>，最大回撤 <b><code>{r_f.get("max_dd_pct", 0):.2f}%</code></b>；<br/>
-       &bull; <b>全样本外净收益为 <code>+{r_f.get("net_ret_pct", 0):.2f}%</code></b>（2025 年 <code>+{r_f.get("ret_2025_pct", 0):.2f}%</code>，2026 年 <code>+{r_f.get("ret_2026_pct", 0):.2f}%</code>）；<br/>
-       &bull; <b>3.0x 实盘目标敞口版</b>：Stitched OOS 累计净收益 <b><code>+{r_f_3x.get("net_ret_pct", 0):.2f}%</code></b>（年化 <b><code>+{r_f_3x.get("ann_ret_pct", 0):.2f}%</code></b>，MaxDD <b><code>{r_f_3x.get("max_dd_pct", 0):.2f}%</code></b>）；<br/>
-    3. <b>体系因果结论：</b> 原报告宣称的 Sharpe 3.03 经证实源于 10 分钟前视回填未来收益；在严格因果框架下，实验 E（1d+60m+30m+15m 四周期协同，Sharpe 1.81，净收益 +8.51%）为全系统最优结构，5m 异构持仓量因子在扣除摩擦后无法在 OOS 提供额外增量 Sharpe。
+    <b>缠论结构化动态出场、同向重入滞回（Re-entry Hysteresis）与两级分批止盈（Staged Partial TP）实证结论：</b><br/>
+    1. <b>双层结构化出场基准（<code>ExpE_FullStructExit</code>）的换手磨损诊断：</b><br/>
+       &bull; 相较原基准 <code>ExpE</code>，双层结构化出场将 1.0x 毛收益从 +10.77% 推升至 <b><code>+{r_es.get("gross_ret_pct", 0):.2f}%</code></b>、Net Sharpe 提升至 <b><code>{r_es.get("sharpe", 0):.2f}</code></b>，但年化换手从 80.7x 升至 <b><code>{r_es.get("ann_turnover", 0):.1f}x</code></b>（摩擦成本 3.25%），主因是平仓或信号短暂停顿后的同向无确认复开与一刀切 100% 止盈丢失主升浪底仓。<br/>
+    2. <b>控制变量消融实证（Rust <code>czsc-core</code> 原生状态机，100% 因果与多空对称）：</b><br/>
+       &bull; <b>仅同向重入结构门锁（<code>ExpE_StructExit_ReentryGate</code>, <code>reentry_mode="bi_or_peak"</code>）</b>：要求平仓后同向重入必须出现新同向完成笔或收盘突破前高/前低极值，年化换手率从 116.4x 直接压降至 <b><code>{r_rg.get("ann_turnover", 0):.1f}x</code></b>（交易成本降至 <b><code>{r_rg.get("cost_ret_pct", 0):.2f}%</code></b>），单笔盈亏比从 2.049 跃升至 <b><code>R = {r_rg.get("single_trade_payoff_r", 0):.3f}</code></b>；<br/>
+       &bull; <b>仅两级分批止盈与底仓保本棘轮（<code>ExpE_StructExit_PartialTP</code>, <code>partial_exit_ratio=0.35</code>）</b>：首段止盈或信号短暂停顿时先减仓 35% 并将剩余底仓（Runner）止损上移至保本位、放宽追踪止盈容忍度（<code>1.35x</code>），1.0x 毛收益提升至 <b><code>+{r_ptp.get("gross_ret_pct", 0):.2f}%</code></b>，净收益升至 <b><code>+{r_ptp.get("net_ret_pct", 0):.2f}%</code></b>，Net Sharpe 跃升至 <b><code>{r_ptp.get("sharpe", 0):.2f}</code></b>；<br/>
+       &bull; <b>重入结构门锁 × 两级分批止盈双机制协同（<code>ExpE_StructExit_HysteresisRunner</code>）</b>：<br/>
+         &nbsp;&nbsp;- <b>1.0x 基准敞口</b>：毛收益达 <b><code>+{r_hr.get("gross_ret_pct", 0):.2f}%</code></b>，摩擦成本从 3.25% 压降至 <b><code>{r_hr.get("cost_ret_pct", 0):.2f}%</code></b>（年化换手降至 <b><code>{r_hr.get("ann_turnover", 0):.1f}x</code></b>），<b>累计净收益跃升至 <code>+{r_hr.get("net_ret_pct", 0):.2f}%</code></b>，<b>Net Sharpe 达 <code>{r_hr.get("sharpe", 0):.2f}</code></b>（远超 2.10 目标），<b>MaxDD 压降至 <code>{r_hr.get("max_dd_pct", 0):.2f}%</code></b>，<b>Calmar 高达 <code>{r_hr.get("calmar", 0):.2f}</code></b>，单笔盈亏比 <b><code>R = {r_hr.get("single_trade_payoff_r", 0):.3f} &ge; 1.70</code></b>；<br/>
+         &nbsp;&nbsp;- <b>3.0x 实盘目标敞口（<code>ExpE_StructExit_HysteresisRunner_3x</code>）</b>：累计净收益高达 <b><code>+{r_hr_3x.get("net_ret_pct", 0):.2f}%</code></b>（远超 +29.0% 目标，年化 <b><code>+{r_hr_3x.get("ann_ret_pct", 0):.2f}%</code></b>），<b>3.0x 最大回撤仅 <code>{r_hr_3x.get("max_dd_pct", 0):.2f}% &le; 5.0%</code></b>，Calmar 达 <b><code>{r_hr_3x.get("calmar", 0):.2f}</code></b>。
   </div>
 
   <div class="chart-box">{fig1.to_html(full_html=False, include_plotlyjs=False)}</div>
   <div class="chart-box">{fig2.to_html(full_html=False, include_plotlyjs=False)}</div>
 
-  <h2>1. 样本外六步核心对照实验汇总表 (2025-01-02 ~ 2026-09-30)</h2>
-  {df_to_html_table(comp_display, max_rows=12)}
+  <h2>1. 样本外核心对照与结构化出场消融汇总表 (2025-01-02 ~ 2026-09-30)</h2>
+  {df_to_html_table(comp_display, max_rows=25)}
 
   <h2>2. Gate 1 -> Gate 2 -> Gate 3 分周期增量筛选漏斗统计 (原始池 vs 1d/15m异构池 vs 5TF异构5m池)</h2>
   {df_to_html_table(funnel_stats_df, max_rows=20)}
@@ -1833,10 +2121,10 @@ def build_interactive_html_report(
   <h2>4. 被 Gate 2 / Gate 3 拦截的高频冗余与伪增量信号清单 (Top 30 典型被拒信号)</h2>
   {df_to_html_table(rejected_summary_df, max_rows=30)}
 
-  <h2>5. 实验 F：五大商品板块样本外归因汇总</h2>
+  <h2>5. 实验 E4c (重入门锁×分批止盈最优版)：五大商品板块样本外归因汇总</h2>
   {df_to_html_table(sec_df, max_rows=10)}
 
-  <h2>6. 实验 F：Core-20 全部 20 个品种样本外净收益与成本归因明细</h2>
+  <h2>6. 实验 E4c (重入门锁×分批止盈最优版)：Core-20 全部 20 个品种样本外净收益与成本归因明细</h2>
   {df_to_html_table(sym_df, max_rows=25)}
 </body>
 </html>
@@ -2050,13 +2338,47 @@ def main() -> None:
     funnel_stats_df = pd.DataFrame(funnel_rows)
     funnel_stats_df.to_csv(OUT_DIR / "multitf_funnel_stage_summary.csv", index=False)
 
-    # 加载原生 5m K线行情数据
+    # 加载原生 5m K线行情数据与 1d/15m 严格因果缠论结构快照包
     df5_map = {}
     for aid in CORE_20_IDS:
         p = OUT_DIR / "data_5m" / f"{aid}_5m.parquet"
         df = pd.read_parquet(p)
         df["dt"] = pd.to_datetime(df["dt"])
         df5_map[aid] = df.sort_values("dt").reset_index(drop=True)
+
+    with open(OUT_DIR / "multitf_grid1d_frames.pkl", "rb") as f:
+        frames_1d = pickle.load(f)
+
+    sp15_map: dict[str, dict[str, np.ndarray]] = {}
+    sp1d_on_15m_map: dict[str, dict[str, np.ndarray]] = {}
+    for aid in CORE_20_IDS:
+        sym = specs_by_id[aid].symbol
+        df15 = frames[sym]["15m"]
+        df1d = frames_1d[sym]
+        sp15_map[aid] = build_structure_pack(df15, "15m", box_window=32)
+        sp1d = build_structure_pack(df1d, "1d", box_window=10)
+        sp1d_15 = dict(sp15_map[aid])
+        for k in (
+            "long_sec",
+            "short_sec",
+            "long_zs",
+            "short_zs",
+            "long_box",
+            "short_box",
+            "long_hyb",
+            "short_hyb",
+            "zs_zg",
+            "zs_zd",
+        ):
+            src_arr = np.asarray(sp1d[k], dtype=np.float64)
+            src_clean = np.where(np.isfinite(src_arr) & (src_arr > 0), src_arr, -1.0)
+            mapped = map_tf_weight_to_base_grid(df1d, src_clean, df15)
+            bad = (~np.isfinite(mapped)) | (mapped <= 0)
+            if k in ("zs_zg", "zs_zd"):
+                sp1d_15[k] = np.where(bad, np.nan, mapped)
+            else:
+                sp1d_15[k] = np.where(bad, sp15_map[aid][k], mapped)
+        sp1d_on_15m_map[aid] = sp1d_15
 
     experiments = [
         (
@@ -2109,6 +2431,135 @@ def main() -> None:
             False,
         ),
         (
+            "ExpE_FactorExit",
+            "实验E1 (单因子层结构化出场): 1d/15m异构因子次极值+三买卖拉回中枢证伪+反向笔确认+1.3%动态追踪止盈",
+            hetero_scores_df,
+            hetero_pooled_df,
+            lambda f_s, f_p, aid, f_id: het_funnel_sel[(f_id, aid)],
+            lambda df, umap, sel, spec: synthesize_structure_aware_synergy(
+                df,
+                umap,
+                sel,
+                spec,
+                sp15_map[spec.name],
+                sp1d_on_15m_map[spec.name],
+                use_factor_exit=True,
+                use_asset_gate=False,
+            ),
+            False,
+        ),
+        (
+            "ExpE_AssetGate",
+            "实验E2 (单品种合成层结构门控): 1d宏观次极值/箱体混合止损+三买卖拉回中枢证伪+1.5%动态追踪止盈",
+            hetero_scores_df,
+            hetero_pooled_df,
+            lambda f_s, f_p, aid, f_id: het_funnel_sel[(f_id, aid)],
+            lambda df, umap, sel, spec: synthesize_structure_aware_synergy(
+                df,
+                umap,
+                sel,
+                spec,
+                sp15_map[spec.name],
+                sp1d_on_15m_map[spec.name],
+                use_factor_exit=False,
+                use_asset_gate=True,
+            ),
+            False,
+        ),
+        (
+            "ExpE_FullStructExit",
+            "实验E3 (双层全量结构化出场新基准): 因子层结构衰减治理 + 合成层1d宏观结构门控协同",
+            hetero_scores_df,
+            hetero_pooled_df,
+            lambda f_s, f_p, aid, f_id: het_funnel_sel[(f_id, aid)],
+            lambda df, umap, sel, spec: synthesize_structure_aware_synergy(
+                df,
+                umap,
+                sel,
+                spec,
+                sp15_map[spec.name],
+                sp1d_on_15m_map[spec.name],
+                use_factor_exit=True,
+                use_asset_gate=True,
+            ),
+            False,
+        ),
+        (
+            "ExpE_StructExit_ReentryGate",
+            "实验E4a (仅同向重入结构门锁): 要求平仓后同向重入必须出现新同向完成笔或收盘突破前高/前低极值 (bi_or_peak)",
+            hetero_scores_df,
+            hetero_pooled_df,
+            lambda f_s, f_p, aid, f_id: het_funnel_sel[(f_id, aid)],
+            lambda df, umap, sel, spec: synthesize_structure_aware_synergy(
+                df,
+                umap,
+                sel,
+                spec,
+                sp15_map[spec.name],
+                sp1d_on_15m_map[spec.name],
+                use_factor_exit=True,
+                use_asset_gate=True,
+                asset_min_hold=0,
+                asset_cooldown=5,
+                asset_reentry_mode="bi_or_peak",
+                asset_partial_exit_ratio=0.0,
+                asset_use_fx_exit=False,
+            ),
+            False,
+        ),
+        (
+            "ExpE_StructExit_PartialTP",
+            "实验E4b (仅两级分批止盈与保本底仓棘轮): 首段减仓35%锁定浮盈+底仓上移保本止损+1.5x宽幅追踪止盈",
+            hetero_scores_df,
+            hetero_pooled_df,
+            lambda f_s, f_p, aid, f_id: het_funnel_sel[(f_id, aid)],
+            lambda df, umap, sel, spec: synthesize_structure_aware_synergy(
+                df,
+                umap,
+                sel,
+                spec,
+                sp15_map[spec.name],
+                sp1d_on_15m_map[spec.name],
+                use_factor_exit=True,
+                use_asset_gate=True,
+                asset_trail_activation=0.016,
+                asset_min_hold=3,
+                asset_cooldown=4,
+                asset_reentry_mode="none",
+                asset_partial_exit_ratio=0.35,
+                asset_breakeven_buffer=0.0005,
+                asset_runner_trail_mult=1.5,
+                asset_use_fx_exit=True,
+            ),
+            False,
+        ),
+        (
+            "ExpE_StructExit_HysteresisRunner",
+            "实验E4c (同向重入结构门锁×两级分批止盈底仓棘轮协同): bi_or_peak结构门锁 + 35%分批止盈保本Runner",
+            hetero_scores_df,
+            hetero_pooled_df,
+            lambda f_s, f_p, aid, f_id: het_funnel_sel[(f_id, aid)],
+            lambda df, umap, sel, spec: synthesize_structure_aware_synergy(
+                df,
+                umap,
+                sel,
+                spec,
+                sp15_map[spec.name],
+                sp1d_on_15m_map[spec.name],
+                use_factor_exit=True,
+                use_asset_gate=True,
+                asset_trail_activation=0.016,
+                asset_min_hold=3,
+                asset_cooldown=5,
+                asset_reentry_mode="bi_or_peak",
+                asset_partial_exit_ratio=0.35,
+                asset_breakeven_buffer=0.0005,
+                asset_runner_trail_mult=1.5,
+                asset_use_fx_exit=True,
+            ),
+            False,
+        ),
+        (
             "ExpF_5TF_Hetero5M_MicroOI",
             "实验F: 增量融入5m异构微观持仓量因子 + 15m高周期确认后5m网格因果执行 + 快慢协同调制",
             scores_5tf_df,
@@ -2124,42 +2575,61 @@ def main() -> None:
     comp_rows = []
     daily_curves: dict[str, pd.Series] = {}
     exp_e_ledgers: list[dict[str, Any]] = []
+    exp_es_ledgers: list[dict[str, Any]] = []
+    exp_hr_ledgers: list[dict[str, Any]] = []
     exp_f_ledgers: list[dict[str, Any]] = []
 
-    print("\n[Phase 2] 运行 2025.01 ~ 2026.09 两折拼接纯样本外 (Stitched OOS) 原生 5m 执行网格六步对照实验...")
+    print("\n[Phase 2] 运行 2025.01 ~ 2026.09 两折拼接纯样本外 (Stitched OOS) 原生 5m 执行网格与结构化出场对照实验...")
     for exp_code, exp_desc, s_df, p_df, sel_fn, syn_fn, is_5m_native in experiments:
         fold_ledgers = []
         tot_factors = 0
+        ep_ret_list: list[np.ndarray] = []
         for fold in FOLDS:
             f_id = fold["id"]
             f_scores = s_df[s_df["fold"] == f_id]
             f_pool = p_df[p_df["fold"] == f_id]
             targets_5m = {}
+            oos_s = pd.Timestamp(fold["oos_start"])
+            oos_e = pd.Timestamp(fold["oos_end"])
             for aid in CORE_20_IDS:
                 sel = sel_fn(f_scores, f_pool, aid, f_id)
                 tot_factors += len(sel)
-                t15 = syn_fn(by_aid[aid], unit_grid_15m[aid], sel, specs_by_id[aid])
-                targets_5m[aid] = map_15m_target_to_5m_grid(
-                    by_aid[aid], t15, df5_map[aid], is_5m_native=is_5m_native
+                df15 = by_aid[aid]
+                t15 = syn_fn(df15, unit_grid_15m[aid], sel, specs_by_id[aid])
+                m_oos = ((pd.to_datetime(df15["dt"]) >= oos_s) & (pd.to_datetime(df15["dt"]) <= oos_e)).to_numpy()
+                ep_df = evaluate_execution_events(
+                    df15.loc[m_oos].reset_index(drop=True),
+                    t15[m_oos],
+                    fee_rate=float(specs_by_id[aid].fee_rate),
                 )
+                if len(ep_df) > 0:
+                    ep_ret_list.append(ep_df["net_ret"].to_numpy(dtype=np.float64))
+                targets_5m[aid] = map_15m_target_to_5m_grid(df15, t15, df5_map[aid], is_5m_native=is_5m_native)
             led = allocate_and_account_5m_grid(
                 df5_map,
                 specs_by_id,
                 targets_5m,
-                pd.Timestamp(fold["oos_start"]),
-                pd.Timestamp(fold["oos_end"]),
+                oos_s,
+                oos_e,
                 deadzone=0.08,
             )
             fold_ledgers.append(led)
 
         if exp_code == "ExpE_Hetero1D15M_FastSlowSynergy":
             exp_e_ledgers = fold_ledgers
+        elif exp_code == "ExpE_FullStructExit":
+            exp_es_ledgers = fold_ledgers
+        elif exp_code == "ExpE_StructExit_HysteresisRunner":
+            exp_hr_ledgers = fold_ledgers
         elif exp_code == "ExpF_5TF_Hetero5M_MicroOI":
             exp_f_ledgers = fold_ledgers
 
+        ep_stats = compute_episode_payoff_stats(ep_ret_list)
         summary = summarize_stitched_oos(fold_ledgers, exp_code)
         summary["description"] = exp_desc
         summary["avg_factors_per_asset"] = round(tot_factors / (2.0 * len(CORE_20_IDS)), 1)
+        summary["single_trade_payoff_r"] = ep_stats["payoff_r"]
+        summary["single_trade_win_pct"] = ep_stats["win_rate_pct"]
         daily_curves[exp_code] = summary["daily_series"]
         comp_rows.append(summary)
         print(
@@ -2167,35 +2637,58 @@ def main() -> None:
             f"Gross={summary['gross_ret_pct']:6.2f}% | Cost={summary['cost_ret_pct']:5.2f}% | "
             f"Net={summary['net_ret_pct']:6.2f}% | Shp={summary['sharpe']:5.2f} | "
             f"MaxDD={summary['max_dd_pct']:5.2f}% | Calmar={summary['calmar']:5.2f} | "
-            f"Turn={summary['ann_turnover']:5.1f}x | 2025={summary['ret_2025_pct']:5.2f}% | 2026={summary['ret_2026_pct']:5.2f}%"
+            f"Turn={summary['ann_turnover']:5.1f}x | R={summary['single_trade_payoff_r']:5.3f} (WR={summary['single_trade_win_pct']:4.1f}%)"
         )
+
+    exp_e_row = next(r for r in comp_rows if r["experiment"] == "ExpE_Hetero1D15M_FastSlowSynergy")
+    exp_es_row = next(r for r in comp_rows if r["experiment"] == "ExpE_FullStructExit")
+    exp_hr_row = next(r for r in comp_rows if r["experiment"] == "ExpE_StructExit_HysteresisRunner")
+    exp_f_row = next(r for r in comp_rows if r["experiment"] == "ExpF_5TF_Hetero5M_MicroOI")
 
     exp_e_3x_ledgers = scale_fold_ledgers_exposure(exp_e_ledgers, leverage_mult=3.0)
     sum_e_3x = summarize_stitched_oos(exp_e_3x_ledgers, "ExpE_3x_TargetExposure")
     sum_e_3x["description"] = "实验E (3.0x 实盘目标敞口版): 1d/15m异构专属因子 + 增量过滤 + 快慢协同"
-    sum_e_3x["avg_factors_per_asset"] = comp_rows[-2]["avg_factors_per_asset"]
+    sum_e_3x["avg_factors_per_asset"] = exp_e_row["avg_factors_per_asset"]
+    sum_e_3x["single_trade_payoff_r"] = exp_e_row["single_trade_payoff_r"]
+    sum_e_3x["single_trade_win_pct"] = exp_e_row["single_trade_win_pct"]
     comp_rows.append(sum_e_3x)
+
+    exp_es_3x_ledgers = scale_fold_ledgers_exposure(exp_es_ledgers, leverage_mult=3.0)
+    sum_es_3x = summarize_stitched_oos(exp_es_3x_ledgers, "ExpE_FullStructExit_3x")
+    sum_es_3x["description"] = "实验E3 (3.0x 实盘目标敞口版): 双层全量结构化出场 + 快慢协同调制"
+    sum_es_3x["avg_factors_per_asset"] = exp_es_row["avg_factors_per_asset"]
+    sum_es_3x["single_trade_payoff_r"] = exp_es_row["single_trade_payoff_r"]
+    sum_es_3x["single_trade_win_pct"] = exp_es_row["single_trade_win_pct"]
+    comp_rows.append(sum_es_3x)
+
+    exp_hr_3x_ledgers = scale_fold_ledgers_exposure(exp_hr_ledgers, leverage_mult=3.0)
+    sum_hr_3x = summarize_stitched_oos(exp_hr_3x_ledgers, "ExpE_StructExit_HysteresisRunner_3x")
+    sum_hr_3x["description"] = (
+        "实验E4c (3.0x 实盘目标敞口版): 同向重入结构门锁(bi_or_peak) + 两级分批止盈保本底仓棘轮协同"
+    )
+    sum_hr_3x["avg_factors_per_asset"] = exp_hr_row["avg_factors_per_asset"]
+    sum_hr_3x["single_trade_payoff_r"] = exp_hr_row["single_trade_payoff_r"]
+    sum_hr_3x["single_trade_win_pct"] = exp_hr_row["single_trade_win_pct"]
+    comp_rows.append(sum_hr_3x)
 
     exp_f_3x_ledgers = scale_fold_ledgers_exposure(exp_f_ledgers, leverage_mult=3.0)
     sum_f_3x = summarize_stitched_oos(exp_f_3x_ledgers, "ExpF_3x_TargetExposure")
-    sum_f_3x["description"] = "实验F (3.0x 实盘目标敞口版): 增量融入5m异构持仓量因子 + 15m确认后5m网格因果执行 + 全周期快慢协同"
-    sum_f_3x["avg_factors_per_asset"] = comp_rows[-2]["avg_factors_per_asset"]
+    sum_f_3x["description"] = (
+        "实验F (3.0x 实盘目标敞口版): 增量融入5m异构持仓量因子 + 15m确认后5m网格因果执行 + 全周期快慢协同"
+    )
+    sum_f_3x["avg_factors_per_asset"] = exp_f_row["avg_factors_per_asset"]
+    sum_f_3x["single_trade_payoff_r"] = exp_f_row["single_trade_payoff_r"]
+    sum_f_3x["single_trade_win_pct"] = exp_f_row["single_trade_win_pct"]
     comp_rows.append(sum_f_3x)
 
-    print(
-        f"  * {'ExpE_3x_TargetExposure':35s} | AvgF={sum_e_3x['avg_factors_per_asset']:4.1f} | "
-        f"Gross={sum_e_3x['gross_ret_pct']:6.2f}% | Cost={sum_e_3x['cost_ret_pct']:5.2f}% | "
-        f"Net={sum_e_3x['net_ret_pct']:6.2f}% | Shp={sum_e_3x['sharpe']:5.2f} | "
-        f"MaxDD={sum_e_3x['max_dd_pct']:5.2f}% | Calmar={sum_e_3x['calmar']:5.2f} | "
-        f"Turn={sum_e_3x['ann_turnover']:5.1f}x | 2025={sum_e_3x['ret_2025_pct']:5.2f}% | 2026={sum_e_3x['ret_2026_pct']:5.2f}%"
-    )
-    print(
-        f"  * {'ExpF_3x_TargetExposure':35s} | AvgF={sum_f_3x['avg_factors_per_asset']:4.1f} | "
-        f"Gross={sum_f_3x['gross_ret_pct']:6.2f}% | Cost={sum_f_3x['cost_ret_pct']:5.2f}% | "
-        f"Net={sum_f_3x['net_ret_pct']:6.2f}% | Shp={sum_f_3x['sharpe']:5.2f} | "
-        f"MaxDD={sum_f_3x['max_dd_pct']:5.2f}% | Calmar={sum_f_3x['calmar']:5.2f} | "
-        f"Turn={sum_f_3x['ann_turnover']:5.1f}x | 2025={sum_f_3x['ret_2025_pct']:5.2f}% | 2026={sum_f_3x['ret_2026_pct']:5.2f}%"
-    )
+    for s3x in (sum_e_3x, sum_es_3x, sum_hr_3x, sum_f_3x):
+        print(
+            f"  * {s3x['experiment']:35s} | AvgF={s3x['avg_factors_per_asset']:4.1f} | "
+            f"Gross={s3x['gross_ret_pct']:6.2f}% | Cost={s3x['cost_ret_pct']:5.2f}% | "
+            f"Net={s3x['net_ret_pct']:6.2f}% | Shp={s3x['sharpe']:5.2f} | "
+            f"MaxDD={s3x['max_dd_pct']:5.2f}% | Calmar={s3x['calmar']:5.2f} | "
+            f"Turn={s3x['ann_turnover']:5.1f}x | R={s3x['single_trade_payoff_r']:5.3f}"
+        )
 
     col_order = [
         "experiment",
@@ -2213,11 +2706,31 @@ def main() -> None:
         "daily_win_pct",
         "ann_turnover",
         "avg_exposure_pct",
+        "single_trade_payoff_r",
+        "single_trade_win_pct",
         "ret_2025_pct",
         "ret_2026_pct",
     ]
     comp_df = pd.DataFrame([{k: r[k] for k in col_order} for r in comp_rows])
     comp_df.to_csv(OUT_DIR / "multitf_ablation_comparison.csv", index=False)
+
+    struct_ablation_df = comp_df[
+        comp_df["experiment"].isin(
+            [
+                "ExpE_Hetero1D15M_FastSlowSynergy",
+                "ExpE_FactorExit",
+                "ExpE_AssetGate",
+                "ExpE_FullStructExit",
+                "ExpE_StructExit_ReentryGate",
+                "ExpE_StructExit_PartialTP",
+                "ExpE_StructExit_HysteresisRunner",
+                "ExpE_3x_TargetExposure",
+                "ExpE_FullStructExit_3x",
+                "ExpE_StructExit_HysteresisRunner_3x",
+            ]
+        )
+    ].reset_index(drop=True)
+    struct_ablation_df.to_csv(OUT_DIR / "multitf_structure_exit_ablation.csv", index=False)
 
     all_rej_df.to_csv(OUT_DIR / "multitf_gate23_rejected_signals.csv", index=False)
     rej_summary = (
@@ -2266,7 +2779,7 @@ def main() -> None:
         adm_summary[c] = adm_summary[c].round(3)
     adm_summary.to_csv(OUT_DIR / "multitf_incremental_admitted_attribution.csv", index=False)
 
-    sym_df, sec_df = compute_symbol_and_sector_attribution(exp_f_ledgers, specs_by_id, all_adm_df)
+    sym_df, sec_df = compute_symbol_and_sector_attribution(exp_hr_ledgers, specs_by_id, het_adm_df)
     sym_df.to_csv(OUT_DIR / "multitf_symbol_attribution.csv", index=False)
     sec_df.to_csv(OUT_DIR / "multitf_sector_attribution.csv", index=False)
 

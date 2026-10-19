@@ -27,6 +27,7 @@ use crate::objects::zs::ZS;
 use crate::utils::common::create_naive_pandas_timestamp;
 use pyo3::types::{PyDict, PyDictMethods};
 use pyo3_stub_gen::derive::gen_stub_pyfunction;
+mod structure_exit;
 
 /// 对 `analyze::utils::check_fx` 的 Python 友好的薄 wrapper。
 #[gen_stub_pyfunction]
@@ -153,6 +154,7 @@ fn check_gap_info_py(py: Python<'_>, bars: Vec<RawBar>) -> PyResult<Vec<Py<PyDic
 /// 把迁移过来的 czsc-core 类型添加到 czsc-python 传入的父模块上。
 /// 隐藏在 `python` feature 后面，这样普通 Rust 消费者就不会传递性地引入 pyo3。
 pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    structure_exit::register(m)?;
     // 枚举
     m.add_class::<Freq>()?;
     m.add_class::<Market>()?;
