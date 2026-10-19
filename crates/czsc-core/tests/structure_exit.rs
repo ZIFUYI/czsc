@@ -514,3 +514,75 @@ fn ratchet_stop_and_zs_reentry_and_activation_trailing_and_track_signal() {
     assert_eq!(trk.strength[3], 0.0); // latched flat on bar 3 despite upstream direction[3]==1
     assert_eq!(trk.strength[4], 0.8); // re-armed on bar 4 when completed_fx_dir[4]==1
 }
+
+#[test]
+fn reentry_hysteresis_and_staged_partial_take_profit_runner_are_causal_and_symmetric() {
+    use czsc_core::structure_exit::evaluate_structure_decay;
+
+    for side in [1_i8, -1_i8] {
+        let s = f64::from(side);
+        let p = |delta_pct: f64| 100.0 * (1.0 + s * delta_pct);
+        // Bar 0: enter at 100.0, stop at 95%/105%
+        // Bar 1: rally +3.0% (best=103/97)
+        // Bar 2: pull back to +2.4% with opposite FX -> Stage 1 partial_take_profit (scale=0.6, stop raised to breakeven 100.2/99.8)
+        // Bar 3: deeper pullback to +1.5% (1.46% from peak > 1.3% base trailing, but < 1.95% runner trailing!) -> runner survives!
+        // Bar 4: same-side completed BI confirms continuation at +3.5% -> restores full scale 1.0!
+        // Bar 5: sharp reversal to +1.2% (> 1.3% drop from 103.5 peak) -> full trailing_stop exit, latches peak=103.5
+        // Bar 6: same-side FX at +2.0% (below 103.5 peak) -> blocked by reentry_mode="bi_or_peak"!
+        // Bar 7: breakout above peak at +3.8% -> unlocks latch & overrides cooldown!
+        let close = vec![
+            p(0.000),
+            p(0.030),
+            p(0.024),
+            p(0.015),
+            p(0.035),
+            p(0.012),
+            p(0.020),
+            p(0.038),
+        ];
+        let stop = vec![p(-0.05); 8];
+        let direction = vec![side; 8];
+        let quality = vec![0.8; 8];
+        let reverse_dir = vec![0, 0, 0, 0, side, 0, 0, 0];
+        let fx_dir = vec![0, 0, -side, 0, 0, 0, side, 0];
+        let cfg = StructureFactorConfig {
+            lam0: 0.0,
+            trailing: 0.013,
+            trail_activation: 0.02,
+            ratchet_stop: false,
+            min_hold: 1,
+            cooldown: 3,
+            track_signal: true,
+            reentry_mode: "bi_or_peak".into(),
+            reentry_breakout_buf: 0.001,
+            partial_exit_ratio: 0.4,
+            breakeven_buffer: 0.002,
+            runner_trail_mult: 1.5,
+            completed_fx_dir: Some(fx_dir),
+            ..Default::default()
+        };
+        let res = evaluate_structure_decay(
+            &direction,
+            &quality,
+            &close,
+            &stop,
+            &reverse_dir,
+            &[1.0; 8],
+            &[1.0; 8],
+            &cfg,
+        )
+        .unwrap();
+
+        assert!((res.strength[0] - s * 0.8).abs() < 1e-12);
+        assert!((res.strength[1] - s * 0.8).abs() < 1e-12);
+        assert_eq!(res.exit_reason[2], "partial_take_profit");
+        assert!((res.strength[2] - s * 0.8 * 0.6).abs() < 1e-12);
+        assert!((res.stop[2] - p(0.002)).abs() < 1e-12); // ratcheted to breakeven
+        assert!((res.strength[3] - s * 0.8 * 0.6).abs() < 1e-12); // survives 1.46% drawdown thanks to runner_trail_mult=1.5
+        assert!((res.strength[4] - s * 0.8).abs() < 1e-12); // restored to 1.0 scale on same-side BI
+        assert_eq!(res.exit_reason[5], "trailing_stop");
+        assert_eq!(res.strength[5], 0.0);
+        assert_eq!(res.strength[6], 0.0); // blocked on bar 6 despite same-side FX (below peak)
+        assert!((res.strength[7] - s * 0.8).abs() < 1e-12); // unlocked on bar 7 by peak breakout
+    }
+}

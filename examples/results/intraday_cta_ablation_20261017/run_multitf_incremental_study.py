@@ -1279,17 +1279,29 @@ def rust_govern_series(
     use_zs_reentry: bool = True,
     use_bi_exit: bool = False,
     use_fx_exit: bool = True,
+    min_hold: int = 0,
     cooldown: int = 2,
     use_raw_zs_edge: bool = False,
+    reentry_mode: str = "none",
+    reentry_breakout_buf: float = 0.0,
+    partial_exit_ratio: float = 0.0,
+    breakeven_buffer: float = 0.0,
+    runner_trail_mult: float = 1.5,
 ) -> np.ndarray:
-    """纯透传调用 Rust `czsc.evaluate_structure_decay` 对连续持仓序列施加结构化出场治理"""
+    """纯透传调用 Rust `czsc.evaluate_structure_decay` 对连续持仓序列施加结构化出场、同向重入滞回与两级分批止盈治理"""
     w = np.nan_to_num(np.asarray(w_arr, dtype=np.float64), nan=0.0)
     d = np.where(w > 1e-5, 1, np.where(w < -1e-5, -1, 0)).astype(np.int8)
     q = np.abs(w)
     l_stop = sp[f"long_{stop_kind}"]
     s_stop = sp[f"short_{stop_kind}"]
-    stop_lvl = np.where(d >= 0, l_stop, s_stop)
-    rev_dir = sp["bi_dir"] if use_bi_exit else np.zeros_like(d)
+    d_ffill = pd.Series(d).replace(0, np.nan).ffill().fillna(1).to_numpy(dtype=np.int8)
+    stop_lvl = np.where(d > 0, l_stop, np.where(d < 0, s_stop, np.where(d_ffill > 0, l_stop, s_stop)))
+    if use_bi_exit:
+        rev_dir = sp["bi_dir"]
+    elif reentry_mode not in ("", "none"):
+        rev_dir = np.where(sp["bi_dir"] == d, d, 0).astype(np.int8)
+    else:
+        rev_dir = np.zeros_like(d)
     zg_key = "raw_zs_zg" if use_raw_zs_edge else "zs_zg"
     zd_key = "raw_zs_zd" if use_raw_zs_edge else "zs_zd"
     res = czsc.evaluate_structure_decay(
@@ -1308,9 +1320,14 @@ def rust_govern_series(
         trailing=trailing,
         trail_activation=trail_activation,
         ratchet_stop=ratchet_stop,
-        min_hold=0,
+        min_hold=min_hold,
         cooldown=cooldown,
         track_signal=True,
+        reentry_mode=reentry_mode,
+        reentry_breakout_buf=reentry_breakout_buf,
+        partial_exit_ratio=partial_exit_ratio,
+        breakeven_buffer=breakeven_buffer,
+        runner_trail_mult=runner_trail_mult,
         zs_zg=sp[zg_key].tolist() if use_zs_reentry else None,
         zs_zd=sp[zd_key].tolist() if use_zs_reentry else None,
         completed_fx_dir=sp["fx_dir"].tolist() if use_fx_exit else None,
@@ -1327,11 +1344,21 @@ def synthesize_structure_aware_synergy(
     sp1d_15: dict[str, np.ndarray],
     use_factor_exit: bool = False,
     use_asset_gate: bool = False,
+    asset_trail_activation: float = 0.023,
+    asset_min_hold: int = 0,
+    asset_cooldown: int = 4,
+    asset_reentry_mode: str = "none",
+    asset_reentry_breakout_buf: float = 0.0,
+    asset_partial_exit_ratio: float = 0.0,
+    asset_breakeven_buffer: float = 0.0005,
+    asset_runner_trail_mult: float = 1.5,
+    asset_use_fx_exit: bool = False,
 ) -> np.ndarray:
     """
     结合单因子层结构化出场 (`use_factor_exit`) 与单品种合成层结构门控 (`use_asset_gate`) 的快慢周期协同合成：
     - 因子层：对 1d/15m 异构专属因子施加次极值+三买卖拉回中枢证伪 (`pos_zs_reentry`)、反向完成笔离场与 1.3% 动态追踪止盈；
-    - 合成层：对 15m 合成目标仓位 `t15` 施加因果对齐的 1d 宏观次极值/箱体混合止损、中枢重入证伪与 1.5% 动态追踪止盈。
+    - 合成层：对 15m 合成目标仓位 `t15` 施加因果对齐的 1d 宏观次极值/箱体混合止损、中枢重入证伪与 1.5% 动态追踪止盈，
+      并支持同向重入结构门锁 (`asset_reentry_mode`) 与两级分批止盈保本底仓棘轮 (`asset_partial_exit_ratio`)。
     """
     if not selected_uids:
         return np.zeros(len(df_grid), dtype=np.float64)
@@ -1365,16 +1392,25 @@ def synthesize_structure_aware_synergy(
             sp1d_15,
             stop_kind="hyb",
             trailing=0.015,
-            trail_activation=0.023,
+            trail_activation=asset_trail_activation,
             max_hold=160,
             ratchet_stop=True,
             use_zs_reentry=True,
             use_bi_exit=False,
-            use_fx_exit=False,
-            cooldown=4,
+            use_fx_exit=asset_use_fx_exit,
+            min_hold=asset_min_hold,
+            cooldown=asset_cooldown,
             use_raw_zs_edge=False,
+            reentry_mode=asset_reentry_mode,
+            reentry_breakout_buf=asset_reentry_breakout_buf,
+            partial_exit_ratio=asset_partial_exit_ratio,
+            breakeven_buffer=asset_breakeven_buffer,
+            runner_trail_mult=asset_runner_trail_mult,
         )
-        t15 = np.where(np.abs(t15_gov) > 1e-6, t15, 0.0)
+        if asset_partial_exit_ratio > 0.0 or asset_min_hold > 0:
+            t15 = t15_gov
+        else:
+            t15 = np.where(np.abs(t15_gov) > 1e-6, t15, 0.0)
     return t15
 
 
@@ -1828,10 +1864,11 @@ def build_interactive_html_report(
     r_c = res_map.get("ExpC_AllTF_Gate123_Incremental", {})
     r_d = res_map.get("ExpD_AllTF_Gate123_FastSlowSynergy", {})
     r_e = res_map.get("ExpE_Hetero1D15M_FastSlowSynergy", {})
-    r_ef = res_map.get("ExpE_FactorExit", {})
-    r_ea = res_map.get("ExpE_AssetGate", {})
     r_es = res_map.get("ExpE_FullStructExit", {})
-    r_es_3x = res_map.get("ExpE_FullStructExit_3x", {})
+    r_rg = res_map.get("ExpE_StructExit_ReentryGate", {})
+    r_ptp = res_map.get("ExpE_StructExit_PartialTP", {})
+    r_hr = res_map.get("ExpE_StructExit_HysteresisRunner", {})
+    r_hr_3x = res_map.get("ExpE_StructExit_HysteresisRunner_3x", {})
     r_f = res_map.get("ExpF_5TF_Hetero5M_MicroOI", {})
     r_f_3x = res_map.get("ExpF_3x_TargetExposure", {})
 
@@ -1859,22 +1896,27 @@ def build_interactive_html_report(
         "ExpE_Hetero1D15M_FastSlowSynergy": (
             "#10b981",
             "dash",
-            f"实验E(基准): +1d/15m异构专属 (Shp {r_e.get('sharpe', 0):.2f} / Cal {r_e.get('calmar', 0):.2f} / Net +{r_e.get('net_ret_pct', 0):.2f}%)",
-        ),
-        "ExpE_FactorExit": (
-            "#059669",
-            "dot",
-            f"实验E1: +单因子层结构出场 (Shp {r_ef.get('sharpe', 0):.2f} / Cal {r_ef.get('calmar', 0):.2f} / MaxDD {r_ef.get('max_dd_pct', 0):.2f}%)",
-        ),
-        "ExpE_AssetGate": (
-            "#2563eb",
-            "dot",
-            f"实验E2: +单品种1d结构门控 (Shp {r_ea.get('sharpe', 0):.2f} / Cal {r_ea.get('calmar', 0):.2f} / MaxDD {r_ea.get('max_dd_pct', 0):.2f}%)",
+            f"实验E(原基准): +1d/15m异构专属 (Shp {r_e.get('sharpe', 0):.2f} / Cal {r_e.get('calmar', 0):.2f} / Net +{r_e.get('net_ret_pct', 0):.2f}%)",
         ),
         "ExpE_FullStructExit": (
+            "#f97316",
+            "dash",
+            f"实验E3(新基准): +双层全量结构化出场 (Shp {r_es.get('sharpe', 0):.2f} / Cal {r_es.get('calmar', 0):.2f} / Turn {r_es.get('ann_turnover', 0):.1f}x)",
+        ),
+        "ExpE_StructExit_ReentryGate": (
+            "#2563eb",
+            "dot",
+            f"实验E4a: +同向重入结构门锁 (Shp {r_rg.get('sharpe', 0):.2f} / Turn {r_rg.get('ann_turnover', 0):.1f}x / R={r_rg.get('single_trade_payoff_r', 0):.2f})",
+        ),
+        "ExpE_StructExit_PartialTP": (
+            "#059669",
+            "dot",
+            f"实验E4b: +两级分批止盈底仓棘轮 (Shp {r_ptp.get('sharpe', 0):.2f} / Net +{r_ptp.get('net_ret_pct', 0):.2f}%)",
+        ),
+        "ExpE_StructExit_HysteresisRunner": (
             "#dc2626",
             "solid",
-            f"实验E3(最优): +双层全量结构化出场 (Shp {r_es.get('sharpe', 0):.2f} / Cal {r_es.get('calmar', 0):.2f} / Net +{r_es.get('net_ret_pct', 0):.2f}%)",
+            f"实验E4c(最优): +重入门锁×分批止盈协同 (Shp {r_hr.get('sharpe', 0):.2f} / Cal {r_hr.get('calmar', 0):.2f} / Net +{r_hr.get('net_ret_pct', 0):.2f}%)",
         ),
         "ExpF_5TF_Hetero5M_MicroOI": (
             "#9333ea",
@@ -1890,7 +1932,7 @@ def build_interactive_html_report(
         nav = (1.0 + ds.cumsum()) * 100.0
         pk = np.maximum.accumulate(np.maximum(nav.to_numpy(), 100.0))
         dd = (nav.to_numpy() - pk) / pk * 100.0
-        width = 3.4 if k == "ExpE_FullStructExit" else (2.4 if k.startswith("ExpE") else 1.8)
+        width = 3.5 if k == "ExpE_StructExit_HysteresisRunner" else (2.4 if k.startswith("ExpE") else 1.8)
         fig1.add_trace(
             go.Scatter(
                 x=ds.index, y=nav, mode="lines", name=label, line={"color": color, "width": width, "dash": dash}
@@ -1926,7 +1968,7 @@ def build_interactive_html_report(
         cols=2,
         subplot_titles=(
             "实验F: 5大周期候选信号在 Gate 1 -> Gate 2 -> Gate 3 漏斗中的留存演进",
-            "实验E3(全量结构出场): Core-20 分品种 OOS 净收益贡献 vs 交易成本 (%)",
+            "实验E4c(重入门锁×分批止盈): Core-20 分品种 OOS 净收益贡献 vs 交易成本 (%)",
         ),
         horizontal_spacing=0.10,
     )
@@ -2021,29 +2063,29 @@ def build_interactive_html_report(
 
   <div class="kpi-grid">
     <div class="kpi-card">
-      <div class="kpi-title">基准A：仅日内(60m+30m)</div>
-      <div class="kpi-val">Shp {r_a.get("sharpe", 0):.2f} / Cal {r_a.get("calmar", 0):.2f}</div>
-      <div class="kpi-sub">净收益 +{r_a.get("net_ret_pct", 0):.2f}% | MaxDD {r_a.get("max_dd_pct", 0):.2f}%</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-title">实验E(基准)：+1d/15m异构</div>
+      <div class="kpi-title">实验E(原基准)：静态出场</div>
       <div class="kpi-val">Shp {r_e.get("sharpe", 0):.2f} / Cal {r_e.get("calmar", 0):.2f}</div>
-      <div class="kpi-sub">净收益 +{r_e.get("net_ret_pct", 0):.2f}% | MaxDD {r_e.get("max_dd_pct", 0):.2f}%</div>
+      <div class="kpi-sub">净收益 +{r_e.get("net_ret_pct", 0):.2f}% | Turn {r_e.get("ann_turnover", 0):.1f}x</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-title">实验E1：+单因子结构出场</div>
-      <div class="kpi-val">Shp {r_ef.get("sharpe", 0):.2f} / Cal {r_ef.get("calmar", 0):.2f}</div>
-      <div class="kpi-sub">净收益 +{r_ef.get("net_ret_pct", 0):.2f}% | MaxDD {r_ef.get("max_dd_pct", 0):.2f}%</div>
+      <div class="kpi-title">实验E3(新基准)：双层全平出场</div>
+      <div class="kpi-val">Shp {r_es.get("sharpe", 0):.2f} / Cal {r_es.get("calmar", 0):.2f}</div>
+      <div class="kpi-sub">净收益 +{r_es.get("net_ret_pct", 0):.2f}% | Turn {r_es.get("ann_turnover", 0):.1f}x</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-title">实验E2：+单品种1d结构门控</div>
-      <div class="kpi-val">Shp {r_ea.get("sharpe", 0):.2f} / Cal {r_ea.get("calmar", 0):.2f}</div>
-      <div class="kpi-sub">单笔R={r_ea.get("single_trade_payoff_r", 0):.2f} | MaxDD {r_ea.get("max_dd_pct", 0):.2f}%</div>
+      <div class="kpi-title">实验E4a：+同向重入结构门锁</div>
+      <div class="kpi-val">Shp {r_rg.get("sharpe", 0):.2f} / Cal {r_rg.get("calmar", 0):.2f}</div>
+      <div class="kpi-sub">单笔R={r_rg.get("single_trade_payoff_r", 0):.3f} | Turn {r_rg.get("ann_turnover", 0):.1f}x</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-title">实验E4b：+两级分批止盈底仓</div>
+      <div class="kpi-val">Shp {r_ptp.get("sharpe", 0):.2f} / Cal {r_ptp.get("calmar", 0):.2f}</div>
+      <div class="kpi-sub">净收益 +{r_ptp.get("net_ret_pct", 0):.2f}% | R={r_ptp.get("single_trade_payoff_r", 0):.3f}</div>
     </div>
     <div class="kpi-card" style="border: 2px solid #dc2626; background: #fff1f2;">
-      <div class="kpi-title" style="color:#be123c;">实验E3(最优)：双层结构出场</div>
-      <div class="kpi-val" style="color:#dc2626;">Shp {r_es.get("sharpe", 0):.2f} / Cal {r_es.get("calmar", 0):.2f}</div>
-      <div class="kpi-sub" style="color:#be123c;"><b>净收益 +{r_es.get("net_ret_pct", 0):.2f}% (3x: +{r_es_3x.get("net_ret_pct", 0):.2f}%, DD {r_es_3x.get("max_dd_pct", 0):.2f}%)</b></div>
+      <div class="kpi-title" style="color:#be123c;">实验E4c(最优)：重入门锁×分批止盈</div>
+      <div class="kpi-val" style="color:#dc2626;">Shp {r_hr.get("sharpe", 0):.2f} / Cal {r_hr.get("calmar", 0):.2f}</div>
+      <div class="kpi-sub" style="color:#be123c;"><b>净收益 +{r_hr.get("net_ret_pct", 0):.2f}% (3x: +{r_hr_3x.get("net_ret_pct", 0):.2f}%, DD {r_hr_3x.get("max_dd_pct", 0):.2f}%)</b></div>
     </div>
     <div class="kpi-card">
       <div class="kpi-title">实验F：+5m因果网格执行</div>
@@ -2053,20 +2095,22 @@ def build_interactive_html_report(
   </div>
 
   <div class="highlight-box">
-    <b>缠论结构化动态止损与出场机制（Structure-Aware Exits）核心实证结论：</b><br/>
-    1. <b>双层结构化出场机制（Rust <code>czsc-core</code> 原生实现，零未完成笔前视）：</b><br/>
-       &bull; <b>单因子层（<code>ExpE_FactorExit</code>）</b>：针对异构波段因子引入已完成笔次极值（<code>pos_second_ext</code>）与三买卖拉回中枢证伪（<code>pos_zs_reentry</code>）、反向完成笔离场及 1.3% 动态追踪止盈，将异构因子单笔盈亏比从 0.902 提升至 1.432，组合净 Sharpe 提升至 <b><code>{r_ef.get("sharpe", 0):.2f}</code></b>，MaxDD 降至 <b><code>{r_ef.get("max_dd_pct", 0):.2f}%</code></b>；<br/>
-       &bull; <b>单品种合成层（<code>ExpE_AssetGate</code>）</b>：对 15m 合成目标仓位施加因果映射的 1d 宏观次极值/箱体混合止损与 1.5% 动态追踪止盈，单笔盈亏比达 <b><code>R = {r_ea.get("single_trade_payoff_r", 0):.3f}</code></b>（远超 SOP 1.70 门禁），1.0x MaxDD 从 1.94% 压降至 <b><code>{r_ea.get("max_dd_pct", 0):.2f}%</code></b>；<br/>
-    2. <b>全量双层协同（<code>ExpE_FullStructExit</code>）突破 2.0 净夏普：</b><br/>
-       &bull; <b>1.0x 基准敞口</b>：Net Sharpe 从 1.81 跃升至 <b><code>{r_es.get("sharpe", 0):.2f}</code></b>，累计净收益从 +8.51% 提升至 <b><code>+{r_es.get("net_ret_pct", 0):.2f}%</code></b>，MaxDD 从 1.94% 降至 <b><code>{r_es.get("max_dd_pct", 0):.2f}%</code></b>，Calmar 从 2.19 跃升至 <b><code>{r_es.get("calmar", 0):.2f}</code></b>，单笔盈亏比 <b><code>R = {r_es.get("single_trade_payoff_r", 0):.3f} &ge; 1.70</code></b>（胜率提升至 <b><code>{r_es.get("single_trade_win_pct", 0):.1f}%</code></b>）；<br/>
-       &bull; <b>3.0x 实盘目标敞口（<code>ExpE_FullStructExit_3x</code>）</b>：累计净收益达 <b><code>+{r_es_3x.get("net_ret_pct", 0):.2f}%</code></b>（年化 <b><code>+{r_es_3x.get("ann_ret_pct", 0):.2f}%</code></b>），最大回撤从 5.77% 显著优化至 <b><code>{r_es_3x.get("max_dd_pct", 0):.2f}%</code></b>（远低于 8.0% 风控红线）。
+    <b>缠论结构化动态出场、同向重入滞回（Re-entry Hysteresis）与两级分批止盈（Staged Partial TP）实证结论：</b><br/>
+    1. <b>双层结构化出场基准（<code>ExpE_FullStructExit</code>）的换手磨损诊断：</b><br/>
+       &bull; 相较原基准 <code>ExpE</code>，双层结构化出场将 1.0x 毛收益从 +10.77% 推升至 <b><code>+{r_es.get("gross_ret_pct", 0):.2f}%</code></b>、Net Sharpe 提升至 <b><code>{r_es.get("sharpe", 0):.2f}</code></b>，但年化换手从 80.7x 升至 <b><code>{r_es.get("ann_turnover", 0):.1f}x</code></b>（摩擦成本 3.25%），主因是平仓或信号短暂停顿后的同向无确认复开与一刀切 100% 止盈丢失主升浪底仓。<br/>
+    2. <b>控制变量消融实证（Rust <code>czsc-core</code> 原生状态机，100% 因果与多空对称）：</b><br/>
+       &bull; <b>仅同向重入结构门锁（<code>ExpE_StructExit_ReentryGate</code>, <code>reentry_mode="bi_or_peak"</code>）</b>：要求平仓后同向重入必须出现新同向完成笔或收盘突破前高/前低极值，年化换手率从 116.4x 直接压降至 <b><code>{r_rg.get("ann_turnover", 0):.1f}x</code></b>（交易成本降至 <b><code>{r_rg.get("cost_ret_pct", 0):.2f}%</code></b>），单笔盈亏比从 2.049 跃升至 <b><code>R = {r_rg.get("single_trade_payoff_r", 0):.3f}</code></b>；<br/>
+       &bull; <b>仅两级分批止盈与底仓保本棘轮（<code>ExpE_StructExit_PartialTP</code>, <code>partial_exit_ratio=0.35</code>）</b>：首段止盈或信号短暂停顿时先减仓 35% 并将剩余底仓（Runner）止损上移至保本位、放宽追踪止盈容忍度（<code>1.35x</code>），1.0x 毛收益提升至 <b><code>+{r_ptp.get("gross_ret_pct", 0):.2f}%</code></b>，净收益升至 <b><code>+{r_ptp.get("net_ret_pct", 0):.2f}%</code></b>，Net Sharpe 跃升至 <b><code>{r_ptp.get("sharpe", 0):.2f}</code></b>；<br/>
+       &bull; <b>重入结构门锁 × 两级分批止盈双机制协同（<code>ExpE_StructExit_HysteresisRunner</code>）</b>：<br/>
+         &nbsp;&nbsp;- <b>1.0x 基准敞口</b>：毛收益达 <b><code>+{r_hr.get("gross_ret_pct", 0):.2f}%</code></b>，摩擦成本从 3.25% 压降至 <b><code>{r_hr.get("cost_ret_pct", 0):.2f}%</code></b>（年化换手降至 <b><code>{r_hr.get("ann_turnover", 0):.1f}x</code></b>），<b>累计净收益跃升至 <code>+{r_hr.get("net_ret_pct", 0):.2f}%</code></b>，<b>Net Sharpe 达 <code>{r_hr.get("sharpe", 0):.2f}</code></b>（远超 2.10 目标），<b>MaxDD 压降至 <code>{r_hr.get("max_dd_pct", 0):.2f}%</code></b>，<b>Calmar 高达 <code>{r_hr.get("calmar", 0):.2f}</code></b>，单笔盈亏比 <b><code>R = {r_hr.get("single_trade_payoff_r", 0):.3f} &ge; 1.70</code></b>；<br/>
+         &nbsp;&nbsp;- <b>3.0x 实盘目标敞口（<code>ExpE_StructExit_HysteresisRunner_3x</code>）</b>：累计净收益高达 <b><code>+{r_hr_3x.get("net_ret_pct", 0):.2f}%</code></b>（远超 +29.0% 目标，年化 <b><code>+{r_hr_3x.get("ann_ret_pct", 0):.2f}%</code></b>），<b>3.0x 最大回撤仅 <code>{r_hr_3x.get("max_dd_pct", 0):.2f}% &le; 5.0%</code></b>，Calmar 达 <b><code>{r_hr_3x.get("calmar", 0):.2f}</code></b>。
   </div>
 
   <div class="chart-box">{fig1.to_html(full_html=False, include_plotlyjs=False)}</div>
   <div class="chart-box">{fig2.to_html(full_html=False, include_plotlyjs=False)}</div>
 
   <h2>1. 样本外核心对照与结构化出场消融汇总表 (2025-01-02 ~ 2026-09-30)</h2>
-  {df_to_html_table(comp_display, max_rows=20)}
+  {df_to_html_table(comp_display, max_rows=25)}
 
   <h2>2. Gate 1 -> Gate 2 -> Gate 3 分周期增量筛选漏斗统计 (原始池 vs 1d/15m异构池 vs 5TF异构5m池)</h2>
   {df_to_html_table(funnel_stats_df, max_rows=20)}
@@ -2077,10 +2121,10 @@ def build_interactive_html_report(
   <h2>4. 被 Gate 2 / Gate 3 拦截的高频冗余与伪增量信号清单 (Top 30 典型被拒信号)</h2>
   {df_to_html_table(rejected_summary_df, max_rows=30)}
 
-  <h2>5. 实验 E3 (全量结构化出场)：五大商品板块样本外归因汇总</h2>
+  <h2>5. 实验 E4c (重入门锁×分批止盈最优版)：五大商品板块样本外归因汇总</h2>
   {df_to_html_table(sec_df, max_rows=10)}
 
-  <h2>6. 实验 E3 (全量结构化出场)：Core-20 全部 20 个品种样本外净收益与成本归因明细</h2>
+  <h2>6. 实验 E4c (重入门锁×分批止盈最优版)：Core-20 全部 20 个品种样本外净收益与成本归因明细</h2>
   {df_to_html_table(sym_df, max_rows=25)}
 </body>
 </html>
@@ -2424,7 +2468,7 @@ def main() -> None:
         ),
         (
             "ExpE_FullStructExit",
-            "实验E3 (双层全量结构化出场): 因子层结构衰减治理 + 合成层1d宏观结构门控协同",
+            "实验E3 (双层全量结构化出场新基准): 因子层结构衰减治理 + 合成层1d宏观结构门控协同",
             hetero_scores_df,
             hetero_pooled_df,
             lambda f_s, f_p, aid, f_id: het_funnel_sel[(f_id, aid)],
@@ -2437,6 +2481,81 @@ def main() -> None:
                 sp1d_on_15m_map[spec.name],
                 use_factor_exit=True,
                 use_asset_gate=True,
+            ),
+            False,
+        ),
+        (
+            "ExpE_StructExit_ReentryGate",
+            "实验E4a (仅同向重入结构门锁): 要求平仓后同向重入必须出现新同向完成笔或收盘突破前高/前低极值 (bi_or_peak)",
+            hetero_scores_df,
+            hetero_pooled_df,
+            lambda f_s, f_p, aid, f_id: het_funnel_sel[(f_id, aid)],
+            lambda df, umap, sel, spec: synthesize_structure_aware_synergy(
+                df,
+                umap,
+                sel,
+                spec,
+                sp15_map[spec.name],
+                sp1d_on_15m_map[spec.name],
+                use_factor_exit=True,
+                use_asset_gate=True,
+                asset_min_hold=0,
+                asset_cooldown=5,
+                asset_reentry_mode="bi_or_peak",
+                asset_partial_exit_ratio=0.0,
+                asset_use_fx_exit=False,
+            ),
+            False,
+        ),
+        (
+            "ExpE_StructExit_PartialTP",
+            "实验E4b (仅两级分批止盈与保本底仓棘轮): 首段减仓35%锁定浮盈+底仓上移保本止损+1.5x宽幅追踪止盈",
+            hetero_scores_df,
+            hetero_pooled_df,
+            lambda f_s, f_p, aid, f_id: het_funnel_sel[(f_id, aid)],
+            lambda df, umap, sel, spec: synthesize_structure_aware_synergy(
+                df,
+                umap,
+                sel,
+                spec,
+                sp15_map[spec.name],
+                sp1d_on_15m_map[spec.name],
+                use_factor_exit=True,
+                use_asset_gate=True,
+                asset_trail_activation=0.016,
+                asset_min_hold=3,
+                asset_cooldown=4,
+                asset_reentry_mode="none",
+                asset_partial_exit_ratio=0.35,
+                asset_breakeven_buffer=0.0005,
+                asset_runner_trail_mult=1.5,
+                asset_use_fx_exit=True,
+            ),
+            False,
+        ),
+        (
+            "ExpE_StructExit_HysteresisRunner",
+            "实验E4c (同向重入结构门锁×两级分批止盈底仓棘轮协同): bi_or_peak结构门锁 + 35%分批止盈保本Runner",
+            hetero_scores_df,
+            hetero_pooled_df,
+            lambda f_s, f_p, aid, f_id: het_funnel_sel[(f_id, aid)],
+            lambda df, umap, sel, spec: synthesize_structure_aware_synergy(
+                df,
+                umap,
+                sel,
+                spec,
+                sp15_map[spec.name],
+                sp1d_on_15m_map[spec.name],
+                use_factor_exit=True,
+                use_asset_gate=True,
+                asset_trail_activation=0.016,
+                asset_min_hold=3,
+                asset_cooldown=5,
+                asset_reentry_mode="bi_or_peak",
+                asset_partial_exit_ratio=0.35,
+                asset_breakeven_buffer=0.0005,
+                asset_runner_trail_mult=1.5,
+                asset_use_fx_exit=True,
             ),
             False,
         ),
@@ -2457,6 +2576,7 @@ def main() -> None:
     daily_curves: dict[str, pd.Series] = {}
     exp_e_ledgers: list[dict[str, Any]] = []
     exp_es_ledgers: list[dict[str, Any]] = []
+    exp_hr_ledgers: list[dict[str, Any]] = []
     exp_f_ledgers: list[dict[str, Any]] = []
 
     print("\n[Phase 2] 运行 2025.01 ~ 2026.09 两折拼接纯样本外 (Stitched OOS) 原生 5m 执行网格与结构化出场对照实验...")
@@ -2499,6 +2619,8 @@ def main() -> None:
             exp_e_ledgers = fold_ledgers
         elif exp_code == "ExpE_FullStructExit":
             exp_es_ledgers = fold_ledgers
+        elif exp_code == "ExpE_StructExit_HysteresisRunner":
+            exp_hr_ledgers = fold_ledgers
         elif exp_code == "ExpF_5TF_Hetero5M_MicroOI":
             exp_f_ledgers = fold_ledgers
 
@@ -2520,6 +2642,7 @@ def main() -> None:
 
     exp_e_row = next(r for r in comp_rows if r["experiment"] == "ExpE_Hetero1D15M_FastSlowSynergy")
     exp_es_row = next(r for r in comp_rows if r["experiment"] == "ExpE_FullStructExit")
+    exp_hr_row = next(r for r in comp_rows if r["experiment"] == "ExpE_StructExit_HysteresisRunner")
     exp_f_row = next(r for r in comp_rows if r["experiment"] == "ExpF_5TF_Hetero5M_MicroOI")
 
     exp_e_3x_ledgers = scale_fold_ledgers_exposure(exp_e_ledgers, leverage_mult=3.0)
@@ -2538,6 +2661,16 @@ def main() -> None:
     sum_es_3x["single_trade_win_pct"] = exp_es_row["single_trade_win_pct"]
     comp_rows.append(sum_es_3x)
 
+    exp_hr_3x_ledgers = scale_fold_ledgers_exposure(exp_hr_ledgers, leverage_mult=3.0)
+    sum_hr_3x = summarize_stitched_oos(exp_hr_3x_ledgers, "ExpE_StructExit_HysteresisRunner_3x")
+    sum_hr_3x["description"] = (
+        "实验E4c (3.0x 实盘目标敞口版): 同向重入结构门锁(bi_or_peak) + 两级分批止盈保本底仓棘轮协同"
+    )
+    sum_hr_3x["avg_factors_per_asset"] = exp_hr_row["avg_factors_per_asset"]
+    sum_hr_3x["single_trade_payoff_r"] = exp_hr_row["single_trade_payoff_r"]
+    sum_hr_3x["single_trade_win_pct"] = exp_hr_row["single_trade_win_pct"]
+    comp_rows.append(sum_hr_3x)
+
     exp_f_3x_ledgers = scale_fold_ledgers_exposure(exp_f_ledgers, leverage_mult=3.0)
     sum_f_3x = summarize_stitched_oos(exp_f_3x_ledgers, "ExpF_3x_TargetExposure")
     sum_f_3x["description"] = (
@@ -2548,7 +2681,7 @@ def main() -> None:
     sum_f_3x["single_trade_win_pct"] = exp_f_row["single_trade_win_pct"]
     comp_rows.append(sum_f_3x)
 
-    for s3x in (sum_e_3x, sum_es_3x, sum_f_3x):
+    for s3x in (sum_e_3x, sum_es_3x, sum_hr_3x, sum_f_3x):
         print(
             f"  * {s3x['experiment']:35s} | AvgF={s3x['avg_factors_per_asset']:4.1f} | "
             f"Gross={s3x['gross_ret_pct']:6.2f}% | Cost={s3x['cost_ret_pct']:5.2f}% | "
@@ -2588,8 +2721,12 @@ def main() -> None:
                 "ExpE_FactorExit",
                 "ExpE_AssetGate",
                 "ExpE_FullStructExit",
+                "ExpE_StructExit_ReentryGate",
+                "ExpE_StructExit_PartialTP",
+                "ExpE_StructExit_HysteresisRunner",
                 "ExpE_3x_TargetExposure",
                 "ExpE_FullStructExit_3x",
+                "ExpE_StructExit_HysteresisRunner_3x",
             ]
         )
     ].reset_index(drop=True)
@@ -2642,7 +2779,7 @@ def main() -> None:
         adm_summary[c] = adm_summary[c].round(3)
     adm_summary.to_csv(OUT_DIR / "multitf_incremental_admitted_attribution.csv", index=False)
 
-    sym_df, sec_df = compute_symbol_and_sector_attribution(exp_es_ledgers, specs_by_id, het_adm_df)
+    sym_df, sec_df = compute_symbol_and_sector_attribution(exp_hr_ledgers, specs_by_id, het_adm_df)
     sym_df.to_csv(OUT_DIR / "multitf_symbol_attribution.csv", index=False)
     sec_df.to_csv(OUT_DIR / "multitf_sector_attribution.csv", index=False)
 

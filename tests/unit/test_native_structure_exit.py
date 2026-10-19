@@ -328,3 +328,50 @@ def test_ratchet_stop_zs_reentry_trailing_fx_and_continuous_track_signal():
     )
     assert trk["strength"] == [0.6, 0.8, 0.0, 0.0, 0.8]
     assert trk["exit_reason"][2] == "trailing_stop"
+
+
+@pytest.mark.parametrize("side", [1, -1])
+def test_reentry_hysteresis_and_staged_partial_take_profit_runner(side):
+    def p(delta_pct: float) -> float:
+        return 100.0 * (1.0 + side * delta_pct)
+
+    close = [p(0.000), p(0.030), p(0.024), p(0.015), p(0.035), p(0.012), p(0.020), p(0.038)]
+    stop = [p(-0.05)] * 8
+    direction = [side] * 8
+    quality = [0.8] * 8
+    reverse_dir = [0, 0, 0, 0, side, 0, 0, 0]
+    fx_dir = [0, 0, -side, 0, 0, 0, side, 0]
+
+    res = czsc.evaluate_structure_decay(
+        direction,
+        quality,
+        close,
+        stop,
+        reverse_dir,
+        [1.0] * 8,
+        [1.0] * 8,
+        lam0=0.0,
+        trailing=0.013,
+        trail_activation=0.02,
+        ratchet_stop=False,
+        min_hold=1,
+        cooldown=3,
+        track_signal=True,
+        reentry_mode="bi_or_peak",
+        reentry_breakout_buf=0.001,
+        partial_exit_ratio=0.4,
+        breakeven_buffer=0.002,
+        runner_trail_mult=1.5,
+        completed_fx_dir=fx_dir,
+    )
+    assert res["strength"][0] == pytest.approx(side * 0.8)
+    assert res["strength"][1] == pytest.approx(side * 0.8)
+    assert res["exit_reason"][2] == "partial_take_profit"
+    assert res["strength"][2] == pytest.approx(side * 0.8 * 0.6)
+    assert res["stop"][2] == pytest.approx(p(0.002))
+    assert res["strength"][3] == pytest.approx(side * 0.8 * 0.6)
+    assert res["strength"][4] == pytest.approx(side * 0.8)
+    assert res["exit_reason"][5] == "trailing_stop"
+    assert res["strength"][5] == 0.0
+    assert res["strength"][6] == 0.0
+    assert res["strength"][7] == pytest.approx(side * 0.8)

@@ -385,6 +385,11 @@ pub struct StructureFactorConfig {
     pub min_hold: usize,
     pub cooldown: usize,
     pub track_signal: bool,
+    pub reentry_mode: String,
+    pub reentry_breakout_buf: f64,
+    pub partial_exit_ratio: f64,
+    pub breakeven_buffer: f64,
+    pub runner_trail_mult: f64,
     pub zs_zg: Option<Vec<f64>>,
     pub zs_zd: Option<Vec<f64>>,
     pub completed_fx_dir: Option<Vec<i8>>,
@@ -405,6 +410,11 @@ impl Default for StructureFactorConfig {
             min_hold: 0,
             cooldown: 0,
             track_signal: false,
+            reentry_mode: "none".into(),
+            reentry_breakout_buf: 0.0,
+            partial_exit_ratio: 0.0,
+            breakeven_buffer: 0.0,
+            runner_trail_mult: 1.5,
             zs_zg: None,
             zs_zd: None,
             completed_fx_dir: None,
@@ -430,8 +440,33 @@ impl StructureFactorConfig {
                 || allow_disabled_trailing && self.trailing == 0.0)
             || !self.trail_activation.is_finite()
             || !(0.0..=0.25).contains(&self.trail_activation)
+            || !self.reentry_breakout_buf.is_finite()
+            || !(0.0..=0.10).contains(&self.reentry_breakout_buf)
+            || !self.partial_exit_ratio.is_finite()
+            || !(0.0..1.0).contains(&self.partial_exit_ratio)
+            || !self.breakeven_buffer.is_finite()
+            || !(0.0..=0.05).contains(&self.breakeven_buffer)
+            || !self.runner_trail_mult.is_finite()
+            || !(1.0..=3.0).contains(&self.runner_trail_mult)
         {
             return Err("invalid structure configuration: require positive windows, valid decay and trailing in [0.012, 0.015]".into());
+        }
+        if ![
+            "",
+            "none",
+            "bi_or_peak",
+            "bi_above_exit_or_peak",
+            "fx_above_exit",
+            "fx_above_peak",
+            "strict_bi",
+            "peak_only",
+            "profit_hysteresis",
+            "bi_or_fx_peak",
+            "signal_reset",
+        ]
+        .contains(&self.reentry_mode.as_str())
+        {
+            return Err(format!("unknown reentry_mode: {}", self.reentry_mode));
         }
         if self.zs_zg.as_ref().is_some_and(|v| v.len() != n)
             || self.zs_zd.as_ref().is_some_and(|v| v.len() != n)
@@ -510,14 +545,96 @@ struct Holding {
     direction: i8,
     quality: f64,
     decay: f64,
+    scale: f64,
+    stage: u8,
     stop: f64,
     setup: usize,
     entry_close: f64,
     best_close: f64,
     held: usize,
+    flat_held: usize,
 }
+#[derive(Clone, Copy, Default)]
+struct ReentryLatch {
+    side: i8,
+    exit_close: f64,
+    exit_peak: f64,
+    in_profit: bool,
+}
+
 fn valid_stop(side: i8, price: f64, stop: f64) -> bool {
     stop.is_finite() && stop > 0.0 && f64::from(side) * (price - stop) > 0.0
+}
+
+fn can_unlock_reentry(
+    latch: ReentryLatch,
+    close: f64,
+    bi_dir: i8,
+    fx_dir: i8,
+    cfg: &StructureFactorConfig,
+) -> bool {
+    if latch.side == 0 {
+        return true;
+    }
+    let side = latch.side;
+    let above_exit = if side > 0 {
+        close > latch.exit_close * (1.0 + cfg.reentry_breakout_buf)
+    } else {
+        close < latch.exit_close * (1.0 - cfg.reentry_breakout_buf)
+    };
+    let above_peak = if side > 0 {
+        close > latch.exit_peak * (1.0 + cfg.reentry_breakout_buf)
+    } else {
+        close < latch.exit_peak * (1.0 - cfg.reentry_breakout_buf)
+    };
+    match cfg.reentry_mode.as_str() {
+        "" | "none" => bi_dir == side || fx_dir == side,
+        "bi_or_peak" => bi_dir == side || above_peak,
+        "bi_above_exit_or_peak" => (bi_dir == side && above_exit) || above_peak,
+        "fx_above_exit" => (bi_dir == side || fx_dir == side) && above_exit,
+        "fx_above_peak" => (bi_dir == side || fx_dir == side) && above_peak,
+        "strict_bi" => bi_dir == side,
+        "peak_only" => above_peak,
+        "bi_or_fx_peak" => bi_dir == side || (fx_dir == side && above_peak),
+        "profit_hysteresis" => {
+            if latch.in_profit {
+                (bi_dir == side && above_exit) || above_peak
+            } else {
+                bi_dir == side || (fx_dir == side && above_exit)
+            }
+        }
+        "signal_reset" => false,
+        _ => false,
+    }
+}
+
+fn step_holding(
+    h: &mut Holding,
+    close: f64,
+    fast: f64,
+    slow: f64,
+    current_stop_anchor: f64,
+    cfg: &StructureFactorConfig,
+) {
+    let ratio = if fast.is_finite() && slow.is_finite() && fast > 0.0 && slow > 0.0 {
+        fast / slow
+    } else {
+        1.0
+    };
+    h.decay *= (-cfg.lam0 * ratio.clamp(cfg.rho_min, cfg.rho_max)).exp();
+    h.held += 1;
+    if h.direction > 0 {
+        h.best_close = h.best_close.max(close);
+    } else {
+        h.best_close = h.best_close.min(close);
+    }
+    if cfg.ratchet_stop && valid_stop(h.direction, close, current_stop_anchor) {
+        if h.direction > 0 {
+            h.stop = h.stop.max(current_stop_anchor);
+        } else {
+            h.stop = h.stop.min(current_stop_anchor);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -531,8 +648,11 @@ fn advance(
     current_stop_anchor: f64,
     cfg: &StructureFactorConfig,
     out: &mut StructureFactorResult,
-) {
+) -> Option<ReentryLatch> {
     if let Some(h) = holding {
+        let prev_side = h.direction;
+        let prev_peak = h.best_close;
+        let in_profit = f64::from(h.direction) * (close - h.entry_close) > 0.0;
         out.position_direction[t] = h.direction;
         out.stop[t] = h.stop;
         out.setup_index[t] = h.setup as i64;
@@ -541,16 +661,22 @@ fn advance(
         } else {
             (h.entry_close - h.best_close) / h.entry_close.max(1e-12)
         };
-        let trail_active = cfg.trailing > 0.0
-            && (cfg.trail_activation <= 0.0 || peak_gain >= cfg.trail_activation);
+        let trail_dist = if h.stage == 0 {
+            cfg.trailing
+        } else {
+            cfg.trailing * cfg.runner_trail_mult.max(1.0)
+        };
+        let trail_active =
+            trail_dist > 0.0 && (cfg.trail_activation <= 0.0 || peak_gain >= cfg.trail_activation);
         let trailing_broken = trail_active
             && if h.direction > 0 {
-                close <= h.best_close * (1.0 - cfg.trailing)
+                close <= h.best_close * (1.0 - trail_dist)
             } else {
-                close >= h.best_close * (1.0 + cfg.trailing)
+                close >= h.best_close * (1.0 + trail_dist)
             };
         let fx_dir = cfg.completed_fx_dir.as_ref().map_or(0, |v| v[t]);
-        let trailing_fx_broken = trail_active
+        let trailing_fx_broken = h.stage == 0
+            && trail_active
             && cfg.trail_activation > 0.0
             && fx_dir == -h.direction
             && if h.direction > 0 {
@@ -573,38 +699,105 @@ fn advance(
             .soft_exit
             .as_ref()
             .is_some_and(|se| se[t] && (h.held + 1) >= cfg.min_hold.max(1));
-        let reason = if !valid_stop(h.direction, close, h.stop) {
-            "structure_break"
-        } else if zs_reentry_broken {
-            "zs_reentry_break"
-        } else if reverse == -h.direction {
+        let rev_bi_broken = h.stage == 0 && reverse == -h.direction && (h.held + 1) >= cfg.min_hold;
+
+        if !valid_stop(h.direction, close, h.stop) {
+            out.exit_reason[t] = "structure_break".into();
+            *holding = None;
+            return Some(ReentryLatch {
+                side: prev_side,
+                exit_close: close,
+                exit_peak: prev_peak,
+                in_profit,
+            });
+        }
+        if zs_reentry_broken {
+            out.exit_reason[t] = "zs_reentry_break".into();
+            *holding = None;
+            return Some(ReentryLatch {
+                side: prev_side,
+                exit_close: close,
+                exit_peak: prev_peak,
+                in_profit,
+            });
+        }
+        if trailing_broken {
+            out.exit_reason[t] = "trailing_stop".into();
+            *holding = None;
+            return Some(ReentryLatch {
+                side: prev_side,
+                exit_close: close,
+                exit_peak: prev_peak,
+                in_profit,
+            });
+        }
+
+        if h.stage == 1
+            && h.flat_held == 0
+            && (reverse == h.direction
+                || (fx_dir == h.direction && f64::from(h.direction) * (close - prev_peak) >= 0.0))
+        {
+            h.stage = 0;
+            h.scale = 1.0;
+        }
+
+        if h.stage == 0
+            && cfg.partial_exit_ratio > 0.0
+            && (rev_bi_broken || trailing_fx_broken || soft_broken)
+        {
+            let be_stop = if h.direction > 0 {
+                h.entry_close * (1.0 + cfg.breakeven_buffer)
+            } else {
+                h.entry_close * (1.0 - cfg.breakeven_buffer)
+            };
+            if valid_stop(h.direction, close, be_stop) {
+                h.stage = 1;
+                h.scale *= 1.0 - cfg.partial_exit_ratio;
+                if (cfg.trail_activation <= 0.0 || peak_gain >= cfg.trail_activation)
+                    || trailing_fx_broken
+                {
+                    if h.direction > 0 {
+                        h.stop = h.stop.max(be_stop);
+                    } else {
+                        h.stop = h.stop.min(be_stop);
+                    }
+                }
+                step_holding(h, close, fast, slow, current_stop_anchor, cfg);
+                let final_peak = h.best_close;
+                out.stop[t] = h.stop;
+                if h.held > cfg.max_hold {
+                    out.exit_reason[t] = "max_hold".into();
+                    *holding = None;
+                    return Some(ReentryLatch {
+                        side: prev_side,
+                        exit_close: close,
+                        exit_peak: final_peak,
+                        in_profit,
+                    });
+                } else if h.held >= cfg.min_hold && h.decay < cfg.d_eps {
+                    out.exit_reason[t] = "decay".into();
+                    *holding = None;
+                    return Some(ReentryLatch {
+                        side: prev_side,
+                        exit_close: close,
+                        exit_peak: final_peak,
+                        in_profit,
+                    });
+                } else {
+                    out.exit_reason[t] = "partial_take_profit".into();
+                    return None;
+                }
+            }
+        }
+
+        let reason = if rev_bi_broken {
             "reverse_bi"
-        } else if trailing_broken {
-            "trailing_stop"
-        } else if trailing_fx_broken {
+        } else if trailing_fx_broken && cfg.partial_exit_ratio <= 0.0 {
             "trailing_fx_exit"
         } else if soft_broken {
             "soft_exit"
         } else {
-            let ratio = if fast.is_finite() && slow.is_finite() && fast > 0.0 && slow > 0.0 {
-                fast / slow
-            } else {
-                1.0
-            };
-            h.decay *= (-cfg.lam0 * ratio.clamp(cfg.rho_min, cfg.rho_max)).exp();
-            h.held += 1;
-            if h.direction > 0 {
-                h.best_close = h.best_close.max(close);
-            } else {
-                h.best_close = h.best_close.min(close);
-            }
-            if cfg.ratchet_stop && valid_stop(h.direction, close, current_stop_anchor) {
-                if h.direction > 0 {
-                    h.stop = h.stop.max(current_stop_anchor);
-                } else {
-                    h.stop = h.stop.min(current_stop_anchor);
-                }
-            }
+            step_holding(h, close, fast, slow, current_stop_anchor, cfg);
             if h.held > cfg.max_hold {
                 "max_hold"
             } else if h.held >= cfg.min_hold && h.decay < cfg.d_eps {
@@ -614,10 +807,18 @@ fn advance(
             }
         };
         if !reason.is_empty() {
+            let final_peak = h.best_close;
             out.exit_reason[t] = reason.into();
             *holding = None;
+            return Some(ReentryLatch {
+                side: prev_side,
+                exit_close: close,
+                exit_peak: final_peak,
+                in_profit,
+            });
         }
     }
+    None
 }
 
 fn accept(
@@ -631,17 +832,20 @@ fn accept(
 ) {
     if q > 0.0
         && valid_stop(side, close, anchor.stop)
-        && holding.is_none_or(|h| h.direction != side || q >= h.quality * h.decay)
+        && holding.is_none_or(|h| h.direction != side || q >= h.quality * h.decay * h.scale)
     {
         *holding = Some(Holding {
             direction: side,
             quality: q.clamp(0.0, 1.0),
             decay: 1.0,
+            scale: 1.0,
+            stage: 0,
             stop: anchor.stop,
             setup: anchor.index,
             entry_close: close,
             best_close: close,
             held: 0,
+            flat_held: 0,
         });
         out.trigger[t] = true;
         out.direction[t] = side;
@@ -651,7 +855,7 @@ fn accept(
 fn record(holding: Option<Holding>, t: usize, out: &mut StructureFactorResult) {
     if let Some(h) = holding {
         out.position_direction[t] = h.direction;
-        out.strength[t] = f64::from(h.direction) * h.quality * h.decay;
+        out.strength[t] = f64::from(h.direction) * h.quality * h.decay * h.scale;
         out.stop[t] = h.stop;
         out.setup_index[t] = h.setup as i64;
     }
@@ -704,6 +908,8 @@ pub fn evaluate_structure_factor(
     let mut armed: [Option<Armed>; 2] = [None, None];
     let mut holding: Option<Holding> = None;
     let mut cooldown_rem: usize = 0;
+    let mut latch = ReentryLatch::default();
+    let use_hysteresis = !matches!(cfg.reentry_mode.as_str(), "" | "none");
     for t in 0..n {
         cooldown_rem = cooldown_rem.saturating_sub(1);
         let cur_anchor = match holding {
@@ -711,7 +917,7 @@ pub fn evaluate_structure_factor(
             Some(h) if h.direction < 0 => x.short_stop[t],
             _ => f64::NAN,
         };
-        advance(
+        let exited = advance(
             &mut holding,
             t,
             x.close[t],
@@ -722,11 +928,26 @@ pub fn evaluate_structure_factor(
             cfg,
             &mut out,
         );
-        if !out.exit_reason[t].is_empty() && cfg.cooldown > 0 {
+        if exited.is_some() && cfg.cooldown > 0 {
             cooldown_rem = cfg.cooldown;
         }
-        let blocked_side = if is_risk_exit(out.exit_reason[t].as_str()) {
+        let fx_dir = cfg.completed_fx_dir.as_ref().map_or(0, |v| v[t]);
+        if use_hysteresis {
+            if let Some(new_latch) = exited {
+                if is_risk_exit(out.exit_reason[t].as_str()) {
+                    latch = new_latch;
+                }
+            } else if latch.side != 0
+                && can_unlock_reentry(latch, x.close[t], x.completed_bi_dir[t], fx_dir, cfg)
+            {
+                latch = ReentryLatch::default();
+                cooldown_rem = 0;
+            }
+        }
+        let blocked_side = if exited.is_some() && is_risk_exit(out.exit_reason[t].as_str()) {
             out.position_direction[t]
+        } else if use_hysteresis {
+            latch.side
         } else {
             0
         };
@@ -794,6 +1015,9 @@ pub fn evaluate_structure_factor(
             && let Some((side, q, a)) = candidate
         {
             accept(&mut holding, side, q, a, t, x.close[t], &mut out);
+            if holding.is_some_and(|h| h.direction == side) && latch.side == -side {
+                latch = ReentryLatch::default();
+            }
         }
         record(holding, t, &mut out);
     }
@@ -881,25 +1105,76 @@ pub fn evaluate_structure_decay(
     let mut out = StructureFactorResult::new(n);
     let mut holding: Option<Holding> = None;
     let mut cooldown_rem: usize = 0;
-    let mut latched_side: i8 = 0;
+    let mut latch = ReentryLatch::default();
+    let use_hysteresis = !matches!(cfg.reentry_mode.as_str(), "" | "none");
     for t in 0..n {
         cooldown_rem = cooldown_rem.saturating_sub(1);
         if cfg.track_signal {
-            if direction[t] != latched_side {
-                latched_side = 0;
+            if direction[t] == -latch.side && latch.side != 0 {
+                latch = ReentryLatch::default();
+                cooldown_rem = 0;
+            } else if !use_hysteresis && direction[t] != latch.side {
+                latch = ReentryLatch::default();
             }
-            if let Some(h) = holding
-                && direction[t] == 0
-            {
-                out.position_direction[t] = h.direction;
-                out.stop[t] = h.stop;
-                out.setup_index[t] = h.setup as i64;
-                out.exit_reason[t] = "signal_flat".into();
-                holding = None;
-                continue;
+            if let Some(mut h) = holding {
+                if direction[t] == 0 {
+                    h.flat_held += 1;
+                    if h.flat_held > cfg.min_hold {
+                        out.position_direction[t] = h.direction;
+                        out.stop[t] = h.stop;
+                        out.setup_index[t] = h.setup as i64;
+                        out.exit_reason[t] = "signal_flat".into();
+                        holding = None;
+                        if use_hysteresis {
+                            if cfg.cooldown > 0 {
+                                cooldown_rem = cooldown_rem.max(
+                                    cfg.cooldown.saturating_sub(h.flat_held.saturating_sub(1)),
+                                );
+                            }
+                            latch = ReentryLatch {
+                                side: h.direction,
+                                exit_close: close[t],
+                                exit_peak: h.best_close,
+                                in_profit: f64::from(h.direction) * (close[t] - h.entry_close)
+                                    > 0.0,
+                            };
+                        }
+                        continue;
+                    }
+                    if cfg.partial_exit_ratio > 0.0 && h.stage == 0 {
+                        h.stage = 1;
+                        h.scale = 1.0 - cfg.partial_exit_ratio;
+                        let be_stop = if h.direction > 0 {
+                            h.entry_close * (1.0 + cfg.breakeven_buffer)
+                        } else {
+                            h.entry_close * (1.0 - cfg.breakeven_buffer)
+                        };
+                        if valid_stop(h.direction, close[t], be_stop) {
+                            if h.direction > 0 {
+                                h.stop = h.stop.max(be_stop);
+                            } else {
+                                h.stop = h.stop.min(be_stop);
+                            }
+                        }
+                    }
+                    holding = Some(h);
+                } else if direction[t] == h.direction {
+                    let fx_dir = cfg.completed_fx_dir.as_ref().map_or(0, |v| v[t]);
+                    if h.stage == 1
+                        && (h.flat_held > 0
+                            || reverse_dir[t] == h.direction
+                            || fx_dir == h.direction
+                            || cfg.partial_exit_ratio <= 0.35)
+                    {
+                        h.stage = 0;
+                        h.scale = 1.0;
+                    }
+                    h.flat_held = 0;
+                    holding = Some(h);
+                }
             }
         }
-        advance(
+        let exited = advance(
             &mut holding,
             t,
             close[t],
@@ -910,21 +1185,22 @@ pub fn evaluate_structure_decay(
             cfg,
             &mut out,
         );
-        if !out.exit_reason[t].is_empty() && cfg.cooldown > 0 {
+        if exited.is_some() && cfg.cooldown > 0 {
             cooldown_rem = cfg.cooldown;
         }
-        let same_side_risk_exit =
-            direction[t] == out.position_direction[t] && is_risk_exit(out.exit_reason[t].as_str());
+        let same_side_risk_exit = exited.is_some()
+            && direction[t] == out.position_direction[t]
+            && is_risk_exit(out.exit_reason[t].as_str());
         if cfg.track_signal {
-            if !out.exit_reason[t].is_empty() {
-                latched_side = out.position_direction[t];
+            if let Some(new_latch) = exited {
+                latch = new_latch;
             } else if let Some(mut h) = holding {
                 if direction[t] == h.direction && quality[t].is_finite() {
                     h.quality = quality[t].clamp(0.0, 1.0);
                     holding = Some(h);
                 } else if direction[t] == -h.direction && quality[t].is_finite() {
                     holding = None;
-                    latched_side = 0;
+                    latch = ReentryLatch::default();
                     cooldown_rem = 0;
                     accept(
                         &mut holding,
@@ -942,13 +1218,20 @@ pub fn evaluate_structure_decay(
                 }
             } else if direction[t] != 0 && quality[t].is_finite() {
                 let fx_dir = cfg.completed_fx_dir.as_ref().map_or(0, |v| v[t]);
-                if latched_side == direction[t]
-                    && cooldown_rem == 0
-                    && (reverse_dir[t] == direction[t] || fx_dir == direction[t])
-                {
-                    latched_side = 0;
+                if latch.side == direction[t] {
+                    if use_hysteresis
+                        && can_unlock_reentry(latch, close[t], reverse_dir[t], fx_dir, cfg)
+                    {
+                        latch = ReentryLatch::default();
+                        cooldown_rem = 0;
+                    } else if !use_hysteresis
+                        && cooldown_rem == 0
+                        && can_unlock_reentry(latch, close[t], reverse_dir[t], fx_dir, cfg)
+                    {
+                        latch = ReentryLatch::default();
+                    }
                 }
-                if latched_side == 0 && cooldown_rem == 0 {
+                if latch.side == 0 && cooldown_rem == 0 {
                     accept(
                         &mut holding,
                         direction[t],
@@ -968,7 +1251,7 @@ pub fn evaluate_structure_decay(
             && quality[t].is_finite()
             && !same_side_risk_exit
             && cooldown_rem == 0
-            && out.exit_reason[t].is_empty()
+            && exited.is_none()
         {
             accept(
                 &mut holding,

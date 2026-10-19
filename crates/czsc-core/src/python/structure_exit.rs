@@ -69,7 +69,8 @@ fn structure_stop_anchors_py(
 #[pyfunction(name="evaluate_structure_factor", signature=(setup_long, setup_short, setup_quality_long, setup_quality_short,
     confirm_long, confirm_short, confirm_quality_long, confirm_quality_short, close, long_stop, short_stop,
     completed_bi_dir, atr_fast, atr_slow, window=6, lam0=0.10, rho_min=0.5, rho_max=2.0, d_eps=0.02, max_hold=64, trailing=0.013,
-    trail_activation=0.0, ratchet_stop=false, min_hold=0, cooldown=0, zs_zg=None, zs_zd=None, completed_fx_dir=None, soft_exit=None))]
+    trail_activation=0.0, ratchet_stop=false, min_hold=0, cooldown=0, zs_zg=None, zs_zd=None, completed_fx_dir=None, soft_exit=None,
+    reentry_mode="none", reentry_breakout_buf=0.0, partial_exit_ratio=0.0, breakeven_buffer=0.0, runner_trail_mult=1.5))]
 #[allow(clippy::too_many_arguments)]
 fn evaluate_structure_factor_py(
     py: Python<'_>,
@@ -102,6 +103,11 @@ fn evaluate_structure_factor_py(
     zs_zd: Option<Vec<f64>>,
     completed_fx_dir: Option<Vec<i8>>,
     soft_exit: Option<Vec<bool>>,
+    reentry_mode: &str,
+    reentry_breakout_buf: f64,
+    partial_exit_ratio: f64,
+    breakeven_buffer: f64,
+    runner_trail_mult: f64,
 ) -> PyResult<Py<PyDict>> {
     let input = StructureFactorInput {
         setup_long,
@@ -132,6 +138,11 @@ fn evaluate_structure_factor_py(
         min_hold,
         cooldown,
         track_signal: false,
+        reentry_mode: reentry_mode.into(),
+        reentry_breakout_buf,
+        partial_exit_ratio,
+        breakeven_buffer,
+        runner_trail_mult,
         zs_zg,
         zs_zd,
         completed_fx_dir,
@@ -148,7 +159,8 @@ fn evaluate_structure_factor_py(
 #[pyfunction(name="evaluate_structure_decay", signature=(direction, quality, close, stop_level, reverse_dir, atr_fast, atr_slow,
     lam0=0.10, rho_min=0.5, rho_max=2.0, d_eps=0.02, max_hold=64, trailing=0.0,
     trail_activation=0.0, ratchet_stop=false, min_hold=0, cooldown=0, track_signal=false,
-    zs_zg=None, zs_zd=None, completed_fx_dir=None, soft_exit=None))]
+    zs_zg=None, zs_zd=None, completed_fx_dir=None, soft_exit=None,
+    reentry_mode="none", reentry_breakout_buf=0.0, partial_exit_ratio=0.0, breakeven_buffer=0.0, runner_trail_mult=1.5))]
 #[allow(clippy::too_many_arguments)]
 fn evaluate_structure_decay_py(
     py: Python<'_>,
@@ -174,6 +186,11 @@ fn evaluate_structure_decay_py(
     zs_zd: Option<Vec<f64>>,
     completed_fx_dir: Option<Vec<i8>>,
     soft_exit: Option<Vec<bool>>,
+    reentry_mode: &str,
+    reentry_breakout_buf: f64,
+    partial_exit_ratio: f64,
+    breakeven_buffer: f64,
+    runner_trail_mult: f64,
 ) -> PyResult<Py<PyDict>> {
     let cfg = StructureFactorConfig {
         lam0,
@@ -187,6 +204,11 @@ fn evaluate_structure_decay_py(
         min_hold,
         cooldown,
         track_signal,
+        reentry_mode: reentry_mode.into(),
+        reentry_breakout_buf,
+        partial_exit_ratio,
+        breakeven_buffer,
+        runner_trail_mult,
         zs_zg,
         zs_zd,
         completed_fx_dir,

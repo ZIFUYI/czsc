@@ -616,6 +616,11 @@ class DecayConfig:
     min_hold: int = 0
     cooldown: int = 0
     track_signal: bool = False
+    reentry_mode: str = "none"
+    reentry_breakout_buf: float = 0.0
+    partial_exit_ratio: float = 0.0
+    breakeven_buffer: float = 0.0
+    runner_trail_mult: float = 1.5
     use_zs_reentry: bool = False
     use_fx_exit: bool = False
     stop_plugin: str | None = None
@@ -647,6 +652,7 @@ def apply_dynamic_structure_decay(
     from czsc import evaluate_structure_decay
 
     cfg = cfg or DecayConfig()
+    pass_fx = cfg.use_fx_exit or (cfg.reentry_mode not in ("", "none"))
     result = evaluate_structure_decay(
         direction,
         quality,
@@ -666,9 +672,14 @@ def apply_dynamic_structure_decay(
         min_hold=cfg.min_hold,
         cooldown=cfg.cooldown,
         track_signal=cfg.track_signal,
+        reentry_mode=cfg.reentry_mode,
+        reentry_breakout_buf=cfg.reentry_breakout_buf,
+        partial_exit_ratio=cfg.partial_exit_ratio,
+        breakeven_buffer=cfg.breakeven_buffer,
+        runner_trail_mult=cfg.runner_trail_mult,
         zs_zg=zs_zg if cfg.use_zs_reentry else None,
         zs_zd=zs_zd if cfg.use_zs_reentry else None,
-        completed_fx_dir=completed_fx_dir if cfg.use_fx_exit else None,
+        completed_fx_dir=completed_fx_dir if pass_fx else None,
         soft_exit=soft_exit,
     )
     return np.asarray(result["strength"]), np.asarray(result["trigger"], dtype=bool)
@@ -954,6 +965,7 @@ def compute_family(
     cfg = decay or DecayConfig()
     plugin_key = cfg.stop_plugin if (cfg.stop_plugin and cfg.stop_plugin in ctx.structure_anchors) else fdef.archetype
     anchors = ctx.structure_anchors[plugin_key]
+    pass_fx = cfg.use_fx_exit or (cfg.reentry_mode not in ("", "none"))
     result = evaluate_structure_factor(
         long[0],
         short[0],
@@ -980,9 +992,14 @@ def compute_family(
         ratchet_stop=cfg.ratchet_stop,
         min_hold=cfg.min_hold,
         cooldown=cfg.cooldown,
+        reentry_mode=cfg.reentry_mode,
+        reentry_breakout_buf=cfg.reentry_breakout_buf,
+        partial_exit_ratio=cfg.partial_exit_ratio,
+        breakeven_buffer=cfg.breakeven_buffer,
+        runner_trail_mult=cfg.runner_trail_mult,
         zs_zg=ctx.zs_zg if cfg.use_zs_reentry else None,
         zs_zd=ctx.zs_zd if cfg.use_zs_reentry else None,
-        completed_fx_dir=ctx.fx_flip if cfg.use_fx_exit else None,
+        completed_fx_dir=ctx.fx_flip if pass_fx else None,
     )
     # Join IDs to native-frozen Setup indexes; no Python exit/state-machine algorithm.
     result["structure_id"] = [
