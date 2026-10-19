@@ -36,6 +36,11 @@
 pub use czsc_core::analyze;
 pub use czsc_core::error_chain;
 pub use czsc_core::objects;
+pub use czsc_core::structure_exit::{
+    StructureFactorConfig, StructureFactorInput, StructureFactorResult, StructureSnapshot,
+    StructureStopAnchors, evaluate_structure_decay, evaluate_structure_factor, structure_snapshots,
+    structure_stop_anchors, two_stage_trigger,
+};
 
 pub use czsc_utils::bar_generator;
 pub use czsc_utils::freq_data;

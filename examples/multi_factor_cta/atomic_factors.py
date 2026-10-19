@@ -11,17 +11,19 @@
   (FX 强度 / 笔背驰 Q_div / 中枢偏离 Z_zs / 量价资金流 / 波动率压缩扩张)，宪法第一条：核心算法在 Rust，Python 仅解码；
 - D ∈ [0, 1]：动态结构衰减机，取代固定半衰期的指数衰减：
       D_t = D_{t-1} · exp(-λ0 · ρ_t),   ρ_t = clip(ATR_fast / ATR_slow, ρ_min, ρ_max)
-  波动率放大 → 衰减加快；出现**反向笔确认**或收盘**跌破结构证伪点** (多头=分型最低价 / 空头=分型最高价) 时
-  立即截断归零 (D = 0)。
+  波动率放大 → 衰减加快；出现反向完成笔、收盘突破冻结的结构证伪点或触及 1.3% 跟踪阈值时
+  截断归零 (D = 0)，下一开盘执行。
 
-多空 100% 对称：每个因子由同一函数 `build(ctx, side)` 以 `side ∈ {+1, -1}` 生成，所有价格比较都写成
-`side · (价差)` 形式，镜像对称由构造保证 (见 tests/unit/test_six_cluster_atomic_factors.py)。
+Setup / Confirmation 与结构规则由同一函数 `build(ctx, side)` 以 `side ∈ {+1, -1}` 生成，
+按方向价差实现镜像对称。跟踪退出在两侧应用相同的 1.3% 规则；仿射价格镜像不保持百分比回撤，
+因此最终持仓不承诺仿射镜像后逐值反号（分别见镜像条件与原生跟踪阈值回归）。
 
 零前视：只使用 ≤ t 的滚动窗口 / Rust 增量信号 / 已收盘的大级别 K 线 (`merge_asof(direction="backward")`)。
 """
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -36,12 +38,14 @@ from examples.alpha_mining_agent.hypothesis_bank import (
     ARCH_D,
     ARCH_E,
     ARCH_F,
+    ARCHETYPE_RULERS,
     STRENGTH_SIGNAL_KINDS,
     decode_strength,
+    research_bars,
     rust_sma,
 )
 
-BI_BASE_COL = "cz_D0BL9_V230228"  # cxt_bi_base：最新笔方向 (向上/向下)，翻转 = 反向笔确认
+BI_BASE_COL = "cz_D0BL9_V230228"  # 未完成笔方向仅用于趋势状态；退出读取原生完成笔事件
 EPS = 1e-9
 
 
@@ -54,6 +58,8 @@ CS_FEATURE_COLS: tuple[str, ...] = (
     "sector_leader_dir",
     "leader_lag_gap",
     "sector_spread_zscore",
+    "cs_available",
+    "cs_active_count",
 )
 
 
@@ -64,7 +70,7 @@ class CrossSectionProvider(Protocol):
 
 
 class NeutralCrossSection:
-    """默认中性实现 (全 0)，使 F 簇在未挂载外部多品种截面时退化为纯多周期/跨尺度共振。"""
+    """缺失截面占位；不满足跨资产因子 FC02~FC04 的上下文要求。"""
 
     def strength(self, df: pd.DataFrame) -> np.ndarray:
         return np.zeros(len(df), dtype=np.float64)
@@ -80,6 +86,8 @@ class NeutralCrossSection:
             "sector_leader_dir": np.zeros(n, dtype=np.float64),
             "leader_lag_gap": np.zeros(n, dtype=np.float64),
             "sector_spread_zscore": np.zeros(n, dtype=np.float64),
+            "cs_available": np.zeros(n, dtype=bool),
+            "cs_active_count": np.zeros(n, dtype=np.int64),
         }
 
 
@@ -95,7 +103,11 @@ class DataFrameCrossSectionProvider:
         self,
         cs_source: pd.DataFrame | dict[str, pd.DataFrame],
         default_tf: str | None = None,
+        max_quote_age: str | pd.Timedelta | None = None,
     ) -> None:
+        # Fixed timeframe-based age, never inferred from future gaps in the source history.
+        durations = {"5m": "5min", "15m": "15min", "30m": "30min", "60m": "60min", "1d": "1D"}
+        self.max_quote_age = pd.Timedelta(max_quote_age or durations.get(default_tf, "60min"))
         if isinstance(cs_source, dict):
             self._tf_map: dict[str, pd.DataFrame] = {
                 tf: self._normalize_source_df(sdf) for tf, sdf in cs_source.items() if sdf is not None
@@ -126,19 +138,20 @@ class DataFrameCrossSectionProvider:
                 out["cs_slope_rank"] = np.full(n, 0.5, dtype=np.float64)
         if "cs_strength" not in out.columns:
             out["cs_strength"] = np.clip(2.0 * out["cs_slope_rank"].to_numpy(dtype=np.float64) - 1.0, -1.0, 1.0)
+        complete = all(c in df.columns for c in CS_FEATURE_COLS[:5])
+        if "cs_available" not in out:
+            out["cs_available"] = complete
+        if "cs_active_count" not in out:
+            out["cs_active_count"] = np.where(out["cs_available"], 2, 0)
         for col in ("sector_leader_dir", "leader_lag_gap", "sector_spread_zscore"):
             if col not in out.columns:
                 out[col] = np.zeros(n, dtype=np.float64)
         return out
 
     def _select_source_df(self, target_df: pd.DataFrame) -> pd.DataFrame | None:
-        if self._tf_map:
-            for cand in self._tf_map.values():
-                if len(cand) == len(target_df) and np.array_equal(
-                    cand["dt"].to_numpy(), pd.to_datetime(target_df["dt"]).to_numpy()
-                ):
-                    return cand
-        return self._default_df
+        # Selecting a timeframe by full-history length/equality changes when future bars are appended.
+        timeframe = target_df.attrs.get("factor_timeframe")
+        return self._tf_map.get(timeframe, self._default_df)
 
     def features(self, df: pd.DataFrame) -> dict[str, np.ndarray]:
         n = len(df)
@@ -155,7 +168,7 @@ class DataFrameCrossSectionProvider:
         else:
             left = pd.DataFrame({"dt": tgt_dt, "_ord": np.arange(n)})
             left_sorted = left.sort_values("dt")
-            merged = pd.merge_asof(left_sorted, src, on="dt", direction="backward")
+            merged = pd.merge_asof(left_sorted, src, on="dt", direction="backward", tolerance=self.max_quote_age)
             aligned = merged.sort_values("_ord").reset_index(drop=True)
 
         rank_arr = np.clip(
@@ -185,6 +198,8 @@ class DataFrameCrossSectionProvider:
             "sector_leader_dir": leader_dir,
             "leader_lag_gap": lag_gap,
             "sector_spread_zscore": spread_z,
+            "cs_available": aligned["cs_available"].eq(True).to_numpy(dtype=bool),
+            "cs_active_count": aligned["cs_active_count"].fillna(0).to_numpy(dtype=np.int64),
         }
 
     def rank(self, df: pd.DataFrame) -> np.ndarray:
@@ -193,18 +208,24 @@ class DataFrameCrossSectionProvider:
     def strength(self, df: pd.DataFrame) -> np.ndarray:
         return self.features(df)["cs_strength"]
 
-    def cache_fingerprint(self) -> int:
-        src = self._default_df
-        if src is None or src.empty:
-            return 0
-        return hash(
-            (
-                len(src),
-                src["cs_slope_rank"].to_numpy(dtype=np.float64).tobytes(),
-                src["sector_leader_dir"].to_numpy(dtype=np.float64).tobytes(),
-                src["sector_spread_zscore"].to_numpy(dtype=np.float64).tobytes(),
-            )
-        )
+    def cache_fingerprint(self) -> str:
+        """Fingerprint every timeframe, timestamp and feature used by this provider."""
+        frames = sorted(self._tf_map.items()) if self._tf_map else [("default", self._default_df)]
+        digest = hashlib.sha256(str(self.max_quote_age).encode())
+        digest.update(_frame_fingerprint(self._default_df).encode())
+        for tf, src in frames:
+            digest.update(tf.encode())
+            digest.update(_frame_fingerprint(src).encode())
+        return digest.hexdigest()
+
+
+def _frame_fingerprint(df: pd.DataFrame | None) -> str:
+    """Content key includes OHLCV, derived/native columns, timestamps and row order."""
+    if df is None:
+        return "none"
+    digest = hashlib.sha256(repr(tuple((str(c), str(t)) for c, t in df.dtypes.items())).encode())
+    digest.update(pd.util.hash_pandas_object(df, index=True).to_numpy(dtype=np.uint64).tobytes())
+    return digest.hexdigest()
 
 
 def _sigmoid(x: np.ndarray | float) -> np.ndarray:
@@ -330,7 +351,7 @@ class SoftCrossSectionalGate:
         archetype: str,
         direction: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """在法医检验与信号生成中同步对触发脉冲与连续权重施加软门控。"""
+        """只缩放风险暴露，保留每个实际发生的触发事件，避免选择性删除低权重亏损样本。"""
         trig_bool = np.asarray(triggers, dtype=bool)
         g = self.gate_multiplier(cs_rank, er, archetype=archetype, direction=direction)
         if weights is not None:
@@ -338,8 +359,7 @@ class SoftCrossSectionalGate:
             gated_w = self.apply(w_arr, cs_rank, er, archetype=archetype)
         else:
             gated_w = trig_bool.astype(np.float64) * float(direction) * g
-        gated_trig = trig_bool & (g >= self.trigger_gate_floor)
-        return gated_trig, gated_w
+        return trig_bool.copy(), gated_w
 
     @staticmethod
     def extract_causal_er(df: pd.DataFrame, window: int = 20) -> np.ndarray:
@@ -408,6 +428,13 @@ class FactorContext:
     leader_lag_gap: np.ndarray | None = None
     sector_spread_zscore: np.ndarray | None = None
     has_external_cs: bool = False
+    cs_available: np.ndarray | None = None
+    structure_anchors: dict = field(default_factory=dict)
+    structure_results: dict = field(default_factory=dict)
+    fx_flip: np.ndarray | None = None
+    zs_zg: np.ndarray | None = None
+    zs_zd: np.ndarray | None = None
+    snapshots: list = field(default_factory=list)
 
     @classmethod
     def from_df(
@@ -430,16 +457,26 @@ class FactorContext:
         path = pd.Series(c).diff().abs().rolling(20).sum()
         er20 = (net / path.replace(0.0, np.nan)).fillna(1.0).to_numpy()
 
-        bi_v1 = (
-            df[BI_BASE_COL].astype(str).str.split("_").str[0].to_numpy(dtype=object)
-            if BI_BASE_COL in df.columns
-            else np.full(n, "其他", dtype=object)
-        )
-        bi_state = np.where(bi_v1 == "向上", 1, np.where(bi_v1 == "向下", -1, 0)).astype(np.int8)
-        bi_flip = np.zeros(n, dtype=np.int8)
-        if n > 1:
-            changed = (bi_state[1:] != bi_state[:-1]) & (bi_state[1:] != 0) & (bi_state[:-1] != 0)
-            bi_flip[1:] = np.where(changed, bi_state[1:], 0)
+        import czsc
+
+        # RawBar serialization is boundary glue; structure discovery and dispatch live in Rust.
+        bars = research_bars(df, df.attrs.get("factor_timeframe", "30m"))
+        snapshots = czsc.structure_snapshots(bars)
+        bi_flip = np.asarray([snapshot.completed_bi_dir for snapshot in snapshots], dtype=np.int8)
+        fx_flip = np.asarray([snapshot.completed_fx_dir for snapshot in snapshots], dtype=np.int8)
+        zs_zg = np.asarray([snapshot.zs_zg for snapshot in snapshots], dtype=np.float64)
+        zs_zd = np.asarray([snapshot.zs_zd for snapshot in snapshots], dtype=np.float64)
+        htf_ma = None
+        if htf is not None and not htf.empty:
+            left = pd.DataFrame({"dt": pd.to_datetime(df["dt"])})
+            right = pd.DataFrame({"dt": pd.to_datetime(htf["dt"]), "ma": htf["ma20"]})
+            htf_ma = pd.merge_asof(left, right, on="dt", direction="backward")["ma"].to_numpy()
+        anchors = {
+            arch: czsc.structure_stop_anchors(bars, snapshots, ruler.stop_plugin, htf_ma=htf_ma)
+            for arch, ruler in ARCHETYPE_RULERS.items()
+        }
+        anchors["pos_second_ext"] = czsc.structure_stop_anchors(bars, snapshots, "pos_second_ext", htf_ma=htf_ma)
+        anchors["pos_zs_reentry"] = czsc.structure_stop_anchors(bars, snapshots, "pos_zs_reentry", htf_ma=htf_ma)
 
         ma20 = f64("ma20")
         ctx = cls(
@@ -463,6 +500,11 @@ class FactorContext:
             atr_rank=np.nan_to_num(f64("atr_rank_60"), nan=1.0),
             er20=er20,
             bi_flip=bi_flip,
+            fx_flip=fx_flip,
+            zs_zg=zs_zg,
+            zs_zd=zs_zd,
+            snapshots=snapshots,
+            structure_anchors=anchors,
             strength={k: decode_strength(df, k) for k in STRENGTH_SIGNAL_KINDS},
         )
         ctx.states = {
@@ -482,7 +524,7 @@ class FactorContext:
             cross_section = DataFrameCrossSectionProvider(df)
 
         is_real_cs = cross_section is not None and not isinstance(cross_section, NeutralCrossSection)
-        ctx.has_external_cs = bool(is_real_cs)
+        ctx.has_external_cs = bool(is_real_cs and hasattr(cross_section, "features"))
 
         if is_real_cs and hasattr(cross_section, "features"):
             feats = cross_section.features(df)  # type: ignore[union-attr]
@@ -492,35 +534,20 @@ class FactorContext:
             ctx.sector_leader_dir = feats["sector_leader_dir"]
             ctx.leader_lag_gap = feats["leader_lag_gap"]
             ctx.sector_spread_zscore = feats["sector_spread_zscore"]
-        elif is_real_cs:
-            xs_arr = np.clip(np.nan_to_num(cross_section.strength(df), nan=0.0), -1.0, 1.0)  # type: ignore[union-attr]
-            ctx.xs = xs_arr
-            ctx.cs_rank = np.clip(0.5 * (xs_arr + 1.0), 0.0, 1.0)
-            ctx.cs_strength_eff = xs_arr
-            ctx.sector_leader_dir = xs_arr
-            ctx.leader_lag_gap = np.zeros(n, dtype=np.float64)
-            ctx.sector_spread_zscore = -2.0 * xs_arr
+            ctx.cs_available = np.asarray(feats.get("cs_available", np.ones(n, dtype=bool)), dtype=bool)
         else:
-            # 单品种未挂载外部截面时：FC01 保持中性 xs=0；FC02~FC04 使用严格因果且 100% 镜像对称的跨尺度相对强弱代理
-            ctx.xs = np.zeros(n, dtype=np.float64)
-            ctx.cs_rank = np.full(n, 0.5, dtype=np.float64)
-            satr = np.maximum(atr, EPS)
-            c_prev20 = np.full(n, np.nan, dtype=np.float64)
-            c_prev15 = np.full(n, np.nan, dtype=np.float64)
-            c_prev3 = np.full(n, np.nan, dtype=np.float64)
-            if n > 20:
-                c_prev20[20:] = c[:-20]
-            if n > 15:
-                c_prev15[15:] = c[:-15]
-            if n > 3:
-                c_prev3[3:] = c[:-3]
-            ns20 = np.nan_to_num((c - c_prev20) / (20.0 * satr), nan=0.0)
-            ns15 = np.nan_to_num((c - c_prev15) / (15.0 * satr), nan=0.0)
-            ns3 = np.nan_to_num((c - c_prev3) / (3.0 * satr), nan=0.0)
-            ctx.cs_strength_eff = np.tanh(3.5 * ns15)
-            ctx.sector_leader_dir = np.tanh(3.5 * ns20)
-            ctx.leader_lag_gap = np.tanh(3.5 * ns20) - np.tanh(2.5 * ns3)
-            ctx.sector_spread_zscore = np.nan_to_num(np.clip((c - ma20) / (0.80 * satr), -5.0, 5.0), nan=0.0)
+            # A scalar relative-strength provider is insufficient evidence for sector leaders/spreads.
+            ctx.xs = (
+                np.clip(np.nan_to_num(cross_section.strength(df), nan=0.0), -1.0, 1.0)
+                if is_real_cs
+                else np.zeros(n, dtype=np.float64)
+            )
+            ctx.cs_rank = 0.5 * (ctx.xs + 1.0)
+            ctx.cs_strength_eff = np.zeros(n, dtype=np.float64)
+            ctx.sector_leader_dir = np.zeros(n, dtype=np.float64)
+            ctx.leader_lag_gap = np.zeros(n, dtype=np.float64)
+            ctx.sector_spread_zscore = np.zeros(n, dtype=np.float64)
+            ctx.cs_available = np.zeros(n, dtype=bool)
         return ctx
 
 
@@ -570,20 +597,10 @@ def two_stage_trigger(
     严禁单根 K 线静态拼接开仓：Confirmation 必须发生在**严格更早**的 Setup 之后、`window` 根之内。
     返回 (fire, q)：`q = setup_q · (0.6 + 0.4 · confirm_q)`，Setup 一经消费即解除武装。
     """
-    n = len(setup)
-    fire = np.zeros(n, dtype=bool)
-    q = np.zeros(n, dtype=np.float64)
-    armed_idx, armed_q = -1, 0.0
-    for t in range(n):
-        if armed_idx >= 0 and t - armed_idx > window:
-            armed_idx = -1
-        if confirm[t] and armed_idx >= 0:
-            fire[t] = True
-            q[t] = float(np.clip(armed_q * (0.6 + 0.4 * confirm_q[t]), 0.01, 1.0))
-            armed_idx = -1
-        if setup[t]:
-            armed_idx, armed_q = t, float(setup_q[t])
-    return fire, q
+    from czsc import two_stage_trigger as native_trigger
+
+    fire, quality = native_trigger(setup, setup_q, confirm, confirm_q, window)
+    return np.asarray(fire, dtype=bool), np.asarray(quality, dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -593,6 +610,15 @@ class DecayConfig:
     rho_max: float = 2.0
     d_eps: float = 0.02  # D 低于此值视为耗尽，清除状态
     max_hold: int = 64
+    trailing: float = 0.013
+    trail_activation: float = 0.0
+    ratchet_stop: bool = False
+    min_hold: int = 0
+    cooldown: int = 0
+    track_signal: bool = False
+    use_zs_reentry: bool = False
+    use_fx_exit: bool = False
+    stop_plugin: str | None = None
 
 
 def apply_dynamic_structure_decay(
@@ -604,6 +630,11 @@ def apply_dynamic_structure_decay(
     atr_fast: np.ndarray,
     atr_slow: np.ndarray,
     cfg: DecayConfig | None = None,
+    *,
+    zs_zg: np.ndarray | None = None,
+    zs_zd: np.ndarray | None = None,
+    completed_fx_dir: np.ndarray | None = None,
+    soft_exit: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     动态结构衰减机 (替代固定 half_life 指数衰减)：返回 (S, trigger)，S = d·Q·D ∈ [-1, 1]。
@@ -613,32 +644,34 @@ def apply_dynamic_structure_decay(
        `D *= exp(-λ0 · clip(ATR_fast/ATR_slow, ρ_min, ρ_max))`，超过 `max_hold` 或 `D < d_eps` 清空；
     2. 若有新触发 (`direction[t] != 0`)：反向、空仓或强度不弱于当前残余强度时刷新状态 (D=1)。
     """
+    from czsc import evaluate_structure_decay
+
     cfg = cfg or DecayConfig()
-    n = len(direction)
-    S = np.zeros(n, dtype=np.float64)
-    trig = np.zeros(n, dtype=bool)
-    d0, q0, dec, stop, held = 0, 0.0, 0.0, np.nan, 0
-    for t in range(n):
-        if d0 != 0:
-            broke = (d0 > 0 and close[t] <= stop) or (d0 < 0 and close[t] >= stop)
-            if reverse_dir[t] == -d0 or broke:
-                dec = 0.0
-            else:
-                ratio = atr_fast[t] / atr_slow[t] if atr_slow[t] > EPS else 1.0
-                rho = float(np.clip(ratio, cfg.rho_min, cfg.rho_max))
-                dec *= float(np.exp(-cfg.lam0 * rho))
-                held += 1
-                if held > cfg.max_hold:
-                    dec = 0.0
-            if dec < cfg.d_eps:
-                d0, q0, dec = 0, 0.0, 0.0
-        if direction[t] != 0 and quality[t] > 0.0:
-            cur = q0 * dec if d0 != 0 else 0.0
-            if d0 == 0 or direction[t] != d0 or quality[t] >= cur:
-                d0, q0, dec, stop, held = int(direction[t]), float(quality[t]), 1.0, float(stop_level[t]), 0
-                trig[t] = True
-        S[t] = d0 * q0 * dec
-    return np.clip(S, -1.0, 1.0), trig
+    result = evaluate_structure_decay(
+        direction,
+        quality,
+        close,
+        stop_level,
+        reverse_dir,
+        atr_fast,
+        atr_slow,
+        cfg.lam0,
+        cfg.rho_min,
+        cfg.rho_max,
+        cfg.d_eps,
+        cfg.max_hold,
+        cfg.trailing,
+        trail_activation=cfg.trail_activation,
+        ratchet_stop=cfg.ratchet_stop,
+        min_hold=cfg.min_hold,
+        cooldown=cfg.cooldown,
+        track_signal=cfg.track_signal,
+        zs_zg=zs_zg if cfg.use_zs_reentry else None,
+        zs_zd=zs_zd if cfg.use_zs_reentry else None,
+        completed_fx_dir=completed_fx_dir if cfg.use_fx_exit else None,
+        soft_exit=soft_exit,
+    )
+    return np.asarray(result["strength"]), np.asarray(result["trigger"], dtype=bool)
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +800,7 @@ def _build_fc01(ctx: FactorContext, side: int):
     """FC01: 大级别结构锚定 × 截面强弱 × 小级别分型扳机。"""
     n = ctx.n
     xs = ctx.xs if ctx.xs is not None else np.zeros(n, dtype=np.float64)
-    if ctx.htf_dir is not None and np.any(ctx.htf_dir != 0):
+    if ctx.htf_dir is not None:
         hdir = ctx.htf_dir
         hq = ctx.htf_q if ctx.htf_q is not None else np.full(n, 0.7, dtype=np.float64)
     else:
@@ -904,35 +937,65 @@ def compute_family(
     resolved_family = F_CLUSTER_FAMILY_ALIASES.get(family, family)
     fdef = ATOMIC_FACTOR_DEFS[resolved_family]
     n = ctx.n
-    direction = np.zeros(n, dtype=np.int8)
-    quality = np.zeros(n, dtype=np.float64)
-    for side in sides:
-        setup, setup_q, confirm, confirm_q, window = fdef.build(ctx, side)
-        fire, q = two_stage_trigger(
-            np.asarray(setup, dtype=bool),
-            np.nan_to_num(np.asarray(setup_q, dtype=np.float64)),
-            np.asarray(confirm, dtype=bool),
-            np.nan_to_num(np.asarray(confirm_q, dtype=np.float64)),
-            window,
-        )
-        better = fire & (q > quality)
-        direction[better] = side
-        quality[better] = q[better]
+    if resolved_family in {"FC02", "FC03", "FC04"} and not ctx.has_external_cs:
+        raise ValueError(f"missing_context: {resolved_family} requires real cross-asset rank/leader/spread features")
+    from czsc import evaluate_structure_factor
 
-    # 结构证伪点：多头 = 近 3 根最低价 (底分型低点)；空头 = 近 3 根最高价
-    low3 = pd.Series(ctx.l).rolling(3, min_periods=1).min().to_numpy()
-    high3 = pd.Series(ctx.h).rolling(3, min_periods=1).max().to_numpy()
-    stop = np.where(direction > 0, low3, high3)
-    s, trig = apply_dynamic_structure_decay(
-        direction, quality, ctx.c, stop, ctx.bi_flip, ctx.atr_fast, ctx.atr_slow, decay
+    inputs = {}
+    for side in (1, -1):
+        setup, setup_q, confirm, confirm_q, window = fdef.build(ctx, side)
+        setup, confirm = np.asarray(setup, dtype=bool), np.asarray(confirm, dtype=bool)
+        if side not in sides:
+            setup, confirm = np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
+        if resolved_family in {"FC02", "FC03", "FC04"} and ctx.cs_available is not None:
+            setup, confirm = setup & ctx.cs_available, confirm & ctx.cs_available
+        inputs[side] = (setup, np.asarray(setup_q, dtype=np.float64), confirm, np.asarray(confirm_q, dtype=np.float64))
+    long, short = inputs[1], inputs[-1]
+    cfg = decay or DecayConfig()
+    plugin_key = cfg.stop_plugin if (cfg.stop_plugin and cfg.stop_plugin in ctx.structure_anchors) else fdef.archetype
+    anchors = ctx.structure_anchors[plugin_key]
+    result = evaluate_structure_factor(
+        long[0],
+        short[0],
+        long[1],
+        short[1],
+        long[2],
+        short[2],
+        long[3],
+        short[3],
+        ctx.c,
+        anchors["long_stop"],
+        anchors["short_stop"],
+        ctx.bi_flip,
+        ctx.atr_fast,
+        ctx.atr_slow,
+        window,
+        cfg.lam0,
+        cfg.rho_min,
+        cfg.rho_max,
+        cfg.d_eps,
+        cfg.max_hold,
+        cfg.trailing,
+        trail_activation=cfg.trail_activation,
+        ratchet_stop=cfg.ratchet_stop,
+        min_hold=cfg.min_hold,
+        cooldown=cfg.cooldown,
+        zs_zg=ctx.zs_zg if cfg.use_zs_reentry else None,
+        zs_zd=ctx.zs_zd if cfg.use_zs_reentry else None,
+        completed_fx_dir=ctx.fx_flip if cfg.use_fx_exit else None,
     )
+    # Join IDs to native-frozen Setup indexes; no Python exit/state-machine algorithm.
+    result["structure_id"] = [
+        anchors["long_id" if d > 0 else "short_id"][i] if i >= 0 else -1
+        for i, d in zip(result["setup_index"], result["position_direction"], strict=True)
+    ]
+    result["stop_plugin"] = cfg.stop_plugin or ARCHETYPE_RULERS[fdef.archetype].stop_plugin
+    ctx.structure_results[(family, sides)] = result
+    s, trig = np.asarray(result["strength"]), np.asarray(result["trigger"], dtype=bool)
 
     if soft_gate is not None and soft_gate is not False and ctx.cs_rank is not None:
         gate_obj = soft_gate if isinstance(soft_gate, SoftCrossSectionalGate) else SoftCrossSectionalGate()
         s = gate_obj.apply(s, ctx.cs_rank, ctx.er20, archetype=fdef.archetype)
-        if len(sides) == 1:
-            g_dir = gate_obj.gate_multiplier(ctx.cs_rank, ctx.er20, archetype=fdef.archetype, direction=sides[0])
-            trig = trig & (g_dir >= gate_obj.trigger_gate_floor)
     return s, trig
 
 
@@ -974,6 +1037,8 @@ def link_higher_timeframes(tf_dfs: dict[str, pd.DataFrame]) -> dict[str, pd.Data
     大级别状态在 `compute_atomic_signal` 内按其收盘时刻因果对齐。原地修改并返回。
     """
     present = [tf for tf in TF_ORDER if tf in tf_dfs]
+    for tf in present:
+        tf_dfs[tf].attrs["factor_timeframe"] = tf
     for i, tf in enumerate(present[:-1]):
         set_factor_context(tf_dfs[tf], htf=tf_dfs[present[i + 1]])
     return tf_dfs
@@ -994,7 +1059,8 @@ def compute_atomic_signal(
     """
     注册表入口 (签名与 `compute_signal_triggers_and_weights` 一致)：`sig_id = 因子族 + L/S`，
     返回 (triggers, weights)，weights = 单一方向的连续强度 S。大级别 K 线 / 截面强弱提供者通过
-    `set_factor_context` / `link_higher_timeframes` 挂载 (均可缺省，F 簇缺省时退化为跨尺度共振)。
+    `set_factor_context` / `link_higher_timeframes` 挂载；FC02~FC04 缺少真实截面时明确拒绝计算。
+    soft_gate=False 明确禁止门控，None 使用挂载的门控；注册中心统一持有门控时应传 False。
     """
     del scale  # 阈值已由 ATR 归一，周期缩放不再需要
     raw_family, side_char = sig_id[:-1], sig_id[-1]
@@ -1003,18 +1069,24 @@ def compute_atomic_signal(
         raise KeyError(f"unknown atomic factor: {sig_id}")
     htf = _unbox(df, "htf_df")
     cs_prov = _unbox(df, "cross_section")
-    cs_fp = (
-        cs_prov.cache_fingerprint()
-        if hasattr(cs_prov, "cache_fingerprint")
-        else (
-            hash(df["cs_slope_rank"].to_numpy(dtype=np.float64).tobytes())
-            if "cs_slope_rank" in df.columns
-            else id(cs_prov)
-        )
+    cs_fp = cs_prov.cache_fingerprint() if hasattr(cs_prov, "cache_fingerprint") else None
+    import os
+
+    # Providers without an explicit version cannot be safely cached across evaluations.
+    cacheable = cs_prov is None or cs_fp is not None
+    key = (
+        "atomic-context-v3-native-structures",
+        _frame_fingerprint(df),
+        _frame_fingerprint(htf),
+        cs_fp,
+        df.attrs.get("factor_timeframe"),
+        tuple(
+            os.environ.get(name)
+            for name in ("CZSC_MIN_BI_LEN", "czsc_min_bi_len", "CZSC_MAX_BI_NUM", "czsc_max_bi_num")
+        ),
     )
-    key = (len(df), hash(df["close"].to_numpy(dtype=np.float64).tobytes()), id(htf), cs_fp)
     cache = _unbox(df, "_atomic_ctx")
-    if cache is None or cache[0] != key:
+    if not cacheable or cache is None or cache[0] != key:
         ctx = FactorContext.from_df(df, htf, cs_prov)
         df.attrs["_atomic_ctx"] = _AttrBox((key, ctx))
     else:
