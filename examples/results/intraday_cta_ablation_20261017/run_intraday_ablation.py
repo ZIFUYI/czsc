@@ -31,7 +31,6 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import examples.multi_factor_cta.atomic_factors as af  # noqa: E402
 import examples.multi_factor_cta.synthesis_engine as se  # noqa: E402
 from examples.alpha_mining_agent.forensic_pipeline import (  # noqa: E402
     compute_single_factor_net_sharpe_and_turnover,
@@ -65,51 +64,7 @@ OUT_DIR = Path(__file__).resolve().parent
 MANIFEST_PATH = ROOT / "examples/results/research_rerun_20261017/manifest.json"
 CACHE_ROOT = ROOT / "examples/results/research_rerun_20261017/intraday/native_cache"
 
-# 1. 只读复用已有 native_cache 的 pkl 信号，零磁盘写入原缓存目录
-_orig_read_pickle = pd.read_pickle
-_orig_exists = Path.exists
-
-
-def _fast_read_pickle(path, *args, **kwargs):
-    p = Path(path)
-    if not _orig_exists(p):
-        sym_dir = CACHE_ROOT / p.parent.name
-        prefix = "_".join(p.name.split("_")[:4]) + "_"
-        matches = sorted(sym_dir.glob(prefix + "*.pkl"))
-        if matches:
-            return _orig_read_pickle(matches[0], *args, **kwargs)
-    return _orig_read_pickle(path, *args, **kwargs)
-
-
-def _fast_exists(self: Path) -> bool:
-    if "native_czsc_signals_" in self.name and not _orig_exists(self):
-        sym_dir = CACHE_ROOT / self.parent.name
-        prefix = "_".join(self.name.split("_")[:4]) + "_"
-        if list(sym_dir.glob(prefix + "*.pkl")):
-            return True
-    return _orig_exists(self)
-
-
-pd.read_pickle = _fast_read_pickle
-Path.exists = _fast_exists
-
-# 2. 内存级缓存 DataFrame 哈希指纹，避免在同一 DataFrame 上重复计算 70 次 hash_pandas_object
-_orig_fp = af._frame_fingerprint
-_fp_memo: dict[int, str] = {}
-
-
-def _fast_fp(df: pd.DataFrame | None) -> str:
-    if df is None:
-        return "none"
-    k = id(df)
-    if k not in _fp_memo:
-        _fp_memo[k] = _orig_fp(df)
-    return _fp_memo[k]
-
-
-af._frame_fingerprint = _fast_fp
-
-# 3. 修正日线尺度回退问题（仅在内存运行时生效，不改生产文件）
+# 1. 修正日线尺度回退问题（仅在内存运行时生效，不改生产文件）
 _orig_turbulence_cap = se.IntraAssetThreePillarSynthesizer._get_causal_turbulence_cap
 
 

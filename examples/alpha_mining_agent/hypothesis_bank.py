@@ -656,6 +656,9 @@ def migrate_archetype(name: str, sig_id: str | None = None) -> str:
     raise ValueError(f"未知战略簇名称: {name}")
 
 
+TF_FREQ_MAP = {"5m": "5分钟", "15m": "15分钟", "30m": "30分钟", "60m": "60分钟", "1d": "日线"}
+
+
 TF_SCALE_MAP: dict[str, float] = {
     "1d": 1.00,
     "60m": 0.50,
@@ -668,6 +671,13 @@ TF_SCALE_MAP: dict[str, float] = {
 # ---------------------------------------------------------------------------
 # 2. 统一多维技术与微观结构特征预计算
 # ---------------------------------------------------------------------------
+def research_bars(df: pd.DataFrame, tf: str) -> list[czsc.RawBar]:
+    """Serialize OHLCV to the shared Rust research boundary; omit pandas-only attributes."""
+    frame = df.copy(deep=False)
+    frame.attrs = {}
+    return czsc.format_research_kline_bytes(czsc.to_arrow(frame), TF_FREQ_MAP[tf])
+
+
 def rust_sma(s: pd.Series, n: int) -> pd.Series:
     """Rust 原生简单均线 `czsc.sma`：与 `s.rolling(n).mean()` 数值一致 (前 n-1 个为 NaN)，由 Rust 算子计算。"""
     return pd.Series(czsc.sma(s.to_numpy(dtype=np.float64), n), index=s.index, dtype=np.float64)
@@ -718,12 +728,9 @@ def enrich_kline_features(df: pd.DataFrame, scale: float = 1.0) -> pd.DataFrame:
     df["lower_shadow"] = df[["open", "close"]].min(axis=1) - df["low"]
     df["bias20"] = (df["close"] - df["ma20"]) / df["ma20"]
 
-    # RSI(14)
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0.0).rolling(14).mean()
-    loss = (-delta.clip(upper=0.0)).rolling(14).mean() + 1e-9
-    rs = gain / loss
-    df["rsi14"] = 100.0 - (100.0 / (1.0 + rs))
+    # Rust canonical Wilder RSI; preserve the shared warmup/flat-price contract.
+    close_values = df["close"].to_numpy(dtype=np.float64)
+    df["rsi14"] = czsc.rsi(close_values, 14)
 
     # 均线粘合度
     ma_max = df[["ma5", "ma10", "ma20", "ma30"]].max(axis=1)
@@ -751,16 +758,11 @@ def enrich_kline_features(df: pd.DataFrame, scale: float = 1.0) -> pd.DataFrame:
     df["kc_dn"] = df["ma20"] - 1.5 * df["atr14"]
     df["in_squeeze"] = (df["boll_up"] <= df["kc_up"]) & (df["boll_dn"] >= df["kc_dn"])
 
-    # MACD (12, 26, 9)
-    ema12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["close"].ewm(span=26, adjust=False).mean()
-    df["dif"] = ema12 - ema26
-    df["dea"] = df["dif"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"] = (df["dif"] - df["dea"]) * 2.0
+    # Canonical Rust MACD uses full warmup and an undoubled histogram.
+    df["dif"], df["dea"], df["macd_hist"] = czsc.macd(close_values, 12, 26, 9)
 
-    # OBV 能量潮及 20 期极值
-    sign_chg = np.sign(df["close"].diff().fillna(0.0))
-    df["obv"] = (sign_chg * df["volume"]).cumsum()
+    # Close-to-close OBV shares the Rust initial-volume and unchanged-close rules.
+    df["obv"] = czsc.obv(close_values, df["volume"].to_numpy(dtype=np.float64))
     df["obv_high20"] = df["obv"].shift(1).rolling(20).max()
     df["obv_low20"] = df["obv"].shift(1).rolling(20).min()
     df["high10"] = df["high"].shift(1).rolling(10).max()
@@ -799,7 +801,7 @@ def enrich_kline_features(df: pd.DataFrame, scale: float = 1.0) -> pd.DataFrame:
 
 
 STRENGTH_SIGNAL_KINDS: dict[str, str] = {
-    # kind -> 信号 k3 段 (Rust `strength_*_V260601` 的模板尾段，用于在挂载后的列名里定位)
+    # canonical strength_* 复用历史信号键，保证已有 Event / 缓存列兼容；这里只做 DataFrame 边界定位。
     "fx": "FX强度V260601",
     "bi_div": "笔背驰强度V260601",
     "zs_revert": "中枢回归强度V260601",
@@ -833,12 +835,12 @@ _EXTENDED_NATIVE_SIGNALS: tuple[dict, ...] = (
     {"name": "czsc.signals.zdy_zs_V230423", "di": 1},
     {"name": "czsc.signals.zdy_zs_space_V230421", "di": 1},
     # strength: 写入 Signal.score 的结构强度信号 (Q ∈ (0, 1] -> score = round(100·Q))
-    {"name": "czsc.signals.strength_fx_V260601", "n": 14},
-    {"name": "czsc.signals.strength_bi_div_V260601", "n": 10},
-    {"name": "czsc.signals.strength_zs_revert_V260601", "k": 15},
-    {"name": "czsc.signals.strength_zs_break_V260601", "n": 10},
-    {"name": "czsc.signals.strength_flow_V260601", "n": 20, "k": 20},
-    {"name": "czsc.signals.strength_squeeze_V260601", "n": 14, "m": 60, "th": 30},
+    {"name": "czsc.signals.strength_fx", "n": 14},
+    {"name": "czsc.signals.strength_bi_div", "n": 10},
+    {"name": "czsc.signals.strength_zs_revert", "k": 15},
+    {"name": "czsc.signals.strength_zs_break", "n": 10},
+    {"name": "czsc.signals.strength_flow", "n": 20, "k": 20},
+    {"name": "czsc.signals.strength_squeeze", "n": 14, "m": 60, "th": 30},
 )
 
 
@@ -873,110 +875,148 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extende
     与 6 个写入 `Signal.score` 的 `strength_*` 结构强度信号 (列名前缀统一为 `cz_`)，
     并合成为原生信号组合触发布尔列 (`cz_trig_CZ01L` ~ `cz_trig_CZ08S` 及 5m 专属 `cz_trig_M501L` ~ `cz_trig_M504S`)。
 
-    缓存文件名包含扩展配置指纹，新增/修改信号配置后不会误读旧缓存。
+    缓存指纹覆盖完整行情、信号配置、挂载代码和原生扩展，行情或实现改变时重新计算。
     """
     import hashlib
     import json
+    import os
     from pathlib import Path
 
     if df.empty:
         return df.copy()
-    suffix = ""
+    import importlib
+
+    import czsc
+
+    freq_str = TF_FREQ_MAP[tf]
+    sigs_cfg = [
+        {"name": "czsc.signals.cxt_five_bi_V230619", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.cxt_seven_bi_V230620", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.cxt_three_bi_V230618", "freq": freq_str, "di": 1},
+        {
+            "name": "czsc.signals.cxt_third_bs_V230319",
+            "freq": freq_str,
+            "di": 1,
+            "ma_type": "SMA",
+            "timeperiod": 20,
+        },
+        {
+            "name": "czsc.signals.cxt_third_bs_V230318",
+            "freq": freq_str,
+            "di": 1,
+            "ma_type": "SMA",
+            "timeperiod": 20,
+        },
+        {"name": "czsc.signals.cxt_third_buy_V230228", "freq": freq_str, "di": 1},
+        {
+            "name": "czsc.signals.cxt_second_bs_V230320",
+            "freq": freq_str,
+            "di": 1,
+            "ma_type": "SMA",
+            "timeperiod": 20,
+        },
+        {"name": "czsc.signals.cxt_first_buy_V221126", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.cxt_first_sell_V221126", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.cxt_double_zs_V230311", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.cxt_ds_midline_break_V260521", "freq": freq_str, "di": 1, "n": 3, "m": 2},
+        {"name": "czsc.signals.cxt_bi_base_V230228", "freq": freq_str, "bi_init_length": 9},
+        {"name": "czsc.signals.cxt_bi_status_V230101", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.cxt_fx_power_V221107", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.cxt_bi_end_V230312", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.byi_bi_end_V230106", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.byi_bi_end_V230107", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.byi_second_bs_V230324", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.byi_symmetry_zs_V221107", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.jcc_san_xing_xian_V221023", "freq": freq_str, "di": 1, "th": 2},
+        {"name": "czsc.signals.jcc_ten_mo_V221028", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.jcc_yun_xian_V221118", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.jcc_ci_tou_V221101", "freq": freq_str, "di": 1, "z": 5, "th": 50},
+        {"name": "czsc.signals.jcc_wu_yun_gai_ding_V221101", "freq": freq_str, "di": 1, "z": 5, "th": 50},
+        {"name": "czsc.signals.jcc_three_crow_V221108", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.jcc_san_fa_V20221115", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.bar_fake_break_V230204", "freq": freq_str, "di": 1, "n": 10, "m": 3},
+        {
+            "name": "czsc.signals.bar_fang_liang_break_V221216",
+            "freq": freq_str,
+            "di": 1,
+            "ma_type": "SMA",
+            "timeperiod": 20,
+            "th": 13,
+        },
+        {"name": "czsc.signals.bar_dual_thrust_V230403", "freq": freq_str, "di": 1, "n": 4, "k1": 5, "k2": 5},
+        {"name": "czsc.signals.bar_r_breaker_V230326", "freq": freq_str, "n": 1},
+        {"name": "czsc.signals.bar_td9_V240616", "freq": freq_str, "n": 9},
+        {"name": "czsc.signals.bar_accelerate_V221110", "freq": freq_str, "di": 1, "window": 10},
+        {
+            "name": "czsc.signals.obv_up_dw_line_V230719",
+            "freq": freq_str,
+            "di": 1,
+            "n": 20,
+            "m": 10,
+            "max_overlap": 3,
+        },
+        {"name": "czsc.signals.vol_ti_suo_V221216", "freq": freq_str, "di": 1},
+        {"name": "czsc.signals.vol_gao_di_V221218", "freq": freq_str, "di": 1},
+    ]
     if extended:
-        fingerprint = hashlib.md5(json.dumps(_EXTENDED_NATIVE_SIGNALS, sort_keys=True).encode("utf-8")).hexdigest()[:8]
-        suffix = f"_x{fingerprint}"
-    cache_path = Path(workspace_dir) / f"native_czsc_signals_{tf}{suffix}.pkl"
+        sigs_cfg += _extended_native_signal_cfgs(freq_str)
+
+    # Content-addressed identity: input time, OHLCV, symbol, timeframe, full signal config,
+    # environment variables, czsc version, and native binary bytes.
+    identity = hashlib.sha256()
+    identity.update(
+        pd.util.hash_pandas_object(
+            df[["dt", "symbol", "open", "close", "high", "low", "volume"]], index=False
+        ).values.tobytes()
+    )
+    first_dt = str(df["dt"].iloc[0])
+    last_dt = str(df["dt"].iloc[-1])
+    sym_str = str(df["symbol"].iloc[0])
+    identity.update(f"{first_dt}_{last_dt}_{len(df)}_{sym_str}_{tf}_{freq_str}".encode())
+    identity.update(json.dumps(sigs_cfg, sort_keys=True).encode())
+    identity.update(
+        json.dumps(
+            {
+                name: os.environ.get(name)
+                for name in ("CZSC_MIN_BI_LEN", "czsc_min_bi_len", "CZSC_MAX_BI_NUM", "czsc_max_bi_num")
+            },
+            sort_keys=True,
+        ).encode()
+    )
+    identity.update(f"czsc_ver_{getattr(czsc, '__version__', 'unknown')}".encode())
+    native = importlib.import_module("czsc._native")
+    native_file = Path(native.__file__)
+    identity.update(native_file.read_bytes())
+
+    cache_path = Path(workspace_dir) / f"native_czsc_signals_{tf}_{identity.hexdigest()[:24]}.pkl"
     sig_df = None
     if cache_path.exists():
-        cached = pd.read_pickle(cache_path)
-        if len(cached) == len(df):
-            sig_df = cached
-    if sig_df is None:
-        import czsc
+        try:
+            cached = pd.read_pickle(cache_path)
+            attrs_cols = cached.attrs.get("_expected_cols")
+            attrs_sha = cached.attrs.get("_cache_sha256")
+            expected_min_cols = len(sigs_cfg)
+            valid = (
+                isinstance(cached, pd.DataFrame)
+                and len(cached) == len(df)
+                and len(cached.columns) >= expected_min_cols
+                and (attrs_sha is None or attrs_sha == identity.hexdigest())
+            )
+            if valid and attrs_cols is not None:
+                valid = (len(cached.columns) == len(attrs_cols)) and all(c in cached.columns for c in attrs_cols)
+            if valid:
+                valid = all(str(c).startswith("cz_") for c in cached.columns)
+            if valid:
+                sig_df = cached
+        except Exception:
+            sig_df = None
 
-        tf_to_freq = {
-            "1d": czsc.Freq.D.value,
-            "60m": czsc.Freq.F60.value,
-            "30m": czsc.Freq.F30.value,
-            "15m": czsc.Freq.F15.value,
-            "5m": czsc.Freq.F5.value,
-        }
-        freq_str = tf_to_freq[tf]
+    if sig_df is None:
         sub = df[["dt", "symbol", "open", "close", "high", "low", "volume"]].copy()
         sub = sub.rename(columns={"volume": "vol"})
         sub["amount"] = sub["vol"] * sub["close"]
         bars = czsc.format_standard_kline(sub, freq=freq_str)
-        sigs_cfg = [
-            {"name": "czsc.signals.cxt_five_bi_V230619", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.cxt_seven_bi_V230620", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.cxt_three_bi_V230618", "freq": freq_str, "di": 1},
-            {
-                "name": "czsc.signals.cxt_third_bs_V230319",
-                "freq": freq_str,
-                "di": 1,
-                "ma_type": "SMA",
-                "timeperiod": 20,
-            },
-            {
-                "name": "czsc.signals.cxt_third_bs_V230318",
-                "freq": freq_str,
-                "di": 1,
-                "ma_type": "SMA",
-                "timeperiod": 20,
-            },
-            {"name": "czsc.signals.cxt_third_buy_V230228", "freq": freq_str, "di": 1},
-            {
-                "name": "czsc.signals.cxt_second_bs_V230320",
-                "freq": freq_str,
-                "di": 1,
-                "ma_type": "SMA",
-                "timeperiod": 20,
-            },
-            {"name": "czsc.signals.cxt_first_buy_V221126", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.cxt_first_sell_V221126", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.cxt_double_zs_V230311", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.cxt_ds_midline_break_V260521", "freq": freq_str, "di": 1, "n": 3, "m": 2},
-            {"name": "czsc.signals.cxt_bi_base_V230228", "freq": freq_str, "bi_init_length": 9},
-            {"name": "czsc.signals.cxt_bi_status_V230101", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.cxt_fx_power_V221107", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.cxt_bi_end_V230312", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.byi_bi_end_V230106", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.byi_bi_end_V230107", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.byi_second_bs_V230324", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.byi_symmetry_zs_V221107", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.jcc_san_xing_xian_V221023", "freq": freq_str, "di": 1, "th": 2},
-            {"name": "czsc.signals.jcc_ten_mo_V221028", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.jcc_yun_xian_V221118", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.jcc_ci_tou_V221101", "freq": freq_str, "di": 1, "z": 5, "th": 50},
-            {"name": "czsc.signals.jcc_wu_yun_gai_ding_V221101", "freq": freq_str, "di": 1, "z": 5, "th": 50},
-            {"name": "czsc.signals.jcc_three_crow_V221108", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.jcc_san_fa_V20221115", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.bar_fake_break_V230204", "freq": freq_str, "di": 1, "n": 10, "m": 3},
-            {
-                "name": "czsc.signals.bar_fang_liang_break_V221216",
-                "freq": freq_str,
-                "di": 1,
-                "ma_type": "SMA",
-                "timeperiod": 20,
-                "th": 13,
-            },
-            {"name": "czsc.signals.bar_dual_thrust_V230403", "freq": freq_str, "di": 1, "n": 4, "k1": 5, "k2": 5},
-            {"name": "czsc.signals.bar_r_breaker_V230326", "freq": freq_str, "n": 1},
-            {"name": "czsc.signals.bar_td9_V240616", "freq": freq_str, "n": 9},
-            {"name": "czsc.signals.bar_accelerate_V221110", "freq": freq_str, "di": 1, "window": 10},
-            {
-                "name": "czsc.signals.obv_up_dw_line_V230719",
-                "freq": freq_str,
-                "di": 1,
-                "n": 20,
-                "m": 10,
-                "max_overlap": 3,
-            },
-            {"name": "czsc.signals.vol_ti_suo_V221216", "freq": freq_str, "di": 1},
-            {"name": "czsc.signals.vol_gao_di_V221218", "freq": freq_str, "di": 1},
-        ]
-        sigs_cfg += _extended_native_signal_cfgs(freq_str) if extended else []
-        df_sig = czsc.generate_czsc_signals(bars, sigs_cfg, sdt="2020-01-01", init_n=20, df=True)
+        df_sig = czsc.generate_czsc_signals(bars, sigs_cfg, sdt=str(df["dt"].iloc[0]), init_n=20, df=True)
         rename_map = {}
         sig_cols = []
         for col in df_sig.columns:
@@ -987,10 +1027,11 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extende
         df_sig = df_sig.rename(columns=rename_map)
         df_sig["dt"] = pd.to_datetime(df_sig["dt"]).dt.tz_localize(None)
         merged = pd.merge(df[["dt"]], df_sig[["dt"] + sig_cols], on="dt", how="left").fillna("其他")
-        sig_df = merged[sig_cols]
-        if not cache_path.exists():
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            sig_df.to_pickle(cache_path)
+        sig_df = merged[sig_cols].copy()
+        sig_df.attrs["_expected_cols"] = list(sig_cols)
+        sig_df.attrs["_cache_sha256"] = identity.hexdigest()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        sig_df.to_pickle(cache_path)
 
     df = pd.concat([df.reset_index(drop=True), sig_df.reset_index(drop=True)], axis=1)
 
@@ -1191,6 +1232,12 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extende
             df.groupby("date")["low"].cummin().where(is_first_30m).groupby(df["date"]).ffill().fillna(df["low"]).values
         )
 
+        def _lag1(arr: np.ndarray) -> np.ndarray:
+            res = np.empty_like(arr)
+            res[0] = arr[0]
+            res[1:] = arr[:-1]
+            return res
+
         m501l = np.asarray(
             (df["box_amp"] > 0.012)
             & (c > ma60)
@@ -1213,10 +1260,10 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extende
         )
         m502l = np.asarray(
             (c > ma240)
-            & (np.roll(l, 1) < l48)
+            & (_lag1(l) < l48)
             & (c > l48)
             & (c > o)
-            & (c > np.roll(h, 1))
+            & (c > _lag1(h))
             & (vol >= 1.28 * vma20)
             & (be_stop.str.startswith("看多") | be_macd.str.startswith("看多") | jcc_eng.str.contains("看涨吞没")),
             dtype=bool,
@@ -1232,10 +1279,10 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extende
         m503l = np.asarray(
             sym_zs.str.startswith("是_")
             & (c > ma240)
-            & (np.roll(l, 1) <= np.roll(vwap, 1) * 0.999)
-            & (np.roll(c, 1) >= np.roll(vwap, 1) * 0.996)
+            & (_lag1(l) <= _lag1(vwap) * 0.999)
+            & (_lag1(c) >= _lag1(vwap) * 0.996)
             & (c > o)
-            & (c > np.roll(h, 1))
+            & (c > _lag1(h))
             & (c > vwap)
             & (vol >= 1.35 * vma20)
             & fl_brk.str.startswith("放量突破"),
@@ -1248,7 +1295,7 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extende
             & (c < ma60)
             & (c < vwap)
             & (c < o)
-            & (c < np.roll(l, 1))
+            & (c < _lag1(l))
             & (vol >= 1.28 * vma20)
             & (be_macd.str.startswith("看空") | dt_bs.str.startswith("看空")),
             dtype=bool,
@@ -1257,7 +1304,7 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extende
             (bidx >= 6)
             & (bidx <= 16)
             & (c > orb30_h)
-            & (np.roll(c, 1) <= orb30_h)
+            & (_lag1(c) <= orb30_h)
             & (c > vwap)
             & (c > ma60)
             & (vol >= 1.75 * vma20)
@@ -1269,7 +1316,7 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extende
             (bidx >= 6)
             & (bidx <= 18)
             & (c < orb30_l)
-            & (np.roll(c, 1) >= orb30_l)
+            & (_lag1(c) >= orb30_l)
             & (c < vwap)
             & (c < ma60)
             & (c < ma240)

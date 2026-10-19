@@ -1,0 +1,80 @@
+{
+  "audit_version": "2026.10.19.v1",
+  "timestamp": "2026-10-19T17:35:50.069239",
+  "czsc_version": "1.0.1",
+  "native_extension_path": "/Users/chenqiang/Desktop/czsc/czsc/_native.abi3.so",
+  "all_checks_passed": true,
+  "checks": [
+    {
+      "check": "exp_f_backfill_causality",
+      "passed": true,
+      "details": {
+        "legacy_backfill_leaked_into_t_minus_2_and_t_minus_1": true,
+        "causal_pre_confirmation_invariance": true,
+        "target_effective_at_confirmation_bar": true,
+        "reproduced_failing_case": "w5_buggy[09:20] = 0.8, w5_buggy[09:25] = 0.8 before 09:30 close",
+        "fixed_causal_case": "w5_causal[09:20] = 0.0, w5_causal[09:25] = 0.0, w5_causal[09:30] = 0.8"
+      }
+    },
+    {
+      "check": "cross_timeframe_timestamp_alignment",
+      "passed": true,
+      "details": {
+        "mapped_weights": [
+          0.0,
+          0.0,
+          0.2,
+          0.2,
+          0.4,
+          0.4,
+          0.4,
+          0.6,
+          0.6
+        ],
+        "expected_weights": [
+          0.0,
+          0.0,
+          0.2,
+          0.2,
+          0.4,
+          0.4,
+          0.4,
+          0.6,
+          0.6
+        ],
+        "exact_asof_backward_match": true,
+        "rejected_integer_repeat": true
+      }
+    },
+    {
+      "check": "signal_cache_integrity",
+      "passed": true,
+      "details": {
+        "cache_file_created": true,
+        "same_length_mutation_generates_distinct_cache": true,
+        "pre_perturbation_signals_invariant": true,
+        "corrupted_cache_triggers_recomputation": true,
+        "no_global_monkeypatches": true
+      }
+    },
+    {
+      "check": "structure_clock_and_execution_causality",
+      "passed": true,
+      "details": {
+        "pos_at_signal_bar_2": 0.0,
+        "pos_at_execution_bar_3": 1.0,
+        "signal_bar_return_earned": 0.0,
+        "execution_strictly_at_next_open": true
+      }
+    },
+    {
+      "check": "truncation_and_future_perturbation_invariance",
+      "passed": true,
+      "details": {
+        "total_czsc_columns_tested": 74,
+        "columns_with_differences": 0,
+        "truncation_invariance": true
+      }
+    }
+  ]
+}

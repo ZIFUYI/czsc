@@ -244,7 +244,10 @@ def compute_hetero_15m_signals(df: pd.DataFrame) -> dict[str, tuple[str, np.ndar
     s_c = pd.Series(c)
     ma60 = s_c.rolling(60, min_periods=5).mean().to_numpy(dtype=np.float64)
     ma120 = s_c.rolling(120, min_periods=10).mean().to_numpy(dtype=np.float64)
-    ma120_slp = (ma120 - np.roll(ma120, 16)) / np.maximum(np.roll(ma120, 16), 1e-6)
+    ma120_prev16 = np.empty_like(ma120)
+    ma120_prev16[:16] = ma120[0]
+    ma120_prev16[16:] = ma120[:-16]
+    ma120_slp = (ma120 - ma120_prev16) / np.maximum(ma120_prev16, 1e-6)
     v_ma20 = pd.Series(v).rolling(20, min_periods=2).mean().replace(0, 1.0).to_numpy(dtype=np.float64)
     bias60 = (c - ma60) / np.maximum(ma60, 1e-6)
 
@@ -427,7 +430,10 @@ def compute_all_5m_candidates(df15: pd.DataFrame, f5: pd.DataFrame) -> dict[str,
     ma20 = s_c.rolling(20, min_periods=3).mean().to_numpy()
     ma60 = s_c.rolling(60, min_periods=5).mean().to_numpy()
     ma120 = s_c.rolling(120, min_periods=10).mean().to_numpy()
-    ma120_slp = (ma120 - np.roll(ma120, 16)) / np.maximum(np.roll(ma120, 16), 1e-6)
+    ma120_prev16 = np.empty_like(ma120)
+    ma120_prev16[:16] = ma120[0]
+    ma120_prev16[16:] = ma120[:-16]
+    ma120_slp = (ma120 - ma120_prev16) / np.maximum(ma120_prev16, 1e-6)
     bias20 = (c - ma20) / np.maximum(ma20, 1e-6)
     bias60 = (c - ma60) / np.maximum(ma60, 1e-6)
 
@@ -1351,6 +1357,20 @@ def run_tier3_5m_incremental_funnel(
     return sorted(accepted_uids), rejected_5m, admitted_5m
 
 
+def map_15m_target_to_5m_grid(
+    df15: pd.DataFrame,
+    t15: np.ndarray,
+    df5: pd.DataFrame,
+    is_5m_native: bool = False,
+) -> np.ndarray:
+    """
+    将 15m 目标权重对齐至 5m 原生执行网格。
+    严格因果：后向时间戳对齐 (merge_asof backward)，禁止向过去时间回填任何仓位 (删除 w5_early[idx-2:idx] = w5[idx])。
+    在 15m 周期未完成确认前 (如 09:20、09:25)，5m 网格只能维持此前已确认的高周期目标，不得前视 09:30 的收盘仓位。
+    """
+    return map_tf_weight_to_base_grid(df15, t15, df5)
+
+
 def allocate_and_account_5m_grid(
     df5_map: dict[str, pd.DataFrame],
     specs: dict[str, AssetSpec],
@@ -1615,7 +1635,7 @@ def build_interactive_html_report(
         "ExpF_5TF_Hetero5M_MicroOI": (
             "#e11d48",
             "solid",
-            f"实验F: +5m微观异构+原生5m网格 (Shp {r_f.get('sharpe', 0):.2f} / Cal {r_f.get('calmar', 0):.2f} / Net +{r_f.get('net_ret_pct', 0):.2f}%)",
+            f"实验F: +5m微观异构+因果执行 (Shp {r_f.get('sharpe', 0):.2f} / Cal {r_f.get('calmar', 0):.2f} / Net +{r_f.get('net_ret_pct', 0):.2f}%)",
         ),
     }
 
@@ -1782,20 +1802,20 @@ def build_interactive_html_report(
       <div class="kpi-sub">净收益 +{r_e.get("net_ret_pct", 0):.2f}%</div>
     </div>
     <div class="kpi-card" style="border: 2px solid #e11d48; background: #fff1f2;">
-      <div class="kpi-title" style="color:#be123c;">实验F：+5m原生网格即时</div>
+      <div class="kpi-title" style="color:#be123c;">实验F：+5m因果网格执行</div>
       <div class="kpi-val" style="color:#e11d48;">Shp {r_f.get("sharpe", 0):.2f} / Cal {r_f.get("calmar", 0):.2f}</div>
       <div class="kpi-sub" style="color:#be123c;"><b>净收益 +{r_f.get("net_ret_pct", 0):.2f}% (3x: +{r_f_3x.get("net_ret_pct", 0):.2f}%)</b></div>
     </div>
   </div>
 
   <div class="highlight-box">
-    <b>六步递进核心实验结论（原生 5m 执行网格升级版）：</b><br/>
-    1. <b>原生 5m 执行网格消除 10 分钟时滞损耗：</b> 将撮合主时钟由 15m 下沉至 5m 原生网格（48 根 K 线/天），5m 微观持仓量与结构信号在 5m 柱收盘即时入场，彻底解决了原 15m 网格等待收盘造成的微观反包脉冲踏空与被动滑点逆向选择；<br/>
-    2. <b>全系统净表现刷新历史记录：</b><br/>
-       &bull; 实验 F 样本外 Net Sharpe 达到 <b><code>{r_f.get("sharpe", 0):.2f}</code></b>，Calmar 比率高达 <b><code>{r_f.get("calmar", 0):.2f}</code></b>，最大回撤收敛至极窄的 <b><code>{r_f.get("max_dd_pct", 0):.2f}%</code></b>；<br/>
-       &bull; <b>全样本外净收益大幅提升至 <code>+{r_f.get("net_ret_pct", 0):.2f}%</code></b>（2025 年 <code>+{r_f.get("ret_2025_pct", 0):.2f}%</code>，2026 年 <code>+{r_f.get("ret_2026_pct", 0):.2f}%</code>）；<br/>
-       &bull; <b>3.0x 实盘目标敞口版</b>：Stitched OOS 累计净收益达 <b><code>+{r_f_3x.get("net_ret_pct", 0):.2f}%</code></b>（年化 <b><code>+{r_f_3x.get("ann_ret_pct", 0):.2f}%</code></b>，MaxDD 仅 <b><code>{r_f_3x.get("max_dd_pct", 0):.2f}%</code></b>）；<br/>
-    3. <b>死区状态机（Deadzone = 0.08）+ Alloc3_SectorHRP 防火墙生效：</b> 年化换手率稳定在 <b><code>{r_f.get("ann_turnover", 0):.1f}x</code></b>，摩擦成本控制在 <b><code>{r_f.get("cost_ret_pct", 0):.2f}%</code></b>，并未因下沉至 5m 时钟而发生手续费磨损激增。
+    <b>六步递进核心实验结论（严格因果对齐与前视修正版）：</b><br/>
+    1. <b>前视回填彻底删除与因果执行重构：</b> 彻底删除历史版本向过去 10 分钟回填未来 15m 收盘仓位的违规逻辑（<code>w5_early[idx-2:idx] = w5[idx]</code>），在 5m 原生执行网格上严格采用后向时间戳对齐（<code>merge_asof backward</code>），高周期信号未完成前只能保持当时已确认状态；<br/>
+    2. <b>全系统因果表现复核：</b><br/>
+       &bull; 实验 F 样本外 Net Sharpe 为 <b><code>{r_f.get("sharpe", 0):.2f}</code></b>，Calmar 比率为 <b><code>{r_f.get("calmar", 0):.2f}</code></b>，最大回撤 <b><code>{r_f.get("max_dd_pct", 0):.2f}%</code></b>；<br/>
+       &bull; <b>全样本外净收益为 <code>+{r_f.get("net_ret_pct", 0):.2f}%</code></b>（2025 年 <code>+{r_f.get("ret_2025_pct", 0):.2f}%</code>，2026 年 <code>+{r_f.get("ret_2026_pct", 0):.2f}%</code>）；<br/>
+       &bull; <b>3.0x 实盘目标敞口版</b>：Stitched OOS 累计净收益 <b><code>+{r_f_3x.get("net_ret_pct", 0):.2f}%</code></b>（年化 <b><code>+{r_f_3x.get("ann_ret_pct", 0):.2f}%</code></b>，MaxDD <b><code>{r_f_3x.get("max_dd_pct", 0):.2f}%</code></b>）；<br/>
+    3. <b>体系因果结论：</b> 原报告宣称的 Sharpe 3.03 经证实源于 10 分钟前视回填未来收益；在严格因果框架下，实验 E（1d+60m+30m+15m 四周期协同，Sharpe 1.81，净收益 +8.51%）为全系统最优结构，5m 异构持仓量因子在扣除摩擦后无法在 OOS 提供额外增量 Sharpe。
   </div>
 
   <div class="chart-box">{fig1.to_html(full_html=False, include_plotlyjs=False)}</div>
@@ -2090,7 +2110,7 @@ def main() -> None:
         ),
         (
             "ExpF_5TF_Hetero5M_MicroOI",
-            "实验F: 增量融入5m异构微观持仓量因子 + 原生5m即时网格 + 快慢协同调制",
+            "实验F: 增量融入5m异构微观持仓量因子 + 15m高周期确认后5m网格因果执行 + 快慢协同调制",
             scores_5tf_df,
             pooled_5tf_df,
             lambda f_s, f_p, aid, f_id: exp_f_sel[(f_id, aid)],
@@ -2119,17 +2139,9 @@ def main() -> None:
                 sel = sel_fn(f_scores, f_pool, aid, f_id)
                 tot_factors += len(sel)
                 t15 = syn_fn(by_aid[aid], unit_grid_15m[aid], sel, specs_by_id[aid])
-                w5 = map_tf_weight_to_base_grid(by_aid[aid], t15, df5_map[aid])
-                if is_5m_native:
-                    w5_early = w5.copy()
-                    diff = np.diff(w5, prepend=0.0)
-                    entry_idx = np.where(np.abs(diff) > 0.05)[0]
-                    for idx in entry_idx:
-                        if idx >= 2:
-                            w5_early[idx - 2 : idx] = w5[idx]
-                    targets_5m[aid] = w5_early
-                else:
-                    targets_5m[aid] = w5
+                targets_5m[aid] = map_15m_target_to_5m_grid(
+                    by_aid[aid], t15, df5_map[aid], is_5m_native=is_5m_native
+                )
             led = allocate_and_account_5m_grid(
                 df5_map,
                 specs_by_id,
@@ -2166,7 +2178,7 @@ def main() -> None:
 
     exp_f_3x_ledgers = scale_fold_ledgers_exposure(exp_f_ledgers, leverage_mult=3.0)
     sum_f_3x = summarize_stitched_oos(exp_f_3x_ledgers, "ExpF_3x_TargetExposure")
-    sum_f_3x["description"] = "实验F (3.0x 实盘目标敞口版): 增量融入5m异构持仓量因子 + 全周期快慢协同"
+    sum_f_3x["description"] = "实验F (3.0x 实盘目标敞口版): 增量融入5m异构持仓量因子 + 15m确认后5m网格因果执行 + 全周期快慢协同"
     sum_f_3x["avg_factors_per_asset"] = comp_rows[-2]["avg_factors_per_asset"]
     comp_rows.append(sum_f_3x)
 
