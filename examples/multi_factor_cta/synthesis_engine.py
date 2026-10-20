@@ -533,6 +533,8 @@ class IntraAssetThreePillarSynthesizer:
         cs_strength: np.ndarray | None = None,
         tilt_Floor: float = 0.25,
         tilt_Cap: float = 1.50,
+        enable_hysteresis_runner: bool = False,
+        structure_pack: dict[str, np.ndarray] | None = None,
     ) -> np.ndarray:
         if enable_gram_schmidt:
             w_final, _ = self.synthesize_cluster_orthogonals(
@@ -551,6 +553,12 @@ class IntraAssetThreePillarSynthesizer:
                 tilt_Floor=tilt_Floor,
                 tilt_Cap=tilt_Cap,
             )
+            if enable_hysteresis_runner:
+                mode = execution_mode_override or asset_spec.execution_mode
+                w_gov = govern_position_with_hysteresis_runner(
+                    df_grid, w_final, base_tf=asset_spec.base_tf, sp_pack=structure_pack
+                )
+                return self._apply_execution_mode_adapter(df_grid, w_gov, mode)
             return w_final
 
         raw_clusters, has_ortho, eff_cs_rank = self.extract_raw_cluster_signals(
@@ -564,7 +572,7 @@ class IntraAssetThreePillarSynthesizer:
         )
         self.last_raw_cluster_signals = {k: v.copy() for k, v in raw_clusters.items()}
         self.last_ortho_cluster_signals = {k: v.copy() for k, v in raw_clusters.items()}
-        return self._combine_cluster_signals_to_position(
+        w_out = self._combine_cluster_signals_to_position(
             df_grid=df_grid,
             cluster_map=raw_clusters,
             has_ortho=has_ortho,
@@ -578,6 +586,13 @@ class IntraAssetThreePillarSynthesizer:
             tilt_Floor=tilt_Floor,
             tilt_Cap=tilt_Cap,
         )
+        if enable_hysteresis_runner:
+            mode = execution_mode_override or asset_spec.execution_mode
+            w_gov = govern_position_with_hysteresis_runner(
+                df_grid, w_out, base_tf=asset_spec.base_tf, sp_pack=structure_pack
+            )
+            return self._apply_execution_mode_adapter(df_grid, w_gov, mode)
+        return w_out
 
     @staticmethod
     def _get_causal_regimes(df_grid: pd.DataFrame) -> np.ndarray:
@@ -973,6 +988,9 @@ class CrossAssetHRPSynthesizer:
         rebalance_deadzone: float | None = None,
         tilt_Floor: float = 0.25,
         tilt_Cap: float = 1.50,
+        sector_damp_power: float = 0.50,
+        asset_prior_multipliers: dict[str, float] | pd.Series | pd.DataFrame | None = None,
+        align_futures_trading_day: bool = False,
     ) -> dict[str, Any]:
         """Build a ledger from raw price returns and aligned signed execution targets.
 
@@ -1042,8 +1060,15 @@ class CrossAssetHRPSynthesizer:
             roll_vol = 0.50 * roll_vol + 0.50 * causal_atr_vol
 
         inv_vol = (1.0 / np.maximum(roll_vol, 0.05)) * allocation_mask
+        if asset_prior_multipliers is not None:
+            if isinstance(asset_prior_multipliers, pd.DataFrame):
+                prior_df = self._align_optional_panel(asset_prior_multipliers, ret_df.index, ret_df.columns, 1.0)
+                inv_vol = inv_vol * prior_df
+            else:
+                prior_s = pd.Series(asset_prior_multipliers, dtype=np.float64).reindex(ret_df.columns).fillna(1.0)
+                inv_vol = inv_vol.multiply(prior_s, axis=1)
 
-        # 2. 第二层：动态板块内去拥挤 (1 / sqrt(K_{s,t})) 与板块间因果分层风险平价 (Sector HRP)
+        # 2. 第二层：动态板块内去拥挤 (1 / K_{s,t}^p) 与板块间因果分层风险平价 (Sector HRP)
         sectors: dict[str, list[str]] = {}
         for sym, sec in asset_sectors.items():
             if sym in ret_df.columns:
@@ -1073,8 +1098,8 @@ class CrossAssetHRPSynthesizer:
 
         for sec, syms in sectors.items():
             k_s_t = sector_active_counts[sec]
-            # 同一板块内有 K_{s,t} 个激活品种时，按 1 / sqrt(K_{s,t}) 折减同板块并发暴露
-            within_sec_damp = 1.0 / np.sqrt(np.maximum(k_s_t, 1.0))
+            # 同一板块内有 K_{s,t} 个激活品种时，按 1 / K_{s,t}^sector_damp_power 折减同板块并发暴露
+            within_sec_damp = 1.0 / np.power(np.maximum(k_s_t, 1.0), float(sector_damp_power))
             sec_factor = sec_budget_share[sec] * within_sec_damp
             for sym in syms:
                 sector_mult_df[sym] = sec_factor
@@ -1177,8 +1202,14 @@ class CrossAssetHRPSynthesizer:
             prev = eq_mat[t_idx].copy()
         eq_positions = pd.DataFrame(eq_mat, index=ret_df.index, columns=ret_df.columns)
         eq_ledger = account_portfolio_execution(ret_df, eq_positions, asset_fee_rates, tradable_mask=raw_df.notna())
-        port_daily_ret = ledger["daily_returns"]
-        eq_daily_ret = eq_ledger["daily_returns"]
+        if align_futures_trading_day:
+            t_day_idx = assign_futures_trading_day(ledger["bar_net_returns"].index)
+            port_daily_ret = ledger["bar_net_returns"].groupby(t_day_idx).sum()
+            eq_daily_ret = eq_ledger["bar_net_returns"].groupby(t_day_idx).sum()
+            ledger = {**ledger, "daily_returns": port_daily_ret}
+        else:
+            port_daily_ret = ledger["daily_returns"]
+            eq_daily_ret = eq_ledger["daily_returns"]
 
         # 统计有效资金利用率 (Active Capital Utilization Ratio)
         any_active_days = n_active_series > 0
@@ -1268,6 +1299,312 @@ class DynamicActivePoolAllocator(CrossAssetHRPSynthesizer):
         )
 
 
+def assign_futures_trading_day(dt_index: pd.DatetimeIndex | pd.Series) -> pd.DatetimeIndex:
+    """
+    期货交易日归属（15:00 收盘结算切分）：
+    将夜盘（>=18:00）及周六凌晨统一映射到下一交易日（周一或次日），确保同一完整期货交易日
+    （夜盘 21:00 ~ 次日 15:00）不因自然日午夜切分而产生跨日信息泄露或滚动统计断层。
+    """
+    from examples.multi_factor_cta.data_engine import assign_trading_date
+
+    s = pd.Series(pd.to_datetime(dt_index))
+    return pd.DatetimeIndex(assign_trading_date(s, has_night_session=True))
+
+
+def build_structure_pack(df_tf: pd.DataFrame, tf: str, box_window: int = 32) -> dict[str, np.ndarray]:
+    """基于 Rust `czsc.structure_snapshots` 与 `czsc.structure_stop_anchors` 提取严格因果的结构化出场特征包。"""
+    import czsc
+    from examples.alpha_mining_agent.hypothesis_bank import research_bars, rust_sma
+
+    c = np.nan_to_num(df_tf["close"].to_numpy(dtype=np.float64), nan=1.0)
+    l_arr = np.nan_to_num(df_tf["low"].to_numpy(dtype=np.float64), nan=c)
+    h_arr = np.nan_to_num(df_tf["high"].to_numpy(dtype=np.float64), nan=c)
+    atr = np.nan_to_num(
+        df_tf["atr14"].to_numpy(dtype=np.float64) if "atr14" in df_tf.columns else (h_arr - l_arr),
+        nan=0.005 * c,
+    )
+    tr = df_tf["tr"] if "tr" in df_tf.columns else pd.Series(h_arr - l_arr, index=df_tf.index)
+    atr_fast = np.nan_to_num(rust_sma(tr, 5).to_numpy(dtype=np.float64), nan=1.0)
+    atr_slow = np.nan_to_num(rust_sma(tr, 20).to_numpy(dtype=np.float64), nan=1.0)
+
+    bars = research_bars(df_tf, tf)
+    snaps = czsc.structure_snapshots(bars)
+    sec_anchors = czsc.structure_stop_anchors(bars, snaps, "pos_second_ext")
+    zs_anchors = czsc.structure_stop_anchors(bars, snaps, "pos_zs_reentry")
+    box_anchors = czsc.structure_stop_anchors(bars, snaps, "pos_box_stop", box_window=box_window)
+
+    pad = 0.35 * np.maximum(atr, 1e-6)
+    sec_l = np.asarray(sec_anchors["long_stop"], dtype=np.float64) - pad
+    sec_s = np.asarray(sec_anchors["short_stop"], dtype=np.float64) + pad
+    zs_l = np.asarray(zs_anchors["long_stop"], dtype=np.float64) - pad
+    zs_s = np.asarray(zs_anchors["short_stop"], dtype=np.float64) + pad
+    box_l = np.asarray(box_anchors["long_stop"], dtype=np.float64) - pad
+    box_s = np.asarray(box_anchors["short_stop"], dtype=np.float64) + pad
+
+    fallback_l = np.minimum(l_arr, c) - 1.2 * np.maximum(atr, 1e-6)
+    fallback_s = np.maximum(h_arr, c) + 1.2 * np.maximum(atr, 1e-6)
+
+    long_sec = np.where(np.isfinite(sec_l) & (sec_l > 0) & (sec_l < c), sec_l, fallback_l)
+    short_sec = np.where(np.isfinite(sec_s) & (sec_s > c), sec_s, fallback_s)
+    long_zs = np.where(np.isfinite(zs_l) & (zs_l > 0) & (zs_l < c), zs_l, long_sec)
+    short_zs = np.where(np.isfinite(zs_s) & (zs_s > c), zs_s, short_sec)
+    long_box = np.where(np.isfinite(box_l) & (box_l > 0) & (box_l < c), box_l, long_sec)
+    short_box = np.where(np.isfinite(box_s) & (box_s > c), box_s, short_sec)
+    long_hyb = 0.5 * (long_sec + long_box)
+    short_hyb = 0.5 * (short_sec + short_box)
+
+    raw_sec_l = np.where(
+        np.isfinite(sec_anchors["long_stop"]) & (sec_anchors["long_stop"] < c),
+        sec_anchors["long_stop"],
+        np.minimum(l_arr, c) - 0.6 * np.maximum(atr, 1e-6),
+    )
+    raw_sec_s = np.where(
+        np.isfinite(sec_anchors["short_stop"]) & (sec_anchors["short_stop"] > c),
+        sec_anchors["short_stop"],
+        np.maximum(h_arr, c) + 0.6 * np.maximum(atr, 1e-6),
+    )
+    long_rawzs = np.where(
+        np.isfinite(zs_anchors["long_stop"]) & (zs_anchors["long_stop"] < c),
+        zs_anchors["long_stop"],
+        raw_sec_l,
+    )
+    short_rawzs = np.where(
+        np.isfinite(zs_anchors["short_stop"]) & (zs_anchors["short_stop"] > c),
+        zs_anchors["short_stop"],
+        raw_sec_s,
+    )
+
+    bi_dir = np.asarray([s.completed_bi_dir for s in snaps], dtype=np.int8)
+    fx_dir = np.asarray([s.completed_fx_dir for s in snaps], dtype=np.int8)
+    zs_zg = np.asarray([s.zs_zg for s in snaps], dtype=np.float64) - pad
+    zs_zd = np.asarray([s.zs_zd for s in snaps], dtype=np.float64) + pad
+    raw_zs_zg = np.asarray([s.zs_zg for s in snaps], dtype=np.float64)
+    raw_zs_zd = np.asarray([s.zs_zd for s in snaps], dtype=np.float64)
+    return {
+        "close": c,
+        "atr_fast": atr_fast,
+        "atr_slow": atr_slow,
+        "long_sec": long_sec,
+        "short_sec": short_sec,
+        "long_zs": long_zs,
+        "short_zs": short_zs,
+        "long_box": long_box,
+        "short_box": short_box,
+        "long_hyb": long_hyb,
+        "short_hyb": short_hyb,
+        "long_rawzs": long_rawzs,
+        "short_rawzs": short_rawzs,
+        "bi_dir": bi_dir,
+        "fx_dir": fx_dir,
+        "zs_zg": zs_zg,
+        "zs_zd": zs_zd,
+        "raw_zs_zg": raw_zs_zg,
+        "raw_zs_zd": raw_zs_zd,
+    }
+
+
+def rust_govern_series(
+    w_arr: np.ndarray,
+    sp: dict[str, np.ndarray],
+    stop_kind: str = "zs",
+    trailing: float = 0.014,
+    trail_activation: float = 0.016,
+    max_hold: int = 96,
+    ratchet_stop: bool = True,
+    use_zs_reentry: bool = True,
+    use_bi_exit: bool = False,
+    use_fx_exit: bool = True,
+    min_hold: int = 0,
+    cooldown: int = 2,
+    use_raw_zs_edge: bool = False,
+    reentry_mode: str = "none",
+    reentry_breakout_buf: float = 0.0,
+    partial_exit_ratio: float = 0.0,
+    breakeven_buffer: float = 0.0,
+    runner_trail_mult: float = 1.5,
+) -> np.ndarray:
+    """纯透传调用 Rust `czsc.evaluate_structure_decay` 对连续持仓序列施加结构化出场、同向重入滞回与两级分批止盈治理。"""
+    import czsc
+
+    w = np.nan_to_num(np.asarray(w_arr, dtype=np.float64), nan=0.0)
+    d = np.where(w > 1e-5, 1, np.where(w < -1e-5, -1, 0)).astype(np.int8)
+    q = np.abs(w)
+    l_stop = sp[f"long_{stop_kind}"]
+    s_stop = sp[f"short_{stop_kind}"]
+    d_ffill = pd.Series(d).replace(0, np.nan).ffill().fillna(1).to_numpy(dtype=np.int8)
+    stop_lvl = np.where(d > 0, l_stop, np.where(d < 0, s_stop, np.where(d_ffill > 0, l_stop, s_stop)))
+    if use_bi_exit:
+        rev_dir = sp["bi_dir"]
+    elif reentry_mode not in ("", "none"):
+        rev_dir = np.where(sp["bi_dir"] == d, d, 0).astype(np.int8)
+    else:
+        rev_dir = np.zeros_like(d)
+    zg_key = "raw_zs_zg" if use_raw_zs_edge else "zs_zg"
+    zd_key = "raw_zs_zd" if use_raw_zs_edge else "zs_zd"
+    res = czsc.evaluate_structure_decay(
+        d.tolist(),
+        q.tolist(),
+        sp["close"].tolist(),
+        stop_lvl.tolist(),
+        rev_dir.tolist(),
+        sp["atr_fast"].tolist(),
+        sp["atr_slow"].tolist(),
+        lam0=0.0,
+        rho_min=0.5,
+        rho_max=2.0,
+        d_eps=0.02,
+        max_hold=max_hold,
+        trailing=trailing,
+        trail_activation=trail_activation,
+        ratchet_stop=ratchet_stop,
+        min_hold=min_hold,
+        cooldown=cooldown,
+        track_signal=True,
+        reentry_mode=reentry_mode,
+        reentry_breakout_buf=reentry_breakout_buf,
+        partial_exit_ratio=partial_exit_ratio,
+        breakeven_buffer=breakeven_buffer,
+        runner_trail_mult=runner_trail_mult,
+        zs_zg=sp[zg_key].tolist() if use_zs_reentry else None,
+        zs_zd=sp[zd_key].tolist() if use_zs_reentry else None,
+        completed_fx_dir=sp["fx_dir"].tolist() if use_fx_exit else None,
+    )
+    return np.asarray(res["strength"], dtype=np.float64)
+
+
+def govern_position_with_hysteresis_runner(
+    df_grid: pd.DataFrame,
+    w_arr: np.ndarray,
+    base_tf: str = "15m",
+    *,
+    sp_pack: dict[str, np.ndarray] | None = None,
+    stop_kind: str = "hyb",
+    trailing: float = 0.015,
+    trail_activation: float = 0.016,
+    max_hold: int = 160,
+    min_hold: int = 3,
+    cooldown: int = 5,
+    reentry_mode: str = "bi_or_peak",
+    partial_exit_ratio: float = 0.35,
+    breakeven_buffer: float = 0.0005,
+    runner_trail_mult: float = 1.5,
+    use_fx_exit: bool = True,
+) -> np.ndarray:
+    """
+    将旗舰 `HysteresisRunner`（两级分批止盈 `partial_exit_ratio=0.35` + 保本棘轮 `breakeven_buffer=0.0005`
+    + 尾仓宽轨追踪 `runner_trail_mult=1.5` + 缠论分型/笔/中枢结构离场与同向重入滞回 `bi_or_peak`）
+    正式封装为主库统一治理接口。
+    """
+    sp = sp_pack if sp_pack is not None else build_structure_pack(df_grid, base_tf, box_window=32)
+    return rust_govern_series(
+        w_arr,
+        sp,
+        stop_kind=stop_kind,
+        trailing=trailing,
+        trail_activation=trail_activation,
+        max_hold=max_hold,
+        ratchet_stop=True,
+        use_zs_reentry=True,
+        use_bi_exit=False,
+        use_fx_exit=use_fx_exit,
+        min_hold=min_hold,
+        cooldown=cooldown,
+        use_raw_zs_edge=False,
+        reentry_mode=reentry_mode,
+        reentry_breakout_buf=0.0,
+        partial_exit_ratio=partial_exit_ratio,
+        breakeven_buffer=breakeven_buffer,
+        runner_trail_mult=runner_trail_mult,
+    )
+
+
+def compute_continuous_cluster_risk_shares(
+    price_returns_is: pd.DataFrame | None = None,
+    sleeve_returns_is: pd.DataFrame | None = None,
+    asset_sectors: dict[str, str] | None = None,
+    candidate_assets: list[str] | set[str] | None = None,
+    *,
+    price_corr_df: pd.DataFrame | None = None,
+    strategy_corr_df: pd.DataFrame | None = None,
+    sectors: dict[str, list[str]] | None = None,
+    price_corr_floor: float = 0.35,
+    cluster_damp_coeff: float = 1.0,
+) -> dict[str, float]:
+    """
+    零先验无监督同板块连续相关性簇内风险分摊权重（消除任何特例硬阈值白名单）：
+        w^{cluster}_a = 1 / (1 + cluster_damp_coeff * sum_{b in sec(a), b != a} max(0, (|cp_{a,b}| - floor)/(1 - floor)) * |cs_{a,b}|)
+    """
+    if price_corr_df is not None and strategy_corr_df is not None:
+        cp_mat = price_corr_df.abs().fillna(0.0)
+        cs_mat = strategy_corr_df.abs().fillna(0.0)
+        all_cols = list(cp_mat.columns)
+    elif price_returns_is is not None and sleeve_returns_is is not None:
+        cp_mat = price_returns_is.corr().abs().fillna(0.0)
+        cs_mat = sleeve_returns_is.corr().abs().fillna(0.0)
+        all_cols = list(price_returns_is.columns)
+    else:
+        raise ValueError("必须提供 (price_corr_df, strategy_corr_df) 或 (price_returns_is, sleeve_returns_is)。")
+
+    cand_set = set(candidate_assets) if candidate_assets is not None else set(all_cols)
+    denom = max(1.0 - float(price_corr_floor), 1e-6)
+
+    if sectors is not None:
+        sec_groups = {sec: [s for s in syms if s in cand_set] for sec, syms in sectors.items()}
+    else:
+        sec_map = asset_sectors or {}
+        sec_groups = {}
+        for sym in all_cols:
+            if sym in cand_set:
+                sec = sec_map.get(sym, "DEFAULT_SECTOR")
+                sec_groups.setdefault(sec, []).append(sym)
+
+    cluster_shares: dict[str, float] = {}
+    for _sec, syms in sec_groups.items():
+        for a in syms:
+            crowd_sum = 0.0
+            for peer in syms:
+                if peer == a:
+                    continue
+                cp_val = float(cp_mat.loc[a, peer]) if (a in cp_mat.index and peer in cp_mat.columns) else 0.0
+                cs_val = float(cs_mat.loc[a, peer]) if (a in cs_mat.index and peer in cs_mat.columns) else 0.0
+                eff_rho = max(0.0, (cp_val - float(price_corr_floor)) / denom) * cs_val
+                crowd_sum += eff_rho
+            cluster_shares[a] = float(1.0 / (1.0 + float(cluster_damp_coeff) * crowd_sum))
+    return cluster_shares
+
+
+def compute_causal_sleeve_health_multiplier(
+    sleeve_daily_returns: pd.DataFrame,
+    target_index: pd.DatetimeIndex,
+    *,
+    window: int = 60,
+    min_periods: int = 20,
+    pos_slope: float = 0.30,
+    neg_floor: float = 0.35,
+    align_futures_trading_day: bool = True,
+) -> pd.DataFrame:
+    """
+    严格滞后至前一完整交易日（`shift(1)`，15:00 收盘结算后）的因果滚动袖套健康度风险预算乘数：
+    当过去 60 个交易日单品种袖套滚动 Sharpe >= 0 时温和放大 `1.0 + pos_slope * Sharpe`，
+    当滚动 Sharpe < 0（局部回撤/水土不服期）时自动收缩至 `neg_floor`。
+    """
+    d_df = sleeve_daily_returns.sort_index()
+    r_m = d_df.rolling(window, min_periods=min_periods).mean().shift(1)
+    r_s = d_df.rolling(window, min_periods=min_periods).std(ddof=1).shift(1)
+    r_shp = ((r_m / r_s.replace(0.0, np.nan)) * np.sqrt(252.0)).fillna(0.5)
+    h_daily = r_shp.clip(lower=-0.5, upper=2.0).apply(
+        lambda s: np.where(s >= 0.0, 1.0 + float(pos_slope) * s, float(neg_floor))
+    )
+    lookup_idx = (
+        assign_futures_trading_day(target_index)
+        if align_futures_trading_day
+        else pd.to_datetime(target_index).normalize()
+    )
+    h_grid = h_daily.reindex(lookup_idx).fillna(1.0)
+    h_grid.index = pd.DatetimeIndex(target_index)
+    return h_grid
+
+
 def evaluate_single_asset_backtest(
     df_grid: pd.DataFrame,
     w_grid: np.ndarray,
@@ -1298,7 +1635,9 @@ __all__ = [
     "DEFAULT_BASIS_ORDER",
     "DEFAULT_CAUSAL_ORTHO_WINDOW",
     "account_portfolio_execution",
+    "assign_futures_trading_day",
     "build_asset_execution_inputs",
+    "build_structure_pack",
     "ContinuousSignalStateMachine",
     "CrossAssetHRPSynthesizer",
     "DynamicActivePoolAllocator",
@@ -1307,9 +1646,13 @@ __all__ = [
     "RollingEBWeightsResult",
     "RollingEmpiricalBayesWeighter",
     "apply_cross_sectional_budget_tilt",
+    "compute_causal_sleeve_health_multiplier",
+    "compute_continuous_cluster_risk_shares",
     "compute_empirical_bayes_shrinkage_weight",
     "compute_rolling_empirical_bayes_weights",
     "evaluate_single_asset_backtest",
+    "govern_position_with_hysteresis_runner",
     "gram_schmidt_cluster_orthogonalize",
     "joint_is_coordinate_reweight",
+    "rust_govern_series",
 ]

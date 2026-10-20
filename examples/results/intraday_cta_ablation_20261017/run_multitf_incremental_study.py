@@ -47,7 +47,6 @@ from run_intraday_ablation import (  # noqa: E402
     synthesize_asset_signal,
 )
 
-import czsc  # noqa: E402
 from examples.alpha_mining_agent.forensic_pipeline import evaluate_execution_events  # noqa: E402
 from examples.alpha_mining_agent.hypothesis_bank import (  # noqa: E402
     ALL_SIGNAL_SPECS,
@@ -56,8 +55,6 @@ from examples.alpha_mining_agent.hypothesis_bank import (  # noqa: E402
     ARCH_C,
     ARCH_D,
     ARCH_E,
-    research_bars,
-    rust_sma,
 )
 from examples.multi_factor_cta.data_engine import (  # noqa: E402
     AssetClass,
@@ -70,6 +67,8 @@ from examples.multi_factor_cta.synthesis_engine import (  # noqa: E402
     CrossAssetHRPSynthesizer,
     IntraAssetThreePillarSynthesizer,
     account_portfolio_execution,
+    build_structure_pack,
+    rust_govern_series,
 )
 
 # 启用 5m 周期在商品三支柱合成器中的权重 (原默认值为 0.00)
@@ -1154,162 +1153,6 @@ def compute_episode_payoff_stats(ret_arrays: list[np.ndarray]) -> dict[str, floa
         "payoff_r": round(pl, 3),
         "safety_margin_pct": round(sm * 100.0, 2),
     }
-
-
-def build_structure_pack(df_tf: pd.DataFrame, tf: str, box_window: int = 32) -> dict[str, np.ndarray]:
-    """基于 Rust `czsc.structure_snapshots` 与 `czsc.structure_stop_anchors` 提取严格因果的结构化出场特征包"""
-    c = np.nan_to_num(df_tf["close"].to_numpy(dtype=np.float64), nan=1.0)
-    l_arr = np.nan_to_num(df_tf["low"].to_numpy(dtype=np.float64), nan=c)
-    h_arr = np.nan_to_num(df_tf["high"].to_numpy(dtype=np.float64), nan=c)
-    atr = np.nan_to_num(
-        df_tf["atr14"].to_numpy(dtype=np.float64) if "atr14" in df_tf.columns else (h_arr - l_arr),
-        nan=0.005 * c,
-    )
-    tr = df_tf["tr"] if "tr" in df_tf.columns else pd.Series(h_arr - l_arr, index=df_tf.index)
-    atr_fast = np.nan_to_num(rust_sma(tr, 5).to_numpy(dtype=np.float64), nan=1.0)
-    atr_slow = np.nan_to_num(rust_sma(tr, 20).to_numpy(dtype=np.float64), nan=1.0)
-
-    bars = research_bars(df_tf, tf)
-    snaps = czsc.structure_snapshots(bars)
-    sec_anchors = czsc.structure_stop_anchors(bars, snaps, "pos_second_ext")
-    zs_anchors = czsc.structure_stop_anchors(bars, snaps, "pos_zs_reentry")
-    box_anchors = czsc.structure_stop_anchors(bars, snaps, "pos_box_stop", box_window=box_window)
-
-    pad = 0.35 * np.maximum(atr, 1e-6)
-    sec_l = np.asarray(sec_anchors["long_stop"], dtype=np.float64) - pad
-    sec_s = np.asarray(sec_anchors["short_stop"], dtype=np.float64) + pad
-    zs_l = np.asarray(zs_anchors["long_stop"], dtype=np.float64) - pad
-    zs_s = np.asarray(zs_anchors["short_stop"], dtype=np.float64) + pad
-    box_l = np.asarray(box_anchors["long_stop"], dtype=np.float64) - pad
-    box_s = np.asarray(box_anchors["short_stop"], dtype=np.float64) + pad
-
-    fallback_l = np.minimum(l_arr, c) - 1.2 * np.maximum(atr, 1e-6)
-    fallback_s = np.maximum(h_arr, c) + 1.2 * np.maximum(atr, 1e-6)
-
-    long_sec = np.where(np.isfinite(sec_l) & (sec_l > 0) & (sec_l < c), sec_l, fallback_l)
-    short_sec = np.where(np.isfinite(sec_s) & (sec_s > c), sec_s, fallback_s)
-    long_zs = np.where(np.isfinite(zs_l) & (zs_l > 0) & (zs_l < c), zs_l, long_sec)
-    short_zs = np.where(np.isfinite(zs_s) & (zs_s > c), zs_s, short_sec)
-    long_box = np.where(np.isfinite(box_l) & (box_l > 0) & (box_l < c), box_l, long_sec)
-    short_box = np.where(np.isfinite(box_s) & (box_s > c), box_s, short_sec)
-    long_hyb = 0.5 * (long_sec + long_box)
-    short_hyb = 0.5 * (short_sec + short_box)
-
-    raw_sec_l = np.where(
-        np.isfinite(sec_anchors["long_stop"]) & (sec_anchors["long_stop"] < c),
-        sec_anchors["long_stop"],
-        np.minimum(l_arr, c) - 0.6 * np.maximum(atr, 1e-6),
-    )
-    raw_sec_s = np.where(
-        np.isfinite(sec_anchors["short_stop"]) & (sec_anchors["short_stop"] > c),
-        sec_anchors["short_stop"],
-        np.maximum(h_arr, c) + 0.6 * np.maximum(atr, 1e-6),
-    )
-    long_rawzs = np.where(
-        np.isfinite(zs_anchors["long_stop"]) & (zs_anchors["long_stop"] < c),
-        zs_anchors["long_stop"],
-        raw_sec_l,
-    )
-    short_rawzs = np.where(
-        np.isfinite(zs_anchors["short_stop"]) & (zs_anchors["short_stop"] > c),
-        zs_anchors["short_stop"],
-        raw_sec_s,
-    )
-
-    bi_dir = np.asarray([s.completed_bi_dir for s in snaps], dtype=np.int8)
-    fx_dir = np.asarray([s.completed_fx_dir for s in snaps], dtype=np.int8)
-    zs_zg = np.asarray([s.zs_zg for s in snaps], dtype=np.float64) - pad
-    zs_zd = np.asarray([s.zs_zd for s in snaps], dtype=np.float64) + pad
-    raw_zs_zg = np.asarray([s.zs_zg for s in snaps], dtype=np.float64)
-    raw_zs_zd = np.asarray([s.zs_zd for s in snaps], dtype=np.float64)
-    return {
-        "close": c,
-        "atr_fast": atr_fast,
-        "atr_slow": atr_slow,
-        "long_sec": long_sec,
-        "short_sec": short_sec,
-        "long_zs": long_zs,
-        "short_zs": short_zs,
-        "long_box": long_box,
-        "short_box": short_box,
-        "long_hyb": long_hyb,
-        "short_hyb": short_hyb,
-        "long_rawzs": long_rawzs,
-        "short_rawzs": short_rawzs,
-        "bi_dir": bi_dir,
-        "fx_dir": fx_dir,
-        "zs_zg": zs_zg,
-        "zs_zd": zs_zd,
-        "raw_zs_zg": raw_zs_zg,
-        "raw_zs_zd": raw_zs_zd,
-    }
-
-
-def rust_govern_series(
-    w_arr: np.ndarray,
-    sp: dict[str, np.ndarray],
-    stop_kind: str = "zs",
-    trailing: float = 0.014,
-    trail_activation: float = 0.016,
-    max_hold: int = 96,
-    ratchet_stop: bool = True,
-    use_zs_reentry: bool = True,
-    use_bi_exit: bool = False,
-    use_fx_exit: bool = True,
-    min_hold: int = 0,
-    cooldown: int = 2,
-    use_raw_zs_edge: bool = False,
-    reentry_mode: str = "none",
-    reentry_breakout_buf: float = 0.0,
-    partial_exit_ratio: float = 0.0,
-    breakeven_buffer: float = 0.0,
-    runner_trail_mult: float = 1.5,
-) -> np.ndarray:
-    """纯透传调用 Rust `czsc.evaluate_structure_decay` 对连续持仓序列施加结构化出场、同向重入滞回与两级分批止盈治理"""
-    w = np.nan_to_num(np.asarray(w_arr, dtype=np.float64), nan=0.0)
-    d = np.where(w > 1e-5, 1, np.where(w < -1e-5, -1, 0)).astype(np.int8)
-    q = np.abs(w)
-    l_stop = sp[f"long_{stop_kind}"]
-    s_stop = sp[f"short_{stop_kind}"]
-    d_ffill = pd.Series(d).replace(0, np.nan).ffill().fillna(1).to_numpy(dtype=np.int8)
-    stop_lvl = np.where(d > 0, l_stop, np.where(d < 0, s_stop, np.where(d_ffill > 0, l_stop, s_stop)))
-    if use_bi_exit:
-        rev_dir = sp["bi_dir"]
-    elif reentry_mode not in ("", "none"):
-        rev_dir = np.where(sp["bi_dir"] == d, d, 0).astype(np.int8)
-    else:
-        rev_dir = np.zeros_like(d)
-    zg_key = "raw_zs_zg" if use_raw_zs_edge else "zs_zg"
-    zd_key = "raw_zs_zd" if use_raw_zs_edge else "zs_zd"
-    res = czsc.evaluate_structure_decay(
-        d.tolist(),
-        q.tolist(),
-        sp["close"].tolist(),
-        stop_lvl.tolist(),
-        rev_dir.tolist(),
-        sp["atr_fast"].tolist(),
-        sp["atr_slow"].tolist(),
-        lam0=0.0,
-        rho_min=0.5,
-        rho_max=2.0,
-        d_eps=0.02,
-        max_hold=max_hold,
-        trailing=trailing,
-        trail_activation=trail_activation,
-        ratchet_stop=ratchet_stop,
-        min_hold=min_hold,
-        cooldown=cooldown,
-        track_signal=True,
-        reentry_mode=reentry_mode,
-        reentry_breakout_buf=reentry_breakout_buf,
-        partial_exit_ratio=partial_exit_ratio,
-        breakeven_buffer=breakeven_buffer,
-        runner_trail_mult=runner_trail_mult,
-        zs_zg=sp[zg_key].tolist() if use_zs_reentry else None,
-        zs_zd=sp[zd_key].tolist() if use_zs_reentry else None,
-        completed_fx_dir=sp["fx_dir"].tolist() if use_fx_exit else None,
-    )
-    return np.asarray(res["strength"], dtype=np.float64)
 
 
 def synthesize_structure_aware_synergy(

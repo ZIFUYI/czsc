@@ -31,10 +31,13 @@ if str(ROOT / "examples") not in sys.path:
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from multi_factor_cta.data_engine import AssetClass, AssetSpec, assign_trading_date  # noqa: E402
+from multi_factor_cta.data_engine import AssetClass, AssetSpec  # noqa: E402
 from multi_factor_cta.synthesis_engine import (  # noqa: E402
     _project_capped_simplex_row,
     account_portfolio_execution,
+    assign_futures_trading_day,
+    compute_causal_sleeve_health_multiplier,
+    compute_continuous_cluster_risk_shares,
 )
 from run_multitf_incremental_study import (  # noqa: E402
     ALL_TFS,
@@ -160,13 +163,6 @@ for c in IDS_60:
 PERIODS_PER_YEAR = 252.0 * 48.0
 ANN_SCALE = np.sqrt(PERIODS_PER_YEAR)
 BARS_PER_DAY = 48
-
-
-def assign_futures_trading_day(dts: pd.Series | pd.DatetimeIndex) -> pd.DatetimeIndex:
-    """将含夜盘商品期货时间戳映射到标准期货交易日（>=18:00 夜盘及周六凌晨归属下一交易日，15:00收盘结算）。"""
-    s = pd.Series(pd.to_datetime(dts))
-    t_dates = assign_trading_date(s, has_night_session=True)
-    return pd.DatetimeIndex(pd.to_datetime(t_dates))
 
 
 def ensure_full60_oos_bundles(force_rebuild: bool = False) -> tuple[dict, dict]:
@@ -846,12 +842,7 @@ def run_zero_hardcode_sop_stage3(
             inv_vol[c] *= q_p
 
         d_df = sleeve_daily_ret[f_id][IDS_60]
-        r_m = d_df.rolling(60, min_periods=20).mean().shift(1)
-        r_s = d_df.rolling(60, min_periods=20).std(ddof=1).shift(1)
-        r_shp = ((r_m / r_s.replace(0.0, np.nan)) * np.sqrt(252.0)).fillna(0.5)
-        h_daily = r_shp.clip(lower=-0.5, upper=2.0).apply(lambda s: np.where(s >= 0.0, 1.0 + 0.30 * s, 0.35))
-        h_5m = h_daily.reindex(assign_futures_trading_day(ret_oos.index)).fillna(1.0)
-        h_5m.index = ret_oos.index
+        h_5m = compute_causal_sleeve_health_multiplier(d_df, ret_oos.index, neg_floor=0.35)
         inv_vol = inv_vol * h_5m
 
         led = _execute_sector_conserved_allocation(
@@ -986,19 +977,17 @@ def run_zero_hardcode_cluster_conserved(
                 cands[aid] = float(m["is_shp_hr"]) * float(m["is_shp_fs"]) * float(m["is_payoff_r"]) * liq_mult
 
         # 2. 同板块内连续相关性簇内风险分摊 (<= cutoff，无任何特例白名单或二值剔除豁免)
+        cluster_share_w = compute_continuous_cluster_risk_shares(
+            price_corr_df=cp_mat,
+            strategy_corr_df=cs_mat,
+            sectors=SECTORS_60,
+            candidate_assets=list(cands.keys()),
+            cluster_damp_coeff=cluster_damp_coeff,
+        )
         sel_ids: list[str] = []
-        cluster_share_w: dict[str, float] = {}
         for _sec, syms in SECTORS_60.items():
             sec_cands = sorted([a for a in syms if a in cands], key=lambda x: cands[x], reverse=True)
-            for a in sec_cands:
-                crowd_sum = 0.0
-                for peer in sec_cands:
-                    if peer == a:
-                        continue
-                    eff_rho = max(0.0, (float(cp_mat.loc[a, peer]) - 0.35) / 0.65) * float(cs_mat.loc[a, peer])
-                    crowd_sum += eff_rho
-                cluster_share_w[a] = 1.0 / (1.0 + cluster_damp_coeff * crowd_sum)
-                sel_ids.append(a)
+            sel_ids.extend(sec_cands)
 
         selected_per_fold[f_id] = sel_ids
         sel_set = set(sel_ids)
@@ -1024,12 +1013,7 @@ def run_zero_hardcode_cluster_conserved(
 
         # 3. 严格滞后至前一期货交易日 (15:00结算后) 的因果滚动袖套健康度倾斜
         d_df = d_all[IDS_60]
-        r_m = d_df.rolling(60, min_periods=20).mean().shift(1)
-        r_s = d_df.rolling(60, min_periods=20).std(ddof=1).shift(1)
-        r_shp = ((r_m / r_s.replace(0.0, np.nan)) * np.sqrt(252.0)).fillna(0.5)
-        h_daily = r_shp.clip(lower=-0.5, upper=2.0).apply(lambda s: np.where(s >= 0.0, 1.0 + 0.30 * s, 0.35))
-        h_5m = h_daily.reindex(assign_futures_trading_day(ret_oos.index)).fillna(1.0)
-        h_5m.index = ret_oos.index
+        h_5m = compute_causal_sleeve_health_multiplier(d_df, ret_oos.index, neg_floor=0.35)
         inv_vol = inv_vol * h_5m
 
         led = _execute_sector_conserved_allocation(
@@ -1132,12 +1116,7 @@ def run_core_satellite_sop_stage3(
 
             if use_causal_health:
                 d_df = sleeve_daily_ret[f_id][sats]
-                r_m = d_df.rolling(60, min_periods=20).mean().shift(1)
-                r_s = d_df.rolling(60, min_periods=20).std(ddof=1).shift(1)
-                r_shp = ((r_m / r_s.replace(0.0, np.nan)) * np.sqrt(252.0)).fillna(0.5)
-                h_daily = r_shp.clip(lower=-0.5, upper=2.0).apply(lambda s: np.where(s >= 0.0, 1.0 + 0.30 * s, 0.25))
-                h_5m = h_daily.reindex(assign_futures_trading_day(ret_oos.index)).fillna(1.0)
-                h_5m.index = ret_oos.index
+                h_5m = compute_causal_sleeve_health_multiplier(d_df, ret_oos.index, neg_floor=0.25)
                 inv_v = inv_v * h_5m
 
             inv_sum = inv_v.sum(axis=1).replace(0.0, np.nan)

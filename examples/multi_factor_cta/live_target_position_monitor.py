@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -29,16 +28,22 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from examples.alpha_mining_agent.forensic_pipeline import IS_END_DT  # noqa: E402
 from examples.alpha_mining_agent.hypothesis_bank import ALL_SIGNAL_SPECS  # noqa: E402
 from examples.multi_factor_cta.data_engine import (  # noqa: E402
     AssetClass,
     CrossAssetDataEngine,
 )
-from examples.multi_factor_cta.run_framework_demo import load_research_universe, synthesize_admitted_asset  # noqa: E402
+from examples.multi_factor_cta.run_framework_demo import (  # noqa: E402
+    load_candidate_alloc_map,
+    load_research_universe,
+    synthesize_admitted_asset,
+)
 from examples.multi_factor_cta.synthesis_engine import (  # noqa: E402
     CrossAssetHRPSynthesizer,
     IntraAssetThreePillarSynthesizer,
     build_asset_execution_inputs,
+    compute_continuous_cluster_risk_shares,
     evaluate_single_asset_backtest,
 )
 from examples.multi_factor_cta.test_all_weather_9assets_portfolio import (  # noqa: E402
@@ -113,8 +118,7 @@ def main() -> None:
     intra_synth = IntraAssetThreePillarSynthesizer()
     hrp_synth = CrossAssetHRPSynthesizer(target_portfolio_vol=0.14)
 
-    champ_path = WORKSPACE_DIR / "champion_portfolio.json"
-    champ_alloc: dict[str, float] = json.loads(champ_path.read_text(encoding="utf-8"))["alloc_map"]
+    champ_alloc: dict[str, float] = load_candidate_alloc_map(WORKSPACE_DIR / "champion_portfolio.json")
 
     universe = build_nine_assets_universe()
     pool_frames = load_research_universe(data_engine, [spec for _, spec in universe])
@@ -132,6 +136,7 @@ def main() -> None:
             pool_frames,
             sorted(champ_alloc),
             intra_synth,
+            enable_hysteresis_runner=is_comm,
         )
         # A prospective next-open order snapshot uses information at the latest
         # close; its allocation ledger is not a realized execution backtest.
@@ -174,6 +179,22 @@ def main() -> None:
             "oos_sharpe": ev["oos"]["sharpe"],
         }
 
+    sectors_map: dict[str, list[str]] = {}
+    for aid, sec in asset_sectors.items():
+        sectors_map.setdefault(sec, []).append(aid)
+    daily_price_ret_df = (
+        pd.DataFrame(execution_returns)
+        .groupby(lambda ts: pd.Timestamp(ts).normalize())
+        .sum()
+        .loc[: pd.Timestamp(IS_END_DT).normalize()]
+    )
+    daily_strat_ret_df = pd.DataFrame(asset_daily_returns).sort_index().loc[: pd.Timestamp(IS_END_DT).normalize()]
+    cluster_shares = compute_continuous_cluster_risk_shares(
+        price_corr_df=daily_price_ret_df.corr().abs().fillna(0.0),
+        strategy_corr_df=daily_strat_ret_df.corr().abs().fillna(0.0),
+        sectors=sectors_map,
+    )
+
     hrp_res = hrp_synth.build_multi_asset_portfolio(
         execution_returns,
         asset_sectors,
@@ -183,6 +204,7 @@ def main() -> None:
         returns_kind="price",
         positions_timing="close",
         periods_per_year=252 * 48,
+        asset_prior_multipliers=cluster_shares,
     )
     common_dates = pd.DataFrame(execution_returns).dropna().index
     ref_dt = common_dates[-1] if len(common_dates) > 0 else hrp_res["equal_weights_df"].index[-1]
