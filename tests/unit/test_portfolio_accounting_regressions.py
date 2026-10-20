@@ -404,3 +404,53 @@ def test_daily_turbulence_cap_uses_one_bar_per_day():
     cap_15m = IntraAssetThreePillarSynthesizer._get_causal_turbulence_cap(frame, "15m")
     # Daily bars must use bars_per_day=1, whereas 15m uses bars_per_day=16 (4x higher annualized vol on same series).
     assert float(np.mean(cap_1d[30:])) > float(np.mean(cap_15m[30:]))
+
+
+def test_hysteresis_runner_governance_is_prefix_invariant():
+    from examples.multi_factor_cta.synthesis_engine import govern_position_with_hysteresis_runner
+
+    frame = generate_symbol_kines("SHFE.RB9999", "15分钟", "20230102", "20230215", seed=811).iloc[:240].copy()
+    raw_w = np.tanh(frame["close"].pct_change(4).fillna(0.0).to_numpy(dtype=np.float64) * 50.0)
+    cut = 160
+    full = govern_position_with_hysteresis_runner(frame, raw_w, base_tf="15m")
+    prefix = govern_position_with_hysteresis_runner(frame.iloc[:cut].copy(), raw_w[:cut], base_tf="15m")
+    np.testing.assert_allclose(full[:cut], prefix, atol=1e-12)
+
+
+def test_continuous_cluster_risk_shares_smoothly_dampen_collinear_peers():
+    from examples.multi_factor_cta.synthesis_engine import compute_continuous_cluster_risk_shares
+
+    price_corr = pd.DataFrame(
+        [[1.0, 0.90, 0.20], [0.90, 1.0, 0.20], [0.20, 0.20, 1.0]],
+        index=["rb", "hc", "au"],
+        columns=["rb", "hc", "au"],
+    )
+    strat_corr = pd.DataFrame(
+        [[1.0, 0.80, 0.10], [0.80, 1.0, 0.10], [0.10, 0.10, 1.0]],
+        index=["rb", "hc", "au"],
+        columns=["rb", "hc", "au"],
+    )
+    shares = compute_continuous_cluster_risk_shares(
+        price_corr_df=price_corr,
+        strategy_corr_df=strat_corr,
+        sectors={"FERROUS": ["rb", "hc"], "PRECIOUS": ["au"]},
+    )
+    assert shares["au"] == pytest.approx(1.0)
+    assert 0.5 < shares["rb"] < 0.65
+    assert shares["rb"] == pytest.approx(shares["hc"])
+
+
+def test_causal_sleeve_health_multiplier_lags_night_session_to_prev_trading_day():
+    from examples.multi_factor_cta.synthesis_engine import compute_causal_sleeve_health_multiplier
+
+    days = pd.date_range("2025-01-01", periods=30, freq="B")
+    daily_ret = pd.DataFrame({"A": np.linspace(0.001, 0.01, len(days))}, index=days)
+    # 2025-02-10 21:15 belongs to trading day 2025-02-11; its health multiplier must equal 2025-02-11's lagged value
+    intraday_idx = pd.DatetimeIndex(["2025-02-10 14:45:00", "2025-02-10 21:15:00", "2025-02-11 09:30:00"])
+    h_intraday = compute_causal_sleeve_health_multiplier(daily_ret, intraday_idx)
+    assert h_intraday.loc["2025-02-10 21:15:00", "A"] == pytest.approx(h_intraday.loc["2025-02-11 09:30:00", "A"])
+    # Changing the return on 2025-02-11 must not affect 2025-02-10 21:15 or 2025-02-11 09:30 (strictly shifted by 1 day)
+    daily_ret_perturbed = daily_ret.copy()
+    daily_ret_perturbed.loc["2025-02-11", "A"] = -0.50
+    h_perturbed = compute_causal_sleeve_health_multiplier(daily_ret_perturbed, intraday_idx)
+    pd.testing.assert_frame_equal(h_intraday, h_perturbed)

@@ -54,6 +54,7 @@ from examples.multi_factor_cta.synthesis_engine import (  # noqa: E402
     RollingEmpiricalBayesWeighter,
     build_asset_execution_inputs,
     evaluate_single_asset_backtest,
+    govern_position_with_hysteresis_runner,
 )
 
 WORKSPACE_DIR = ROOT_DIR / "examples" / "results" / "alpha_agent_workspace"
@@ -205,6 +206,20 @@ def load_research_universe(
     return prepare_research_pool(frames, metadata=metadata)
 
 
+def load_candidate_alloc_map(champ_path: Path | None = None) -> dict[str, float]:
+    """加载精选规则因子单元配置，若本地缓存 json 不存在则自动回退至 RuleFactorRegistry 内置种子因子池。"""
+    p = champ_path if champ_path is not None else (WORKSPACE_DIR / "champion_portfolio.json")
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))["alloc_map"]
+    reg = RuleFactorRegistry()
+    alloc: dict[str, float] = {}
+    for spec in reg.list_all():
+        if spec.is_base_seed:
+            for tf in spec.eligible_tfs:
+                alloc[f"{spec.factor_id}@{tf}"] = float(spec.default_weight)
+    return alloc
+
+
 def synthesize_admitted_asset(
     spec: AssetSpec,
     frames: dict[str, dict[str, pd.DataFrame]],
@@ -213,6 +228,7 @@ def synthesize_admitted_asset(
     *,
     is_end_dt: pd.Timestamp = IS_END_DT,
     audit_context: ResearchAuditContext | None = None,
+    enable_hysteresis_runner: bool = False,
 ) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, float], dict[str, dict]]:
     """Re-audit every seed/champion, fit through the cutoff and trade only afterwards.
 
@@ -259,7 +275,10 @@ def synthesize_admitted_asset(
         rebalance_deadzone=0.0,
     )
     target[pd.to_datetime(grid["dt"]).to_numpy() <= pd.Timestamp(is_end_dt).to_datetime64()] = 0.0
-    target = ContinuousSignalStateMachine().transform(target)
+    if enable_hysteresis_runner:
+        target = govern_position_with_hysteresis_runner(grid, target, base_tf=spec.base_tf)
+    else:
+        target = ContinuousSignalStateMachine().transform(target)
     target = synthesizer._apply_execution_mode_adapter(grid, target, spec.execution_mode)
     return target, weights, {uid: float(eb[uid][-1]) for uid in priors}, audits
 
@@ -277,9 +296,8 @@ def main() -> None:
     intra_synth = IntraAssetThreePillarSynthesizer()
     hrp_synth = CrossAssetHRPSynthesizer(target_portfolio_vol=0.14)
 
-    # 加载 44 个精选规则因子单元配置
-    champ_path = WORKSPACE_DIR / "champion_portfolio.json"
-    champ_alloc: dict[str, float] = json.loads(champ_path.read_text(encoding="utf-8"))["alloc_map"]
+    # 加载精选规则因子单元配置（缺失本地缓存时自动回退至内置种子因子池）
+    champ_alloc: dict[str, float] = load_candidate_alloc_map()
 
     universe = build_default_cross_asset_universe()
     pool_frames = load_research_universe(data_engine, universe)
