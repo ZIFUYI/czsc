@@ -31,7 +31,7 @@ if str(ROOT / "examples") not in sys.path:
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from multi_factor_cta.data_engine import AssetClass, AssetSpec  # noqa: E402
+from multi_factor_cta.data_engine import AssetClass, AssetSpec, assign_trading_date  # noqa: E402
 from multi_factor_cta.synthesis_engine import (  # noqa: E402
     _project_capped_simplex_row,
     account_portfolio_execution,
@@ -41,9 +41,23 @@ from run_multitf_incremental_study import (  # noqa: E402
     CORE_20_IDS,
     FOLDS,
     OUT_DIR,
+    allocate_and_account_5m_grid,
+    build_asset_execution_inputs,
+    build_structure_pack,
     compute_episode_payoff_stats,
+    compute_hetero_1d_signals,
+    compute_hetero_15m_signals,
+    eval_is_net_sharpe,
+    evaluate_execution_events,
+    map_15m_target_to_5m_grid,
+    map_tf_weight_to_base_grid,
+    register_hetero_signal_specs,
+    run_incremental_funnel_gate123,
     scale_fold_ledgers_exposure,
+    summarize_pooled_scores,
     summarize_stitched_oos,
+    synthesize_fast_slow_synergy,
+    synthesize_structure_aware_synergy,
 )
 
 CACHE_60_DIR = OUT_DIR / "cache_60"
@@ -148,6 +162,420 @@ ANN_SCALE = np.sqrt(PERIODS_PER_YEAR)
 BARS_PER_DAY = 48
 
 
+def assign_futures_trading_day(dts: pd.Series | pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """将含夜盘商品期货时间戳映射到标准期货交易日（>=18:00 夜盘及周六凌晨归属下一交易日，15:00收盘结算）。"""
+    s = pd.Series(pd.to_datetime(dts))
+    t_dates = assign_trading_date(s, has_night_session=True)
+    return pd.DatetimeIndex(pd.to_datetime(t_dates))
+
+
+def ensure_full60_oos_bundles(force_rebuild: bool = False) -> tuple[dict, dict]:
+    """
+    确保 `fast_oos_bundle_v1.pkl` 与 `exact_core20_ledgers_v3.pkl` 具备完整端到端源码生成闭环，
+    并强制对齐期货交易日归属 (assign_futures_trading_day) 与因果样本内波动率预热。
+    """
+    bundle_path = CACHE_60_DIR / "fast_oos_bundle_v1.pkl"
+    c20_path = CACHE_60_DIR / "exact_core20_ledgers_v3.pkl"
+    register_hetero_signal_specs()
+
+    def _get_15m_df(frames_15m_60: dict, aid: str) -> pd.DataFrame:
+        sym = SPECS_60[aid].symbol
+        v = frames_15m_60[sym] if sym in frames_15m_60 else frames_15m_60[aid]
+        return v["15m"] if isinstance(v, dict) else v
+
+    need_rebuild_b = force_rebuild or (not bundle_path.exists())
+    b = {}
+    if not need_rebuild_b:
+        with open(bundle_path, "rb") as f:
+            b = pickle.load(f)
+        if not b.get("trading_date_aligned"):
+            need_rebuild_b = True
+
+    if need_rebuild_b:
+        with open(CACHE_60_DIR / "frames_15m_60.pkl", "rb") as f:
+            frames_15m_60 = pickle.load(f)
+        with open(CACHE_60_DIR / "unit_grid_15m_60.pkl", "rb") as f:
+            ugrid_60 = pickle.load(f)
+        with open(CACHE_60_DIR / "sp_packs_60.pkl", "rb") as f:
+            sp_packs = pickle.load(f)
+        sp15_60, sp1d_15_60 = sp_packs["sp15"], sp_packs["sp1d_15"]
+        het_scores_60 = pd.read_csv(CACHE_60_DIR / "multitf_60_hetero_scores.csv")
+
+        df5_map_60 = {}
+        for aid in IDS_60:
+            df = pd.read_parquet(OUT_DIR / "data_5m" / f"{aid}_5m.parquet")
+            df["dt"] = pd.to_datetime(df["dt"])
+            df5_map_60[aid] = df.sort_values("dt").reset_index(drop=True)
+
+        pit_assets = {}
+        for fold in FOLDS:
+            f_id = fold["id"]
+            cutoff = pd.Timestamp(fold["cutoff"])
+            active = []
+            for aid in IDS_60:
+                df15 = _get_15m_df(frames_15m_60, aid)
+                t_days = assign_futures_trading_day(df15.loc[pd.to_datetime(df15["dt"]) <= cutoff, "dt"])
+                if t_days.nunique() >= 160:
+                    active.append(aid)
+            pit_assets[f_id] = active
+
+        het_scores_pit = pd.concat(
+            [
+                het_scores_60[(het_scores_60["fold"] == f_id) & (het_scores_60["asset"].isin(pit_assets[f_id]))]
+                for f_id in pit_assets
+            ],
+            ignore_index=True,
+        )
+        het_pool_60 = summarize_pooled_scores(het_scores_pit)
+        sel_60_std, is_sharpe_60 = {}, {}
+        for fold in FOLDS:
+            f_id = fold["id"]
+            cutoff = pd.Timestamp(fold["cutoff"])
+            f_s = het_scores_pit[het_scores_pit["fold"] == f_id]
+            f_p = het_pool_60[het_pool_60["fold"] == f_id]
+            for aid in IDS_60:
+                if aid not in pit_assets[f_id]:
+                    sel_60_std[(f_id, aid)] = []
+                    is_sharpe_60[(f_id, aid)] = 0.0
+                    continue
+                df15 = _get_15m_df(frames_15m_60, aid)
+                m_is = (pd.to_datetime(df15["dt"]) <= cutoff).to_numpy()
+                ret_is = np.nan_to_num(df15["close"].pct_change().fillna(0.0).to_numpy(dtype=np.float64)[m_is], nan=0.0)
+                fee_r = float(SPECS_60[aid].fee_rate)
+                acc, _, _ = run_incremental_funnel_gate123(
+                    f_s, f_p, aid, f_id, ugrid_60[aid], m_is, ret_is, fee_r, allow_lowturn_hetero_15m=True
+                )
+                sel_60_std[(f_id, aid)] = acc
+                syn_is = synthesize_fast_slow_synergy(
+                    df15.loc[m_is].reset_index(drop=True),
+                    {u: ugrid_60[aid][u][m_is] for u in acc},
+                    acc,
+                    SPECS_60[aid],
+                )
+                is_sharpe_60[(f_id, aid)] = eval_is_net_sharpe(syn_is, ret_is, fee_r)
+
+        t15_fs, t15_full, t15_hr = {}, {}, {}
+        t5_fs, t5_full, t5_hr = {}, {}, {}
+        ep_fs, ep_full, ep_hr = {}, {}, {}
+        for fold in FOLDS:
+            f_id = fold["id"]
+            oos_s = pd.Timestamp(fold["oos_start"])
+            oos_e = pd.Timestamp(fold["oos_end"])
+            for aid in IDS_60:
+                sel = sel_60_std[(f_id, aid)]
+                df15 = _get_15m_df(frames_15m_60, aid)
+                spec = SPECS_60[aid]
+                if not sel:
+                    z15 = np.zeros(len(df15), dtype=np.float64)
+                    z5 = np.zeros(len(df5_map_60[aid]), dtype=np.float64)
+                    t15_fs[(f_id, aid)] = t15_full[(f_id, aid)] = t15_hr[(f_id, aid)] = z15
+                    t5_fs[(f_id, aid)] = t5_full[(f_id, aid)] = t5_hr[(f_id, aid)] = z5
+                    continue
+                w_fs = synthesize_fast_slow_synergy(df15, ugrid_60[aid], sel, spec)
+                w_full = synthesize_structure_aware_synergy(
+                    df15,
+                    ugrid_60[aid],
+                    sel,
+                    spec,
+                    sp15_60[aid],
+                    sp1d_15_60[aid],
+                    use_factor_exit=True,
+                    use_asset_gate=True,
+                )
+                w_hr = synthesize_structure_aware_synergy(
+                    df15,
+                    ugrid_60[aid],
+                    sel,
+                    spec,
+                    sp15_60[aid],
+                    sp1d_15_60[aid],
+                    use_factor_exit=True,
+                    use_asset_gate=True,
+                    asset_trail_activation=0.016,
+                    asset_min_hold=3,
+                    asset_cooldown=5,
+                    asset_reentry_mode="bi_or_peak",
+                    asset_partial_exit_ratio=0.35,
+                    asset_breakeven_buffer=0.0005,
+                    asset_runner_trail_mult=1.5,
+                    asset_use_fx_exit=True,
+                )
+                t15_fs[(f_id, aid)], t15_full[(f_id, aid)], t15_hr[(f_id, aid)] = w_fs, w_full, w_hr
+                t5_fs[(f_id, aid)] = map_15m_target_to_5m_grid(df15, w_fs, df5_map_60[aid])
+                t5_full[(f_id, aid)] = map_15m_target_to_5m_grid(df15, w_full, df5_map_60[aid])
+                t5_hr[(f_id, aid)] = map_15m_target_to_5m_grid(df15, w_hr, df5_map_60[aid])
+                m_oos = ((pd.to_datetime(df15["dt"]) >= oos_s) & (pd.to_datetime(df15["dt"]) <= oos_e)).to_numpy()
+                df_oos = df15.loc[m_oos].reset_index(drop=True)
+                for d_ep, w_arr in ((ep_fs, w_fs), (ep_full, w_full), (ep_hr, w_hr)):
+                    ep_df = evaluate_execution_events(df_oos, w_arr[m_oos], fee_rate=float(spec.fee_rate))
+                    d_ep[(f_id, aid)] = ep_df["net_ret"].to_numpy(dtype=np.float64) if len(ep_df) > 0 else np.zeros(0)
+
+        risk_window = 60 * BARS_PER_DAY
+        risk_min_periods = 10 * BARS_PER_DAY
+        oos_fast_cache = {}
+        for fold in FOLDS:
+            f_id = fold["id"]
+            oos_s = pd.Timestamp(fold["oos_start"])
+            oos_e = pd.Timestamp(fold["oos_end"])
+            returns = {}
+            for aid in IDS_60:
+                grid5 = df5_map_60[aid]
+                mask = (grid5["dt"] <= oos_e).to_numpy()
+                sub_grid = grid5.loc[mask].copy().reset_index(drop=True)
+                ret_s, _ = build_asset_execution_inputs(sub_grid, np.zeros(len(sub_grid)))
+                returns[aid] = ret_s
+            raw_ret_df = pd.DataFrame(returns).sort_index()
+            tradable_mask = raw_ret_df.notna()
+            ret_df = raw_ret_df.fillna(0.0)
+            roll_vol_full = (
+                (raw_ret_df.rolling(risk_window, min_periods=risk_min_periods).std().shift(1) * ANN_SCALE)
+                .ffill()
+                .fillna(0.15)
+            )
+            oos_mask = ret_df.index >= oos_s
+            sec_vol_oos = {}
+            for sec, syms in SECTORS_60.items():
+                sec_ret = raw_ret_df[syms].mean(axis=1, skipna=True)
+                sv = (
+                    (sec_ret.rolling(risk_window, min_periods=risk_min_periods).std().shift(1) * ANN_SCALE)
+                    .ffill()
+                    .fillna(0.12)
+                )
+                sec_vol_oos[sec] = sv.loc[oos_mask].copy()
+            pos_oos_map = {}
+            for scheme_name, t5_dict in (("fs", t5_fs), ("full", t5_full), ("hr", t5_hr)):
+                positions = {}
+                for aid in IDS_60:
+                    grid5 = df5_map_60[aid]
+                    mask = (grid5["dt"] <= oos_e).to_numpy()
+                    sub_grid = grid5.loc[mask]
+                    raw_target = np.asarray(t5_dict[(f_id, aid)], dtype=np.float64)[mask].copy()
+                    raw_target[sub_grid["dt"] < oos_s] = 0.0
+                    target = np.zeros_like(raw_target)
+                    cur = 0.0
+                    for i, w in enumerate(raw_target):
+                        if abs(w - cur) >= 0.08:
+                            cur = w
+                        target[i] = cur
+                    idx = pd.DatetimeIndex(sub_grid["dt"])
+                    pos_s = pd.Series(0.0, index=idx.append(pd.DatetimeIndex([idx[-1] + pd.Timedelta(microseconds=1)])))
+                    if len(target) > 1:
+                        pos_s.iloc[1:-1] = target[:-1]
+                    pos_s.iloc[-1] = 0.0
+                    positions[aid] = pos_s
+                pos_df_full = pd.DataFrame(positions).reindex_like(ret_df).fillna(0.0)
+                for col in pos_df_full.columns:
+                    t_col = tradable_mask[col].to_numpy()
+                    p_col = pos_df_full[col].to_numpy().copy()
+                    for i in range(1, len(p_col)):
+                        if not t_col[i]:
+                            p_col[i] = p_col[i - 1]
+                    if t_col[-1]:
+                        p_col[-1] = 0.0
+                    pos_df_full[col] = p_col
+                pos_oos_map[scheme_name] = pos_df_full.loc[oos_mask].copy()
+            oos_fast_cache[f_id] = {
+                "raw_oos": raw_ret_df.loc[oos_mask].copy(),
+                "ret_oos": ret_df.loc[oos_mask].copy(),
+                "mask_oos": tradable_mask.loc[oos_mask].copy(),
+                "roll_vol_oos": roll_vol_full.loc[oos_mask].copy(),
+                "sec_vol_oos": sec_vol_oos,
+                "pos_oos_map": pos_oos_map,
+            }
+
+        sleeve_daily_ret, is_meta_stats = {}, {}
+        for fold in FOLDS:
+            f_id = fold["id"]
+            cutoff = pd.Timestamp(fold["cutoff"])
+            for aid in IDS_60:
+                df15 = _get_15m_df(frames_15m_60, aid)
+                dt15 = pd.to_datetime(df15["dt"])
+                m_is = (dt15 <= cutoff).to_numpy()
+                ret15 = np.nan_to_num(df15["close"].pct_change().fillna(0.0).to_numpy(dtype=np.float64), nan=0.0)
+                w = t15_hr[(f_id, aid)]
+                pos = np.roll(w, 1)
+                pos[0] = 0.0
+                turn = np.abs(np.diff(pos, prepend=0.0))
+                net15 = pos * ret15 - turn * float(SPECS_60[aid].fee_rate)
+                t_day_idx = assign_futures_trading_day(dt15)
+                d_ser = pd.Series(net15, index=t_day_idx).groupby(level=0).sum()
+                sleeve_daily_ret.setdefault(f_id, {})[aid] = d_ser
+                df_is = df15.loc[m_is].reset_index(drop=True)
+                ep_is = evaluate_execution_events(df_is, w[m_is], fee_rate=float(SPECS_60[aid].fee_rate))
+                ep_st = compute_episode_payoff_stats(
+                    [ep_is["net_ret"].to_numpy(dtype=np.float64)] if len(ep_is) > 0 else []
+                )
+                d_is = d_ser[d_ser.index <= cutoff.normalize()]
+                sd_is = float(d_is.std(ddof=1)) if len(d_is) > 10 else 0.0
+                shp_hr_is = float((d_is.mean() / sd_is) * np.sqrt(252.0)) if sd_is > 1e-12 else 0.0
+                is_meta_stats[(f_id, aid)] = {
+                    "is_shp_fs": is_sharpe_60.get((f_id, aid), 0.0),
+                    "is_shp_hr": shp_hr_is,
+                    "is_payoff_r": ep_st["payoff_r"],
+                    "is_win_rate": ep_st["win_rate_pct"],
+                    "is_safety_margin": ep_st["safety_margin_pct"],
+                    "is_ep_count": ep_st["ep_count"],
+                    "n_factors": len(sel_60_std.get((f_id, aid), [])),
+                }
+        for f_id in list(sleeve_daily_ret.keys()):
+            sleeve_daily_ret[f_id] = pd.DataFrame(sleeve_daily_ret[f_id]).sort_index().fillna(0.0)
+        b = {
+            "oos_fast_cache": oos_fast_cache,
+            "sleeve_daily_ret": sleeve_daily_ret,
+            "is_meta_stats": is_meta_stats,
+            "ep_fs": ep_fs,
+            "ep_full": ep_full,
+            "ep_hr": ep_hr,
+            "sel_60_std": sel_60_std,
+            "is_sharpe_60": is_sharpe_60,
+            "pit_assets": pit_assets,
+            "trading_date_aligned": True,
+        }
+        with open(bundle_path, "wb") as f:
+            pickle.dump(b, f)
+
+    need_rebuild_c20 = force_rebuild or (not c20_path.exists())
+    d_c20 = {}
+    if not need_rebuild_c20:
+        with open(c20_path, "rb") as f:
+            d_c20 = pickle.load(f)
+        if not d_c20.get("is_vol_warmup_fixed"):
+            need_rebuild_c20 = True
+
+    if need_rebuild_c20:
+        with open(OUT_DIR / "multitf_unit_grid_cache.pkl", "rb") as f:
+            ugrid_20 = pickle.load(f)
+        with open(OUT_DIR / "multitf_grid15m_frames.pkl", "rb") as f:
+            frames_20 = pickle.load(f)
+        with open(OUT_DIR / "multitf_grid1d_frames.pkl", "rb") as f:
+            frames_1d_20 = pickle.load(f)
+        het_scores_60 = pd.read_csv(CACHE_60_DIR / "multitf_60_hetero_scores.csv")
+        het_scores_20 = het_scores_60[het_scores_60["asset"].isin(CORE_20_IDS)].copy()
+        het_pool_20 = summarize_pooled_scores(het_scores_20)
+
+        sp15_20, sp1d_15_20 = {}, {}
+        for aid in CORE_20_IDS:
+            sym = SPECS_60[aid].symbol
+            df_1d = frames_1d_20[sym]
+            df_15m = frames_20[sym]["15m"]
+            for uid, (_, w_1d) in compute_hetero_1d_signals(df_1d).items():
+                ugrid_20[aid][uid] = np.asarray(map_tf_weight_to_base_grid(df_1d, w_1d, df_15m), dtype=np.float32)
+            for uid, (_, w_15m) in compute_hetero_15m_signals(df_15m).items():
+                ugrid_20[aid][uid] = np.asarray(w_15m, dtype=np.float32)
+            sp15_20[aid] = build_structure_pack(df_15m, "15m", box_window=32)
+            sp1d = build_structure_pack(df_1d, "1d", box_window=10)
+            sp1d_15 = dict(sp15_20[aid])
+            for k in (
+                "long_sec",
+                "short_sec",
+                "long_zs",
+                "short_zs",
+                "long_box",
+                "short_box",
+                "long_hyb",
+                "short_hyb",
+                "zs_zg",
+                "zs_zd",
+            ):
+                src_arr = np.asarray(sp1d[k], dtype=np.float64)
+                src_clean = np.where(np.isfinite(src_arr) & (src_arr > 0), src_arr, -1.0)
+                mapped = map_tf_weight_to_base_grid(df_1d, src_clean, df_15m)
+                bad = (~np.isfinite(mapped)) | (mapped <= 0)
+                sp1d_15[k] = np.where(bad, np.nan if k in ("zs_zg", "zs_zd") else sp15_20[aid][k], mapped)
+            sp1d_15_20[aid] = sp1d_15
+
+        sel_20_anchor = {}
+        for fold in FOLDS:
+            f_id = fold["id"]
+            cutoff = pd.Timestamp(fold["cutoff"])
+            f_s = het_scores_20[het_scores_20["fold"] == f_id]
+            f_p = het_pool_20[het_pool_20["fold"] == f_id]
+            for aid in CORE_20_IDS:
+                df15 = frames_20[SPECS_60[aid].symbol]["15m"]
+                m_is = (pd.to_datetime(df15["dt"]) <= cutoff).to_numpy()
+                ret_is = np.nan_to_num(df15["close"].pct_change().fillna(0.0).to_numpy(dtype=np.float64)[m_is], nan=0.0)
+                acc, _, _ = run_incremental_funnel_gate123(
+                    f_s,
+                    f_p,
+                    aid,
+                    f_id,
+                    ugrid_20[aid],
+                    m_is,
+                    ret_is,
+                    float(SPECS_60[aid].fee_rate),
+                    allow_lowturn_hetero_15m=True,
+                )
+                sel_20_anchor[(f_id, aid)] = acc
+
+        df5_map_20 = {}
+        for aid in CORE_20_IDS:
+            df = pd.read_parquet(OUT_DIR / "data_5m" / f"{aid}_5m.parquet")
+            df["dt"] = pd.to_datetime(df["dt"])
+            df5_map_20[aid] = df.sort_values("dt").reset_index(drop=True)
+        specs_20 = {aid: SPECS_60[aid] for aid in CORE_20_IDS}
+
+        exact_core20 = {}
+        ep_20_exact: dict[str, dict] = {"fs": {}, "full": {}, "hr": {}}
+        for scheme in ("fs", "full", "hr"):
+            ledgers = []
+            for fold in FOLDS:
+                f_id = fold["id"]
+                oos_s = pd.Timestamp(fold["oos_start"])
+                oos_e = pd.Timestamp(fold["oos_end"])
+                targets_5m = {}
+                for aid in CORE_20_IDS:
+                    sel = sel_20_anchor[(f_id, aid)]
+                    df15 = frames_20[SPECS_60[aid].symbol]["15m"]
+                    if scheme == "fs":
+                        t15 = synthesize_fast_slow_synergy(df15, ugrid_20[aid], sel, specs_20[aid])
+                    elif scheme == "full":
+                        t15 = synthesize_structure_aware_synergy(
+                            df15,
+                            ugrid_20[aid],
+                            sel,
+                            specs_20[aid],
+                            sp15_20[aid],
+                            sp1d_15_20[aid],
+                            use_factor_exit=True,
+                            use_asset_gate=True,
+                        )
+                    else:
+                        t15 = synthesize_structure_aware_synergy(
+                            df15,
+                            ugrid_20[aid],
+                            sel,
+                            specs_20[aid],
+                            sp15_20[aid],
+                            sp1d_15_20[aid],
+                            use_factor_exit=True,
+                            use_asset_gate=True,
+                            asset_trail_activation=0.016,
+                            asset_min_hold=3,
+                            asset_cooldown=5,
+                            asset_reentry_mode="bi_or_peak",
+                            asset_partial_exit_ratio=0.35,
+                            asset_breakeven_buffer=0.0005,
+                            asset_runner_trail_mult=1.5,
+                            asset_use_fx_exit=True,
+                        )
+                    m_oos = ((pd.to_datetime(df15["dt"]) >= oos_s) & (pd.to_datetime(df15["dt"]) <= oos_e)).to_numpy()
+                    ep_df = evaluate_execution_events(
+                        df15.loc[m_oos].reset_index(drop=True), t15[m_oos], fee_rate=float(specs_20[aid].fee_rate)
+                    )
+                    ep_20_exact[scheme][(f_id, aid)] = (
+                        ep_df["net_ret"].to_numpy(dtype=np.float64) if len(ep_df) > 0 else np.zeros(0)
+                    )
+                    targets_5m[aid] = map_15m_target_to_5m_grid(df15, t15, df5_map_20[aid])
+                led = allocate_and_account_5m_grid(df5_map_20, specs_20, targets_5m, oos_s, oos_e, deadzone=0.08)
+                ledgers.append(led)
+            exact_core20[scheme] = ledgers
+        d_c20 = {"ledgers": exact_core20, "ep_20_exact": ep_20_exact, "is_vol_warmup_fixed": True}
+        with open(c20_path, "wb") as f:
+            pickle.dump(d_c20, f)
+
+    return b, d_c20
+
+
 def build_universe_60_summary_table() -> pd.DataFrame:
     """统计 60 个商品的 15m/5m 流动性、数据起止日期与所属层级（Core-20 vs 扩展池40）。"""
     rows = []
@@ -155,7 +583,7 @@ def build_universe_60_summary_table() -> pd.DataFrame:
         p15 = DATA_15M_60_DIR / f"{aid}_15m.parquet"
         df15 = pd.read_parquet(p15)
         dt = pd.to_datetime(df15["dt"])
-        d_norm = dt.dt.normalize()
+        d_norm = assign_futures_trading_day(dt) if has_night else dt.dt.normalize()
         vol_col = "volume" if "volume" in df15.columns else "vol"
         amt_series = df15["amount"] if "amount" in df15.columns else pd.Series(0.0, index=df15.index)
         if float(amt_series.sum()) <= 0.0 and vol_col in df15.columns:
@@ -183,6 +611,124 @@ def build_universe_60_summary_table() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _execute_sector_conserved_allocation(
+    fc: dict,
+    pos_df: pd.DataFrame,
+    inv_vol: pd.DataFrame,
+    active_mask: pd.DataFrame,
+    *,
+    sector_damp_power: float,
+    symmetric_deadzone: float,
+    max_single_asset_weight: float,
+    min_effective_assets: int,
+    target_portfolio_vol: float,
+) -> dict:
+    """统一跨品种板块风险预算守恒、因果波动率预热缩放、死区防抖与期末闭合清算内核。"""
+    ret_oos = fc["ret_oos"][IDS_60]
+    mask_oos = fc["mask_oos"][IDS_60]
+
+    sector_active_counts = {}
+    sector_inv_vol = {}
+    for sec, syms in SECTORS_60.items():
+        k_s_t = active_mask[syms].sum(axis=1)
+        sector_active_counts[sec] = k_s_t
+        sec_vol = fc["sec_vol_oos"][sec]
+        sector_inv_vol[sec] = (1.0 / np.maximum(sec_vol, 0.05)) * (k_s_t > 0.0).astype(np.float64)
+
+    sec_inv_vol_df = pd.DataFrame(sector_inv_vol, index=ret_oos.index)
+    sec_inv_vol_sum = sec_inv_vol_df.sum(axis=1).replace(0.0, np.nan)
+    sec_budget_share = sec_inv_vol_df.div(sec_inv_vol_sum, axis=0).fillna(0.0)
+
+    sector_mult_df = pd.DataFrame(0.0, index=ret_oos.index, columns=IDS_60, dtype=np.float64)
+    for sec, syms in SECTORS_60.items():
+        k_s_t = sector_active_counts[sec]
+        within_sec_damp = 1.0 / np.power(np.maximum(k_s_t, 1.0), sector_damp_power)
+        sec_factor = sec_budget_share[sec] * within_sec_damp
+        for sym in syms:
+            sector_mult_df[sym] = sec_factor
+
+    raw_alloc = inv_vol * sector_mult_df * active_mask
+    n_rows, n_cols = raw_alloc.shape
+    alloc_mat = np.zeros((n_rows, n_cols), dtype=np.float64)
+    raw_mat = raw_alloc.to_numpy(dtype=np.float64)
+    act_mat = active_mask.to_numpy(dtype=np.float64)
+    for t_idx in range(n_rows):
+        n_act = float(act_mat[t_idx].sum())
+        if n_act <= 0.0:
+            continue
+        target_b = min(1.0, n_act / float(min_effective_assets))
+        alloc_mat[t_idx] = _project_capped_simplex_row(
+            raw_weights=raw_mat[t_idx],
+            active_mask=act_mat[t_idx],
+            target_budget=target_b,
+            max_weight=max_single_asset_weight,
+        )
+
+    alloc_weights = pd.DataFrame(alloc_mat, index=ret_oos.index, columns=IDS_60)
+    unscaled_positions = (alloc_weights * pos_df).where(mask_oos).ffill().fillna(0.0)
+    unscaled_gross = (unscaled_positions.shift(1).fillna(0.0) * ret_oos).sum(axis=1)
+    port_roll_vol = unscaled_gross.rolling(40 * BARS_PER_DAY, min_periods=15 * BARS_PER_DAY).std().shift(1)
+    active_exp_bars = (
+        (unscaled_positions.abs().sum(axis=1) > 1e-12)
+        .astype(np.float64)
+        .rolling(40 * BARS_PER_DAY, min_periods=1)
+        .sum()
+        .shift(1)
+        .fillna(0.0)
+    )
+    port_roll_vol = port_roll_vol.where(active_exp_bars >= float(15 * BARS_PER_DAY))
+    port_roll_vol = (port_roll_vol * ANN_SCALE).ffill().fillna(target_portfolio_vol)
+    lev_scalar = np.clip(target_portfolio_vol / np.maximum(port_roll_vol, 0.05), 0.0, 1.65)
+    budget_weights = alloc_weights.multiply(lev_scalar, axis=0).clip(lower=0.0, upper=max_single_asset_weight)
+    final_weights_df = budget_weights * pos_df
+
+    budget_fraction = active_mask.sum(axis=1).div(min_effective_assets).clip(upper=1.0)
+    gross_budget_series = (budget_fraction * lev_scalar).to_numpy(dtype=np.float64)
+    final_mat = final_weights_df.to_numpy().copy()
+    observed = mask_oos.to_numpy()
+    prev = np.zeros(n_cols)
+    for t_idx in range(n_rows):
+        target = final_mat[t_idx]
+        if symmetric_deadzone > 0.0:
+            same_dir = (target * prev) > 0.0
+            keep = same_dir & (np.abs(target) > 1e-6) & (np.abs(target - prev) < symmetric_deadzone)
+            target[keep] = prev[keep]
+        target[~observed[t_idx]] = prev[~observed[t_idx]]
+        frozen = float(np.abs(prev[~observed[t_idx]]).sum())
+        avail = max(0.0, float(gross_budget_series[t_idx]) - frozen)
+        prop = float(np.abs(target[observed[t_idx]]).sum())
+        if prop > avail and prop > 0:
+            target[observed[t_idx]] *= avail / prop
+        final_mat[t_idx] = np.clip(target, -max_single_asset_weight, max_single_asset_weight)
+        prev = final_mat[t_idx].copy()
+
+    w_oos = pd.DataFrame(final_mat, index=ret_oos.index, columns=IDS_60)
+    gross_exp = w_oos.abs().sum(axis=1)
+    scale_cap = np.maximum(gross_exp, 1.0)
+    w_oos = w_oos.div(scale_cap, axis=0)
+    w_oos.iloc[0] = 0.0
+    for col in IDS_60:
+        t_col = mask_oos[col].to_numpy()
+        w_col = w_oos[col].to_numpy().copy()
+        for i in range(1, len(w_col)):
+            if not t_col[i]:
+                w_col[i] = w_col[i - 1]
+        if t_col[-1]:
+            w_col[-1] = 0.0
+        w_oos[col] = w_col
+
+    fees = {c: float(SPECS_60[c].fee_rate) for c in IDS_60}
+    ledger = account_portfolio_execution(ret_oos, w_oos, fees, tradable_mask=mask_oos)
+    return {
+        "daily_returns": ledger["daily_returns"],
+        "bar_net_returns": ledger["bar_net_returns"],
+        "gross_returns_df": ledger["gross_returns_df"],
+        "cost_returns_df": ledger["cost_returns_df"],
+        "turnover_df": ledger["turnover_df"],
+        "weights_df": w_oos,
+    }
+
+
 def run_flat_60_alloc(
     name: str,
     oos_fast_cache: dict,
@@ -201,7 +747,6 @@ def run_flat_60_alloc(
     for fold in FOLDS:
         f_id = fold["id"]
         fc = oos_fast_cache[f_id]
-        ret_oos = fc["ret_oos"][IDS_60]
         mask_oos = fc["mask_oos"][IDS_60]
         roll_vol = fc["roll_vol_oos"][IDS_60]
         pos_df = fc["pos_oos_map"][scheme][IDS_60].copy()
@@ -214,98 +759,19 @@ def run_flat_60_alloc(
         active_mask = ((pos_df.abs() > 1e-3) & (listed_mask > 0.0)).astype(np.float64)
         inv_vol = (1.0 / np.maximum(roll_vol, 0.05)) * active_mask
 
-        sector_active_counts = {}
-        sector_inv_vol = {}
-        for sec, syms in SECTORS_60.items():
-            k_s_t = active_mask[syms].sum(axis=1)
-            sector_active_counts[sec] = k_s_t
-            sec_vol = fc["sec_vol_oos"][sec]
-            sector_inv_vol[sec] = (1.0 / np.maximum(sec_vol, 0.05)) * (k_s_t > 0.0).astype(np.float64)
-
-        sec_inv_vol_df = pd.DataFrame(sector_inv_vol, index=ret_oos.index)
-        sec_inv_vol_sum = sec_inv_vol_df.sum(axis=1).replace(0.0, np.nan)
-        sec_budget_share = sec_inv_vol_df.div(sec_inv_vol_sum, axis=0).fillna(0.0)
-
-        sector_mult_df = pd.DataFrame(0.0, index=ret_oos.index, columns=IDS_60, dtype=np.float64)
-        for sec, syms in SECTORS_60.items():
-            k_s_t = sector_active_counts[sec]
-            within_sec_damp = 1.0 / np.power(np.maximum(k_s_t, 1.0), sector_damp_power)
-            sec_factor = sec_budget_share[sec] * within_sec_damp
-            for sym in syms:
-                sector_mult_df[sym] = sec_factor
-
-        raw_alloc = inv_vol * sector_mult_df * active_mask
-        n_rows, n_cols = raw_alloc.shape
-        alloc_mat = np.zeros((n_rows, n_cols), dtype=np.float64)
-        raw_mat = raw_alloc.to_numpy(dtype=np.float64)
-        act_mat = active_mask.to_numpy(dtype=np.float64)
-        for t_idx in range(n_rows):
-            n_act = float(act_mat[t_idx].sum())
-            if n_act <= 0.0:
-                continue
-            target_b = min(1.0, n_act / float(min_effective_assets))
-            alloc_mat[t_idx] = _project_capped_simplex_row(
-                raw_weights=raw_mat[t_idx],
-                active_mask=act_mat[t_idx],
-                target_budget=target_b,
-                max_weight=max_single_asset_weight,
-            )
-
-        alloc_weights = pd.DataFrame(alloc_mat, index=ret_oos.index, columns=IDS_60)
-        unscaled_positions = (alloc_weights * pos_df).where(mask_oos).ffill().fillna(0.0)
-        unscaled_gross = (unscaled_positions.shift(1).fillna(0.0) * ret_oos).sum(axis=1)
-        port_roll_vol = unscaled_gross.rolling(40 * BARS_PER_DAY, min_periods=15 * BARS_PER_DAY).std().shift(1)
-        port_roll_vol = (port_roll_vol * ANN_SCALE).ffill().fillna(target_portfolio_vol)
-        lev_scalar = np.clip(target_portfolio_vol / np.maximum(port_roll_vol, 0.05), 0.0, 1.65)
-        budget_weights = alloc_weights.multiply(lev_scalar, axis=0).clip(lower=0.0, upper=max_single_asset_weight)
-        final_weights_df = budget_weights * pos_df
-
-        budget_fraction = active_mask.sum(axis=1).div(min_effective_assets).clip(upper=1.0)
-        gross_budget_series = (budget_fraction * lev_scalar).to_numpy(dtype=np.float64)
-        final_mat = final_weights_df.to_numpy().copy()
-        observed = mask_oos.to_numpy()
-        prev = np.zeros(n_cols)
-        for t_idx in range(n_rows):
-            target = final_mat[t_idx]
-            if symmetric_deadzone > 0.0:
-                same_dir = (target * prev) > 0.0
-                keep = same_dir & (np.abs(target) > 1e-6) & (np.abs(target - prev) < symmetric_deadzone)
-                target[keep] = prev[keep]
-            target[~observed[t_idx]] = prev[~observed[t_idx]]
-            frozen = float(np.abs(prev[~observed[t_idx]]).sum())
-            avail = max(0.0, float(gross_budget_series[t_idx]) - frozen)
-            prop = float(np.abs(target[observed[t_idx]]).sum())
-            if prop > avail and prop > 0:
-                target[observed[t_idx]] *= avail / prop
-            final_mat[t_idx] = np.clip(target, -max_single_asset_weight, max_single_asset_weight)
-            prev = final_mat[t_idx].copy()
-
-        w_oos = pd.DataFrame(final_mat, index=ret_oos.index, columns=IDS_60)
-        gross_exp = w_oos.abs().sum(axis=1)
-        scale_cap = np.maximum(gross_exp, 1.0)
-        w_oos = w_oos.div(scale_cap, axis=0)
-        w_oos.iloc[0] = 0.0
-        w_oos.iloc[-1] = 0.0
-        for col in IDS_60:
-            t_col = mask_oos[col].to_numpy()
-            w_col = w_oos[col].to_numpy().copy()
-            for i in range(1, len(w_col)):
-                if not t_col[i]:
-                    w_col[i] = w_col[i - 1]
-            w_oos[col] = w_col
-
-        fees = {c: float(SPECS_60[c].fee_rate) for c in IDS_60}
-        ledger = account_portfolio_execution(ret_oos, w_oos, fees, tradable_mask=mask_oos)
-        ledgers.append(
-            {
-                "daily_returns": ledger["daily_returns"],
-                "bar_net_returns": ledger["bar_net_returns"],
-                "gross_returns_df": ledger["gross_returns_df"],
-                "cost_returns_df": ledger["cost_returns_df"],
-                "turnover_df": ledger["turnover_df"],
-                "weights_df": w_oos,
-            }
+        led = _execute_sector_conserved_allocation(
+            fc,
+            pos_df,
+            inv_vol,
+            active_mask,
+            sector_damp_power=sector_damp_power,
+            symmetric_deadzone=symmetric_deadzone,
+            max_single_asset_weight=max_single_asset_weight,
+            min_effective_assets=min_effective_assets,
+            target_portfolio_vol=target_portfolio_vol,
         )
+        ledgers.append(led)
+        w_oos = led["weights_df"]
         for c in IDS_60:
             if w_oos[c].abs().max() > 1e-6 and len(ep_map.get((f_id, c), [])) > 0:
                 ep_list.append(ep_map[(f_id, c)])
@@ -384,102 +850,23 @@ def run_zero_hardcode_sop_stage3(
         r_s = d_df.rolling(60, min_periods=20).std(ddof=1).shift(1)
         r_shp = ((r_m / r_s.replace(0.0, np.nan)) * np.sqrt(252.0)).fillna(0.5)
         h_daily = r_shp.clip(lower=-0.5, upper=2.0).apply(lambda s: np.where(s >= 0.0, 1.0 + 0.30 * s, 0.35))
-        h_5m = h_daily.reindex(ret_oos.index.normalize()).fillna(1.0)
+        h_5m = h_daily.reindex(assign_futures_trading_day(ret_oos.index)).fillna(1.0)
         h_5m.index = ret_oos.index
         inv_vol = inv_vol * h_5m
 
-        sector_active_counts = {}
-        sector_inv_vol = {}
-        for sec, syms in SECTORS_60.items():
-            k_s_t = active_mask[syms].sum(axis=1)
-            sector_active_counts[sec] = k_s_t
-            sec_vol = fc["sec_vol_oos"][sec]
-            sector_inv_vol[sec] = (1.0 / np.maximum(sec_vol, 0.05)) * (k_s_t > 0.0).astype(np.float64)
-
-        sec_inv_vol_df = pd.DataFrame(sector_inv_vol, index=ret_oos.index)
-        sec_inv_vol_sum = sec_inv_vol_df.sum(axis=1).replace(0.0, np.nan)
-        sec_budget_share = sec_inv_vol_df.div(sec_inv_vol_sum, axis=0).fillna(0.0)
-
-        sector_mult_df = pd.DataFrame(0.0, index=ret_oos.index, columns=IDS_60, dtype=np.float64)
-        for sec, syms in SECTORS_60.items():
-            k_s_t = sector_active_counts[sec]
-            within_sec_damp = 1.0 / np.power(np.maximum(k_s_t, 1.0), sector_damp_power)
-            sec_factor = sec_budget_share[sec] * within_sec_damp
-            for sym in syms:
-                sector_mult_df[sym] = sec_factor
-
-        raw_alloc = inv_vol * sector_mult_df * active_mask
-        n_rows, n_cols = raw_alloc.shape
-        alloc_mat = np.zeros((n_rows, n_cols), dtype=np.float64)
-        raw_mat = raw_alloc.to_numpy(dtype=np.float64)
-        act_mat = active_mask.to_numpy(dtype=np.float64)
-        for t_idx in range(n_rows):
-            n_act = float(act_mat[t_idx].sum())
-            if n_act <= 0.0:
-                continue
-            target_b = min(1.0, n_act / float(min_effective_assets))
-            alloc_mat[t_idx] = _project_capped_simplex_row(
-                raw_weights=raw_mat[t_idx],
-                active_mask=act_mat[t_idx],
-                target_budget=target_b,
-                max_weight=max_single_asset_weight,
-            )
-
-        alloc_weights = pd.DataFrame(alloc_mat, index=ret_oos.index, columns=IDS_60)
-        unscaled_positions = (alloc_weights * pos_df).where(mask_oos).ffill().fillna(0.0)
-        unscaled_gross = (unscaled_positions.shift(1).fillna(0.0) * ret_oos).sum(axis=1)
-        port_roll_vol = unscaled_gross.rolling(40 * BARS_PER_DAY, min_periods=15 * BARS_PER_DAY).std().shift(1)
-        port_roll_vol = (port_roll_vol * ANN_SCALE).ffill().fillna(target_portfolio_vol)
-        lev_scalar = np.clip(target_portfolio_vol / np.maximum(port_roll_vol, 0.05), 0.0, 1.65)
-        budget_weights = alloc_weights.multiply(lev_scalar, axis=0).clip(lower=0.0, upper=max_single_asset_weight)
-        final_weights_df = budget_weights * pos_df
-
-        budget_fraction = active_mask.sum(axis=1).div(min_effective_assets).clip(upper=1.0)
-        gross_budget_series = (budget_fraction * lev_scalar).to_numpy(dtype=np.float64)
-        final_mat = final_weights_df.to_numpy().copy()
-        observed = mask_oos.to_numpy()
-        prev = np.zeros(n_cols)
-        for t_idx in range(n_rows):
-            target = final_mat[t_idx]
-            if symmetric_deadzone > 0.0:
-                same_dir = (target * prev) > 0.0
-                keep = same_dir & (np.abs(target) > 1e-6) & (np.abs(target - prev) < symmetric_deadzone)
-                target[keep] = prev[keep]
-            target[~observed[t_idx]] = prev[~observed[t_idx]]
-            frozen = float(np.abs(prev[~observed[t_idx]]).sum())
-            avail = max(0.0, float(gross_budget_series[t_idx]) - frozen)
-            prop = float(np.abs(target[observed[t_idx]]).sum())
-            if prop > avail and prop > 0:
-                target[observed[t_idx]] *= avail / prop
-            final_mat[t_idx] = np.clip(target, -max_single_asset_weight, max_single_asset_weight)
-            prev = final_mat[t_idx].copy()
-
-        w_oos = pd.DataFrame(final_mat, index=ret_oos.index, columns=IDS_60)
-        gross_exp = w_oos.abs().sum(axis=1)
-        scale_cap = np.maximum(gross_exp, 1.0)
-        w_oos = w_oos.div(scale_cap, axis=0)
-        w_oos.iloc[0] = 0.0
-        w_oos.iloc[-1] = 0.0
-        for col in IDS_60:
-            t_col = mask_oos[col].to_numpy()
-            w_col = w_oos[col].to_numpy().copy()
-            for i in range(1, len(w_col)):
-                if not t_col[i]:
-                    w_col[i] = w_col[i - 1]
-            w_oos[col] = w_col
-
-        fees = {c: float(SPECS_60[c].fee_rate) for c in IDS_60}
-        ledger = account_portfolio_execution(ret_oos, w_oos, fees, tradable_mask=mask_oos)
-        ledgers.append(
-            {
-                "daily_returns": ledger["daily_returns"],
-                "bar_net_returns": ledger["bar_net_returns"],
-                "gross_returns_df": ledger["gross_returns_df"],
-                "cost_returns_df": ledger["cost_returns_df"],
-                "turnover_df": ledger["turnover_df"],
-                "weights_df": w_oos,
-            }
+        led = _execute_sector_conserved_allocation(
+            fc,
+            pos_df,
+            inv_vol,
+            active_mask,
+            sector_damp_power=sector_damp_power,
+            symmetric_deadzone=symmetric_deadzone,
+            max_single_asset_weight=max_single_asset_weight,
+            min_effective_assets=min_effective_assets,
+            target_portfolio_vol=target_portfolio_vol,
         )
+        ledgers.append(led)
+        w_oos = led["weights_df"]
         for c in sel_ids:
             if w_oos[c].abs().max() > 1e-6 and len(ep_map.get((f_id, c), [])) > 0:
                 ep_list.append(ep_map[(f_id, c)])
@@ -492,8 +879,8 @@ def run_zero_hardcode_sop_stage3(
 
 def compute_is_liquidity_and_price_returns() -> tuple[dict[tuple[str, str], dict[str, float]], pd.DataFrame]:
     """
-    严格在每个折次的训练截止日 (<= cutoff) 前，计算全池 60 品种的样本内客观流动性深度
-    （日均成交手数、名义成交额、有效上市天数）以及用于无监督产业链共线性聚类的日频价格收益率矩阵。
+    严格在每个折次的训练截止日 (<= cutoff) 前，按期货交易日归属计算全池 60 品种的样本内客观流动性深度
+    （日均成交手数、名义成交额、有效上市天数）以及用于无监督产业链共线性风险分摊的日频价格收益率矩阵。
     全程 100% 零先验硬编码 (不引用 CORE_20_IDS)，杜绝任何未来信息泄露。
     """
     with open(CACHE_60_DIR / "frames_1d_60.pkl", "rb") as f:
@@ -506,7 +893,7 @@ def compute_is_liquidity_and_price_returns() -> tuple[dict[tuple[str, str], dict
         p15 = DATA_15M_60_DIR / f"{aid}_15m.parquet"
         df15 = pd.read_parquet(p15)
         dt = pd.to_datetime(df15["dt"])
-        d_norm = dt.dt.normalize()
+        d_norm = assign_futures_trading_day(dt) if SPECS_60[aid].has_night_session else dt.dt.normalize()
         vol_col = "volume" if "volume" in df15.columns else "vol"
         amt_s = df15["amount"] if "amount" in df15.columns else pd.Series(0.0, index=df15.index)
         if float(amt_s.sum()) <= 0.0 and vol_col in df15.columns:
@@ -551,8 +938,7 @@ def run_zero_hardcode_cluster_conserved(
     min_r: float = 2.15,
     min_sm: float = 12.0,
     min_vol_wan: float = 8.8,
-    price_corr_th: float = 0.68,
-    sleeve_corr_th: float = 0.15,
+    cluster_damp_coeff: float = 1.0,
     sector_damp_power: float = 0.65,
     symmetric_deadzone: float = 0.02,
     max_single_asset_weight: float = 0.25,
@@ -561,7 +947,7 @@ def run_zero_hardcode_cluster_conserved(
 ) -> tuple[dict, list[dict], dict[str, list[str]]]:
     """
     运行 100% 零先验硬编码 (Zero Hardcoded CORE_20_IDS) 的全市场 60 品种内生准入、
-    无监督同板块产业链共线性聚类去重、板块风险预算守恒与滞后至 d-1 日因果袖套健康度配置架构。
+    连续相关性簇内风险分摊 (彻底消除特例豁免硬阈值)、板块风险预算守恒与滞后至前一交易日因果袖套健康度配置架构。
     """
     ledgers = []
     ep_list = []
@@ -599,28 +985,20 @@ def run_zero_hardcode_cluster_conserved(
                 liq_mult = float(np.clip(np.log1p(lq["is_vol_wan"]) / np.log1p(20.0), 0.5, 1.8))
                 cands[aid] = float(m["is_shp_hr"]) * float(m["is_shp_fs"]) * float(m["is_payoff_r"]) * liq_mult
 
-        # 2. 同板块内无监督产业链共线性聚类与簇代表筛选 (<= cutoff)
+        # 2. 同板块内连续相关性簇内风险分摊 (<= cutoff，无任何特例白名单或二值剔除豁免)
         sel_ids: list[str] = []
+        cluster_share_w: dict[str, float] = {}
         for _sec, syms in SECTORS_60.items():
             sec_cands = sorted([a for a in syms if a in cands], key=lambda x: cands[x], reverse=True)
-            sec_acc: list[str] = []
             for a in sec_cands:
-                m_a = is_meta_stats[(f_id, a)]
-                # 高因子广度多周期独立共振联席龙头资格（全市场统一数学准则，确保 au/ag 等高维独立品种不被误删）
-                is_high_breadth_coleader = (
-                    m_a["n_factors"] >= 21 and m_a["is_shp_hr"] >= 1.85 and m_a["is_payoff_r"] >= 3.50
-                )
-                is_dup = False
-                for ldr in sec_acc:
-                    collinear = (float(cp_mat.loc[a, ldr]) >= price_corr_th) or (
-                        float(cp_mat.loc[a, ldr]) >= 0.35 and float(cs_mat.loc[a, ldr]) >= sleeve_corr_th
-                    )
-                    if collinear and not is_high_breadth_coleader:
-                        is_dup = True
-                        break
-                if not is_dup:
-                    sec_acc.append(a)
-            sel_ids.extend(sec_acc)
+                crowd_sum = 0.0
+                for peer in sec_cands:
+                    if peer == a:
+                        continue
+                    eff_rho = max(0.0, (float(cp_mat.loc[a, peer]) - 0.35) / 0.65) * float(cs_mat.loc[a, peer])
+                    crowd_sum += eff_rho
+                cluster_share_w[a] = 1.0 / (1.0 + cluster_damp_coeff * crowd_sum)
+                sel_ids.append(a)
 
         selected_per_fold[f_id] = sel_ids
         sel_set = set(sel_ids)
@@ -640,112 +1018,33 @@ def run_zero_hardcode_cluster_conserved(
                 np.clip(float(m["is_shp_hr"]), 0.5, 2.5)
                 * np.clip(float(m["is_safety_margin"]) / 15.0, 0.5, 2.0)
                 * liq_w
+                * cluster_share_w[c]
             )
             inv_vol[c] *= q_p
 
-        # 3. 严格滞后至 d-1 日的因果滚动袖套健康度倾斜
+        # 3. 严格滞后至前一期货交易日 (15:00结算后) 的因果滚动袖套健康度倾斜
         d_df = d_all[IDS_60]
         r_m = d_df.rolling(60, min_periods=20).mean().shift(1)
         r_s = d_df.rolling(60, min_periods=20).std(ddof=1).shift(1)
         r_shp = ((r_m / r_s.replace(0.0, np.nan)) * np.sqrt(252.0)).fillna(0.5)
         h_daily = r_shp.clip(lower=-0.5, upper=2.0).apply(lambda s: np.where(s >= 0.0, 1.0 + 0.30 * s, 0.35))
-        h_5m = h_daily.reindex(ret_oos.index.normalize()).fillna(1.0)
+        h_5m = h_daily.reindex(assign_futures_trading_day(ret_oos.index)).fillna(1.0)
         h_5m.index = ret_oos.index
         inv_vol = inv_vol * h_5m
 
-        # 4. 板块风险预算守恒阻尼
-        sector_active_counts = {}
-        sector_inv_vol = {}
-        for sec, syms in SECTORS_60.items():
-            k_s_t = active_mask[syms].sum(axis=1)
-            sector_active_counts[sec] = k_s_t
-            sec_vol = fc["sec_vol_oos"][sec]
-            sector_inv_vol[sec] = (1.0 / np.maximum(sec_vol, 0.05)) * (k_s_t > 0.0).astype(np.float64)
-
-        sec_inv_vol_df = pd.DataFrame(sector_inv_vol, index=ret_oos.index)
-        sec_inv_vol_sum = sec_inv_vol_df.sum(axis=1).replace(0.0, np.nan)
-        sec_budget_share = sec_inv_vol_df.div(sec_inv_vol_sum, axis=0).fillna(0.0)
-
-        sector_mult_df = pd.DataFrame(0.0, index=ret_oos.index, columns=IDS_60, dtype=np.float64)
-        for sec, syms in SECTORS_60.items():
-            k_s_t = sector_active_counts[sec]
-            within_sec_damp = 1.0 / np.power(np.maximum(k_s_t, 1.0), sector_damp_power)
-            sec_factor = sec_budget_share[sec] * within_sec_damp
-            for sym in syms:
-                sector_mult_df[sym] = sec_factor
-
-        raw_alloc = inv_vol * sector_mult_df * active_mask
-        n_rows, n_cols = raw_alloc.shape
-        alloc_mat = np.zeros((n_rows, n_cols), dtype=np.float64)
-        raw_mat = raw_alloc.to_numpy(dtype=np.float64)
-        act_mat = active_mask.to_numpy(dtype=np.float64)
-        for t_idx in range(n_rows):
-            n_act = float(act_mat[t_idx].sum())
-            if n_act <= 0.0:
-                continue
-            target_b = min(1.0, n_act / float(min_effective_assets))
-            alloc_mat[t_idx] = _project_capped_simplex_row(
-                raw_weights=raw_mat[t_idx],
-                active_mask=act_mat[t_idx],
-                target_budget=target_b,
-                max_weight=max_single_asset_weight,
-            )
-
-        alloc_weights = pd.DataFrame(alloc_mat, index=ret_oos.index, columns=IDS_60)
-        unscaled_positions = (alloc_weights * pos_df).where(mask_oos).ffill().fillna(0.0)
-        unscaled_gross = (unscaled_positions.shift(1).fillna(0.0) * ret_oos).sum(axis=1)
-        port_roll_vol = unscaled_gross.rolling(40 * BARS_PER_DAY, min_periods=15 * BARS_PER_DAY).std().shift(1)
-        port_roll_vol = (port_roll_vol * ANN_SCALE).ffill().fillna(target_portfolio_vol)
-        lev_scalar = np.clip(target_portfolio_vol / np.maximum(port_roll_vol, 0.05), 0.0, 1.65)
-        budget_weights = alloc_weights.multiply(lev_scalar, axis=0).clip(lower=0.0, upper=max_single_asset_weight)
-        final_weights_df = budget_weights * pos_df
-
-        budget_fraction = active_mask.sum(axis=1).div(min_effective_assets).clip(upper=1.0)
-        gross_budget_series = (budget_fraction * lev_scalar).to_numpy(dtype=np.float64)
-        final_mat = final_weights_df.to_numpy().copy()
-        observed = mask_oos.to_numpy()
-        prev = np.zeros(n_cols)
-        for t_idx in range(n_rows):
-            target = final_mat[t_idx]
-            if symmetric_deadzone > 0.0:
-                same_dir = (target * prev) > 0.0
-                keep = same_dir & (np.abs(target) > 1e-6) & (np.abs(target - prev) < symmetric_deadzone)
-                target[keep] = prev[keep]
-            target[~observed[t_idx]] = prev[~observed[t_idx]]
-            frozen = float(np.abs(prev[~observed[t_idx]]).sum())
-            avail = max(0.0, float(gross_budget_series[t_idx]) - frozen)
-            prop = float(np.abs(target[observed[t_idx]]).sum())
-            if prop > avail and prop > 0:
-                target[observed[t_idx]] *= avail / prop
-            final_mat[t_idx] = np.clip(target, -max_single_asset_weight, max_single_asset_weight)
-            prev = final_mat[t_idx].copy()
-
-        w_oos = pd.DataFrame(final_mat, index=ret_oos.index, columns=IDS_60)
-        gross_exp = w_oos.abs().sum(axis=1)
-        scale_cap = np.maximum(gross_exp, 1.0)
-        w_oos = w_oos.div(scale_cap, axis=0)
-        w_oos.iloc[0] = 0.0
-        w_oos.iloc[-1] = 0.0
-        for col in IDS_60:
-            t_col = mask_oos[col].to_numpy()
-            w_col = w_oos[col].to_numpy().copy()
-            for i in range(1, len(w_col)):
-                if not t_col[i]:
-                    w_col[i] = w_col[i - 1]
-            w_oos[col] = w_col
-
-        fees = {c: float(SPECS_60[c].fee_rate) for c in IDS_60}
-        ledger = account_portfolio_execution(ret_oos, w_oos, fees, tradable_mask=mask_oos)
-        ledgers.append(
-            {
-                "daily_returns": ledger["daily_returns"],
-                "bar_net_returns": ledger["bar_net_returns"],
-                "gross_returns_df": ledger["gross_returns_df"],
-                "cost_returns_df": ledger["cost_returns_df"],
-                "turnover_df": ledger["turnover_df"],
-                "weights_df": w_oos,
-            }
+        led = _execute_sector_conserved_allocation(
+            fc,
+            pos_df,
+            inv_vol,
+            active_mask,
+            sector_damp_power=sector_damp_power,
+            symmetric_deadzone=symmetric_deadzone,
+            max_single_asset_weight=max_single_asset_weight,
+            min_effective_assets=min_effective_assets,
+            target_portfolio_vol=target_portfolio_vol,
         )
+        ledgers.append(led)
+        w_oos = led["weights_df"]
         for c in sel_ids:
             if w_oos[c].abs().max() > 1e-6 and len(ep_map.get((f_id, c), [])) > 0:
                 ep_list.append(ep_map[(f_id, c)])
@@ -837,7 +1136,7 @@ def run_core_satellite_sop_stage3(
                 r_s = d_df.rolling(60, min_periods=20).std(ddof=1).shift(1)
                 r_shp = ((r_m / r_s.replace(0.0, np.nan)) * np.sqrt(252.0)).fillna(0.5)
                 h_daily = r_shp.clip(lower=-0.5, upper=2.0).apply(lambda s: np.where(s >= 0.0, 1.0 + 0.30 * s, 0.25))
-                h_5m = h_daily.reindex(ret_oos.index.normalize()).fillna(1.0)
+                h_5m = h_daily.reindex(assign_futures_trading_day(ret_oos.index)).fillna(1.0)
                 h_5m.index = ret_oos.index
                 inv_v = inv_v * h_5m
 
@@ -850,7 +1149,6 @@ def run_core_satellite_sop_stage3(
                 * pos_sat
             )
             raw_w_sat.iloc[0] = 0.0
-            raw_w_sat.iloc[-1] = 0.0
 
             sat_mat = raw_w_sat.to_numpy(dtype=np.float64).copy()
             obs_sat = mask_sat.to_numpy()
@@ -870,7 +1168,7 @@ def run_core_satellite_sop_stage3(
                 sat_mat[t_i] = row
                 prev_s = row.copy()
             sat_mat[0] = 0.0
-            sat_mat[-1] = 0.0
+            sat_mat[-1, obs_sat[-1]] = 0.0
 
             sat_fees = {s_aid: float(SPECS_60[s_aid].fee_rate) for s_aid in sats}
             sat_w_df = pd.DataFrame(sat_mat, index=ret_oos.index, columns=sats)
@@ -1256,10 +1554,7 @@ def main() -> None:
     univ_df.to_csv(univ_csv, index=False)
     print(f"[1/5] 已生成 60 品种流动性与数据覆盖表: {univ_csv.name} ({len(univ_df)} 个品种)")
 
-    with open(CACHE_60_DIR / "fast_oos_bundle_v1.pkl", "rb") as f:
-        b = pickle.load(f)
-    with open(CACHE_60_DIR / "exact_core20_ledgers_v3.pkl", "rb") as f:
-        d_c20 = pickle.load(f)
+    b, d_c20 = ensure_full60_oos_bundles(force_rebuild=False)
 
     oos_fast_cache = b["oos_fast_cache"]
     sleeve_daily_ret = b["sleeve_daily_ret"]
@@ -1408,8 +1703,7 @@ def main() -> None:
         min_r=2.15,
         min_sm=12.0,
         min_vol_wan=8.8,
-        price_corr_th=0.68,
-        sleeve_corr_th=0.15,
+        cluster_damp_coeff=1.0,
         sector_damp_power=0.65,
         symmetric_deadzone=0.02,
         target_portfolio_vol=0.15,

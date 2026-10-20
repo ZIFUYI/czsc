@@ -31,7 +31,6 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import examples.multi_factor_cta.synthesis_engine as se  # noqa: E402
 from examples.alpha_mining_agent.forensic_pipeline import (  # noqa: E402
     compute_single_factor_net_sharpe_and_turnover,
     evaluate_execution_events,
@@ -63,35 +62,6 @@ from examples.multi_factor_cta.synthesis_engine import (  # noqa: E402
 OUT_DIR = Path(__file__).resolve().parent
 MANIFEST_PATH = ROOT / "examples/results/research_rerun_20261017/manifest.json"
 CACHE_ROOT = ROOT / "examples/results/research_rerun_20261017/intraday/native_cache"
-
-# 1. 修正日线尺度回退问题（仅在内存运行时生效，不改生产文件）
-_orig_turbulence_cap = se.IntraAssetThreePillarSynthesizer._get_causal_turbulence_cap
-
-
-@staticmethod
-def _fixed_turbulence_cap(df_grid: pd.DataFrame, base_tf: str) -> np.ndarray:
-    bars_per_day = {"5m": 48, "15m": 16, "30m": 8, "60m": 4, "1d": 1}.get(base_tf, 16)
-    w_15d = max(20, 15 * bars_per_day)
-    w_5d = max(10, 5 * bars_per_day)
-    close_arr = df_grid["close"].values
-    ret_b = pd.Series(close_arr).pct_change().fillna(0.0).values
-    vol_15d = pd.Series(ret_b).rolling(w_15d, min_periods=bars_per_day).std().fillna(
-        0.28 / np.sqrt(bars_per_day * 242.0)
-    ).values * np.sqrt(bars_per_day * 242.0)
-    net_chg_5d = np.abs(pd.Series(close_arr).diff(w_5d).fillna(0.0).values)
-    abs_path_5d = (
-        pd.Series(np.abs(np.diff(close_arr, prepend=close_arr[0])))
-        .rolling(w_5d, min_periods=bars_per_day)
-        .sum()
-        .fillna(0.0)
-        .values
-    )
-    er_5d = np.clip(net_chg_5d / np.maximum(abs_path_5d, 1e-6), 0.0, 1.0)
-    turb_vol = vol_15d * (1.0 - 0.35 * er_5d)
-    return np.clip(0.28 / np.maximum(turb_vol, 0.28), 0.72, 1.0)
-
-
-se.IntraAssetThreePillarSynthesizer._get_causal_turbulence_cap = _fixed_turbulence_cap
 
 # Core-20 主力商品期货池（覆盖全部 5 大商品板块，2024.01-2026.09 全周期无缺失）
 CORE_20_IDS = (
@@ -385,9 +355,8 @@ def allocate_and_account_fold(
         full_grid = frames[spec.symbol]["15m"]
         mask = (full_grid["dt"] <= oos_end).to_numpy()
         grid = full_grid.loc[mask].copy().reset_index(drop=True)
+        # 保留 IS 真实因果目标仓位供组合波动率预热，仅在截取 w_oos 时对 OOS 起点做空仓起步
         target = np.asarray(asset_targets[aid], dtype=np.float64)[mask].copy()
-        # OOS 开始前强制空仓，保证每个测试段从 0 仓位独立起步
-        target[grid["dt"] < oos_start] = 0.0
 
         ret_s, pos_s = build_asset_execution_inputs(grid, target)
         returns[aid] = ret_s
@@ -446,12 +415,17 @@ def allocate_and_account_fold(
         n_act = active_mask.sum(axis=1).clip(lower=4.0)
         budget = np.minimum(budget, 1.0 / n_act.to_numpy()[:, None] * 1.5).clip(upper=0.25)
         weights_df = pos_df * budget
-        # 组合级因果目标波动率缩放 (target_vol = 14%)
+        # 组合级因果目标波动率缩放 (target_vol = 14%)，按期货交易日(夜盘归属下一交易日)聚合
+        from multi_factor_cta.data_engine import assign_trading_date
+
+        t_dates = pd.to_datetime(
+            assign_trading_date(pd.Series(ret_df.index, index=ret_df.index), has_night_session=True)
+        )
         unlev_bar_ret = (weights_df.shift(1).fillna(0.0) * ret_df).sum(axis=1)
-        daily_unlev = unlev_bar_ret.groupby(unlev_bar_ret.index.normalize()).sum()
+        daily_unlev = unlev_bar_ret.groupby(t_dates).sum()
         realized_vol = daily_unlev.rolling(60, min_periods=15).std().shift(1) * np.sqrt(252.0)
         vol_scalar = (0.14 / realized_vol.replace(0.0, np.nan)).fillna(1.5).clip(lower=0.5, upper=2.5)
-        bar_scalar = pd.Series(ret_df.index.normalize(), index=ret_df.index).map(vol_scalar).fillna(1.5).to_numpy()
+        bar_scalar = t_dates.map(vol_scalar).fillna(1.5).to_numpy()
         weights_df = weights_df.mul(bar_scalar, axis=0)
     elif alloc_mode in ("Alloc3_SectorHRP", "Alloc4_CSTiltFull"):
         hrp = CrossAssetHRPSynthesizer(
@@ -488,13 +462,14 @@ def allocate_and_account_fold(
 
     # 强制首时点平仓起步、末时点收盘清算，且缺失报价时点维持上一时点已执行权重
     w_oos.iloc[0] = 0.0
-    w_oos.iloc[-1] = 0.0
     for col in w_oos.columns:
         t_col = mask_oos[col].to_numpy()
         w_col = w_oos[col].to_numpy().copy()
         for i in range(1, len(w_col)):
             if not t_col[i]:
                 w_col[i] = w_col[i - 1]
+        if t_col[-1]:
+            w_col[-1] = 0.0
         w_oos[col] = w_col
 
     ledger = account_portfolio_execution(
