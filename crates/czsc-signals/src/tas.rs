@@ -1646,6 +1646,142 @@ pub fn tas_ds_ma60_support_v260521(
     make_kline_signal_v3(&k1, &k2, k3, v1, v2, v3)
 }
 
+/// tas_slope_break_V261003：线性回归斜率拐点突破信号
+///
+/// 逻辑：
+/// 1. 计算过去 N 根 K 线的收盘价线性回归斜率（SLOPE）；
+/// 2. 当斜率由负转正时，记录拐点前 2 根 K 线的最高价最大值作为阻力位 `HH`；
+/// 3. 当斜率由正转负时，记录拐点前 2 根 K 线的最低价最小值作为支撑位 `LL`；
+/// 4. 当价格（最新收盘价）突破 `HH` 输出看多，跌破 `LL` 输出看空；
+/// 5. 辅助标记首次向上突破 / 向下跌破 / 多头延续 / 空头延续 / 区间震荡。
+///
+/// 信号值说明：
+/// - `v1`：`看多` / `看空` / `其他`
+/// - `v2`：`向上突破` / `向下跌破` / `多头延续` / `空头延续` / `区间震荡`
+/// - `v3`：`斜率向上` / `斜率向下` / `斜率平盘`
+///
+/// 参数模板：`"{freq}_D{di}N{n}_斜率突破V261003"`
+///
+/// 参数说明：
+/// - `di`：倒数第 `di` 根 K 线，默认 `1`；
+/// - `n`：线性回归长度，默认 `20`。
+#[signal(
+    category = "kline",
+    name = "tas_slope_break_V261003",
+    template = "{freq}_D{di}N{n}_斜率突破V261003",
+    opcode = "TasSlopeBreakV261003",
+    param_kind = "TasSlopeBreakV261003"
+)]
+pub fn tas_slope_break_v261003(
+    czsc: &CZSC,
+    params: &ParamView,
+    _cache: &mut TaCache,
+) -> Vec<Signal> {
+    let di = get_usize_param(params, "di", 1);
+    let n = get_usize_param(params, "n", 20);
+    let k1 = czsc.freq.to_string();
+    let k2 = format!("D{}N{}", di, n);
+    let k3 = "斜率突破V261003";
+
+    if di == 0 || czsc.bars_raw.len() < n + di + 2 || n < 2 {
+        return make_kline_signal_v3(&k1, &k2, k3, "其他", "其他", "其他");
+    }
+
+    let end_idx = czsc.bars_raw.len() - di;
+    let closes: Vec<f64> = czsc.bars_raw[..=end_idx].iter().map(|b| b.close).collect();
+
+    // 逐根计算斜率：从 index n - 1 开始
+    let mut slopes = vec![0.0; closes.len()];
+    for i in (n - 1)..closes.len() {
+        slopes[i] = linear_slope(&closes[i + 1 - n..=i]);
+    }
+
+    // 状态追踪：HH (阻力位) 和 LL (支撑位)
+    let mut hh: Option<f64> = None;
+    let mut ll: Option<f64> = None;
+
+    // 遍历历史斜率变化，定位拐点并更新 HH / LL
+    for i in n..=end_idx {
+        let prev_slope = slopes[i - 1];
+        let curr_slope = slopes[i];
+
+        // 斜率由负转正：记录拐点前2根K线的最高价最大值
+        if prev_slope <= 0.0 && curr_slope > 0.0 {
+            let h1 = czsc.bars_raw[i - 1].high;
+            let h2 = czsc.bars_raw[i - 2].high;
+            hh = Some(h1.max(h2));
+        }
+
+        // 斜率由正转负：记录拐点前2根K线的最低价最小值
+        if prev_slope >= 0.0 && curr_slope < 0.0 {
+            let l1 = czsc.bars_raw[i - 1].low;
+            let l2 = czsc.bars_raw[i - 2].low;
+            ll = Some(l1.min(l2));
+        }
+    }
+
+    let curr_bar = &czsc.bars_raw[end_idx];
+    let prev_bar = &czsc.bars_raw[end_idx - 1];
+    let curr_slope = slopes[end_idx];
+
+    let v3 = if curr_slope > f64::EPSILON {
+        "斜率向上"
+    } else if curr_slope < -f64::EPSILON {
+        "斜率向下"
+    } else {
+        "斜率平盘"
+    };
+
+    let mut v1 = "其他";
+    let mut v2 = "区间震荡";
+
+    match (hh, ll) {
+        (Some(h_val), Some(l_val)) => {
+            if curr_bar.close > h_val {
+                v1 = "看多";
+                if prev_bar.close <= h_val {
+                    v2 = "向上突破";
+                } else {
+                    v2 = "多头延续";
+                }
+            } else if curr_bar.close < l_val {
+                v1 = "看空";
+                if prev_bar.close >= l_val {
+                    v2 = "向下跌破";
+                } else {
+                    v2 = "空头延续";
+                }
+            } else {
+                v1 = "其他";
+                v2 = "区间震荡";
+            }
+        }
+        (Some(h_val), None) => {
+            if curr_bar.close > h_val {
+                v1 = "看多";
+                if prev_bar.close <= h_val {
+                    v2 = "向上突破";
+                } else {
+                    v2 = "多头延续";
+                }
+            }
+        }
+        (None, Some(l_val)) => {
+            if curr_bar.close < l_val {
+                v1 = "看空";
+                if prev_bar.close >= l_val {
+                    v2 = "向下跌破";
+                } else {
+                    v2 = "空头延续";
+                }
+            }
+        }
+        (None, None) => {}
+    }
+
+    make_kline_signal_v3(&k1, &k2, k3, v1, v2, v3)
+}
+
 /// tas_ma_cohere_V230512：均线系统粘合/扩散状态
 ///
 /// 参数模板：`"{freq}_D{di}SMA{ma_seq}_均线系统V230512"`
@@ -5409,5 +5545,111 @@ mod tests {
             ma60_support_signal(&czsc),
             "日线_D1SMA#60T50_双顺均线支撑V260521_看空_空头_向下_0"
         );
+    }
+
+    #[test]
+    fn test_tas_slope_break_v261003_bullish() {
+        let dt0 = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let mut bars = Vec::new();
+        // 前 30 根下跌，斜率变负
+        for i in 0..30 {
+            let close = 100.0 - i as f64;
+            bars.push(
+                RawBarBuilder::default()
+                    .symbol("000001")
+                    .dt(dt0 + Duration::days(i as i64))
+                    .id(i)
+                    .freq(Freq::D)
+                    .open(close)
+                    .close(close)
+                    .high(close + 0.5)
+                    .low(close - 0.5)
+                    .vol(1000.0)
+                    .amount(close * 1000.0)
+                    .build()
+                    .unwrap(),
+            );
+        }
+        // 接下来 30 根大幅反弹上涨，斜率转正并突破 HH
+        for i in 30..60 {
+            let close = 70.0 + (i - 30) as f64 * 2.0;
+            bars.push(
+                RawBarBuilder::default()
+                    .symbol("000001")
+                    .dt(dt0 + Duration::days(i as i64))
+                    .id(i)
+                    .freq(Freq::D)
+                    .open(close)
+                    .close(close)
+                    .high(close + 0.5)
+                    .low(close - 0.5)
+                    .vol(1000.0)
+                    .amount(close * 1000.0)
+                    .build()
+                    .unwrap(),
+            );
+        }
+        let czsc = CZSC::new(bars, 50, 6);
+        let params = HashMap::new();
+        let view = ParamView::new(&params);
+        let mut cache = TaCache::default();
+        let signals = tas_slope_break_v261003(&czsc, &view, &mut cache);
+        assert!(!signals.is_empty());
+        let sig = signals[0].to_string();
+        assert!(sig.contains("看多"));
+        assert!(sig.contains("斜率向上"));
+    }
+
+    #[test]
+    fn test_tas_slope_break_v261003_bearish() {
+        let dt0 = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let mut bars = Vec::new();
+        // 前 30 根上涨，斜率变正
+        for i in 0..30 {
+            let close = 50.0 + i as f64;
+            bars.push(
+                RawBarBuilder::default()
+                    .symbol("000001")
+                    .dt(dt0 + Duration::days(i as i64))
+                    .id(i)
+                    .freq(Freq::D)
+                    .open(close)
+                    .close(close)
+                    .high(close + 0.5)
+                    .low(close - 0.5)
+                    .vol(1000.0)
+                    .amount(close * 1000.0)
+                    .build()
+                    .unwrap(),
+            );
+        }
+        // 接下来 30 根大幅跳水下跌，斜率转负并跌破 LL
+        for i in 30..60 {
+            let close = 80.0 - (i - 30) as f64 * 2.0;
+            bars.push(
+                RawBarBuilder::default()
+                    .symbol("000001")
+                    .dt(dt0 + Duration::days(i as i64))
+                    .id(i)
+                    .freq(Freq::D)
+                    .open(close)
+                    .close(close)
+                    .high(close + 0.5)
+                    .low(close - 0.5)
+                    .vol(1000.0)
+                    .amount(close * 1000.0)
+                    .build()
+                    .unwrap(),
+            );
+        }
+        let czsc = CZSC::new(bars, 50, 6);
+        let params = HashMap::new();
+        let view = ParamView::new(&params);
+        let mut cache = TaCache::default();
+        let signals = tas_slope_break_v261003(&czsc, &view, &mut cache);
+        assert!(!signals.is_empty());
+        let sig = signals[0].to_string();
+        assert!(sig.contains("看空"));
+        assert!(sig.contains("斜率向下"));
     }
 }

@@ -264,6 +264,15 @@ mod tests {
             "strength_flow_V260601",
             "strength_squeeze_V260601",
         ] {
+            let canonical = name.strip_suffix("_V260601").unwrap();
+            assert!(
+                super::SIGNAL_REGISTRY.contains_key(canonical),
+                "missing canonical signal: {canonical}"
+            );
+            assert_eq!(
+                super::SIGNAL_REGISTRY[canonical].param_template,
+                super::SIGNAL_REGISTRY[name].param_template
+            );
             assert!(
                 super::SIGNAL_REGISTRY.contains_key(name),
                 "missing kline signal registration: {name}"

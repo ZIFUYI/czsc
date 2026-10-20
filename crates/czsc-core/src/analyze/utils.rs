@@ -13,7 +13,7 @@ use anyhow::Context;
 use chrono::DateTime;
 use chrono::Utc;
 use polars::frame::DataFrame;
-use polars::prelude::TimeUnit;
+use polars::prelude::{Column, DataType, TimeUnit};
 
 /// K 线缺口信息。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -162,15 +162,15 @@ pub fn check_gap_info(bars: &[RawBar]) -> Vec<GapInfo> {
 /// 去除包含关系：输入三根k线，其中k1和k2为没有包含关系的K线，k3为原始K线
 /// 处理逻辑如下：
 ///
-/// 1. 首先，通过比较k1和k2的高点(high)的大小关系来确定direction的值。如果k1的高点小于k2的高点，
-///    则设定direction为Up；如果k1的高点大于k2的高点，则设定direction为Down；如果k1和k2的高点相等，
-///    则创建一个新的K线k4，与k3具有相同的属性，并返回False和k4。
+/// 1. 只有k2的高低点同时高于或低于k1时，才分别确定direction为Up或Down。
+///    极值并列或前两根仍有包含关系时，方向未知，返回False及与k3属性相同的新K线。
 ///
 /// 2. 接下来，判断k2和k3之间是否存在包含关系。如果存在，则根据direction的值进行处理。
 ///     - 如果direction为Up，则选择k2和k3中的较大高点作为新K线k4的高点，较大低点作为低点，较大高点所在的时间戳(dt)作为k4的时间戳。
 ///     - 如果direction为Down，则选择k2和k3中的较小高点作为新K线k4的高点，较小低点作为低点，较小低点所在的时间戳(dt)作为k4的时间戳。
 ///
-/// 3. 根据上述处理得到的高点、低点、开盘价(open_)、收盘价(close)，计算新K线k4的成交量(vol)和成交金额(amount)，
+/// 3. 合并实体方向沿用k3；十字星保持无实体，开收盘价取限制在合并区间内的原收盘价。
+///    根据上述处理得到的高点、低点、开盘价(open_)、收盘价(close)，计算新K线k4的成交量(vol)和成交金额(amount)，
 ///    并将k2中除了与k3时间戳相同的元素之外的其他元素与k3一起作为k4的元素列表(elements)。
 ///
 /// 4. 返回一个布尔值和新的K线k4。如果k2和k3之间存在包含关系，则返回True和k4；否则返回False和k4，其中k4与k3具有相同的属性。
@@ -179,10 +179,12 @@ pub fn remove_include(
     k2: &NewBar,
     k3: RawBar,
 ) -> Result<(bool, NewBar), AnalyzeErorr> {
-    // 根据k1和k2的high确定direction
-    let direction = if k1.high < k2.high {
+    // Both extrema must establish the same direction. Initial bars may still
+    // include each other; choosing by high alone gives the same direction after
+    // a price mirror in that case. Ties likewise do not establish a direction.
+    let direction = if k1.high < k2.high && k1.low < k2.low {
         Direction::Up
-    } else if k1.high > k2.high {
+    } else if k1.high > k2.high && k1.low > k2.low {
         Direction::Down
     } else {
         return Ok((false, NewBar::new_from_raw(&k3)));
@@ -214,8 +216,13 @@ pub fn remove_include(
 
     let (open_, close) = if k3.open > k3.close {
         (high, low)
-    } else {
+    } else if k3.open < k3.close {
         (low, high)
+    } else {
+        // A doji has no body direction. Preserve that neutrality inside the
+        // merged range instead of manufacturing a bullish candle on both sides.
+        let price = k3.close.clamp(low, high);
+        (price, price)
     };
 
     let k4 = {
@@ -514,4 +521,85 @@ pub fn format_standard_kline(df: DataFrame, freq: Freq) -> Result<Vec<RawBar>, A
     }
 
     Ok(bars)
+}
+
+/// Convert research OHLCV frames without mutating their source data.
+/// Accepts `volume` or `vol`; when both exist they must be numerically equal.
+/// Numeric columns are cast to Float64 in Rust. An absent amount becomes zero,
+/// explicitly marking unavailable turnover, never fabricated price-times-volume.
+/// Required null values, invalid OHLC and negative/non-finite volume or amount
+/// return errors. Datetimes keep their timezone instant. IDs follow input order.
+pub fn format_research_kline(mut df: DataFrame, freq: Freq) -> Result<Vec<RawBar>, AnalyzeErorr> {
+    for name in ["open", "high", "low", "close", "volume", "vol", "amount"] {
+        if let Ok(column) = df.column(name) {
+            df.with_column(column.cast(&DataType::Float64)?)?;
+        }
+    }
+    match (df.column("vol"), df.column("volume")) {
+        (Ok(vol), Ok(volume))
+            if vol
+                .f64()?
+                .into_iter()
+                .zip(volume.f64()?)
+                .any(|(a, b)| a != b) =>
+        {
+            return Err(AnalyzeErorr::Unexpected(anyhow::anyhow!(
+                "volume and vol conflict"
+            )));
+        }
+        (Err(_), Ok(_)) => {
+            df.rename("volume", "vol".into())?;
+        }
+        _ => {}
+    }
+    if df.column("amount").is_err() {
+        df.with_column(Column::new("amount".into(), vec![0.0; df.height()]))?;
+    }
+    for name in [
+        "symbol", "dt", "open", "high", "low", "close", "vol", "amount",
+    ] {
+        if df.column(name)?.null_count() > 0 {
+            return Err(AnalyzeErorr::Unexpected(anyhow::anyhow!(
+                "required column {name} contains null"
+            )));
+        }
+    }
+    // Arrow may infer Null for empty object columns; there are no rows to convert.
+    if df.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Validate before the historical standard converter's non-null row extraction.
+    let o = df.column("open")?.f64()?;
+    let h = df.column("high")?.f64()?;
+    let l = df.column("low")?.f64()?;
+    let c = df.column("close")?.f64()?;
+    let v = df.column("vol")?.f64()?;
+    let a = df.column("amount")?.f64()?;
+    for i in 0..df.height() {
+        let (open, high, low, close) = (
+            o.get(i).unwrap(),
+            h.get(i).unwrap(),
+            l.get(i).unwrap(),
+            c.get(i).unwrap(),
+        );
+        if [open, high, low, close]
+            .iter()
+            .any(|p| !p.is_finite() || *p <= 0.)
+            || high < open.max(close)
+            || low > open.min(close)
+        {
+            return Err(AnalyzeErorr::Unexpected(anyhow::anyhow!(
+                "invalid OHLC at index {i}"
+            )));
+        }
+        if [v.get(i).unwrap(), a.get(i).unwrap()]
+            .iter()
+            .any(|x| !x.is_finite() || *x < 0.)
+        {
+            return Err(AnalyzeErorr::Unexpected(anyhow::anyhow!(
+                "volume and amount must be finite and nonnegative"
+            )));
+        }
+    }
+    format_standard_kline(df, freq)
 }

@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 """
 159915 长期自主信号挖掘与 6×5 全周期生态位矩阵进化 Agent 主循环
-(MAP-Elites Niche Matrix + Archetype-Specific Rulers + 5-Timeframe Atomic Routing)
+(MAP-Elites Niche Matrix + Structural Execution Admission + 5-Timeframe Atomic Routing)
 
 核心特性：
 1. 搜索单元原子化为 `sig_id@tf` (跨越 1d / 60m / 30m / 15m / 5m 五级周期)，哪个信号在哪个周期过关就只挂载在哪个周期；
-2. 四大战略方向配置专属法医三重屏障检验尺 (趋势尺 / 反转尺 / 回归尺 / 日内尺)，彻底消除对反转与日内信号的误杀；
+2. 专属 ATR 标尺仅保留诊断；正式准入检验实际结构退出的完整交易、扣费净值与真实执行事件池化；
 3. 三维真互补门禁 (生态位配额防扎堆 + 持仓时序低相关 |ρ|<0.32 + 空仓填补率 & 回撤期雪中送炭收益 > 0)；
 4. 持久态存储 signal_zoo.json / niche_matrix.json / graveyard.jsonl / leaderboard.md。
 """
@@ -13,6 +13,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -30,8 +33,10 @@ from examples.alpha_mining_agent.forensic_pipeline import (  # noqa: E402
     IS_END_DT,
     backtest_slice,
     map_tf_weight_to_5m_grid,
+    run_execution_audit,
     run_gate1_forensic_audit,
     run_gate2_3d_complementarity_audit,
+    run_parameter_smoothness_audit,
     synthesize_atomic_units_portfolio,
 )
 from examples.alpha_mining_agent.hypothesis_bank import (  # noqa: E402
@@ -43,7 +48,6 @@ from examples.alpha_mining_agent.hypothesis_bank import (  # noqa: E402
     CANDIDATE_HYPOTHESIS_POOL,
     TF_SCALE_MAP,
     attach_native_czsc_signals,
-    compute_signal_triggers_and_weights,
     enrich_kline_features,
 )
 from examples.alpha_mining_agent.state_ledger import (  # noqa: E402
@@ -52,13 +56,130 @@ from examples.alpha_mining_agent.state_ledger import (  # noqa: E402
     AgentStateLedger,
 )
 from examples.multi_factor_cta.atomic_factors import link_higher_timeframes  # noqa: E402
-from examples.multi_factor_cta.forensic_validator import run_stratified_pooled_gate1b_audit  # noqa: E402
+from examples.multi_factor_cta.data_engine import compute_causal_cross_sectional_features  # noqa: E402
+from examples.multi_factor_cta.factor_engine import RuleFactorRegistry  # noqa: E402
+from examples.multi_factor_cta.forensic_validator import (  # noqa: E402
+    RuleFactorForensicValidator,
+    get_stratified_pool_tier,
+    infer_asset_pool_group,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 REAL_5M_CSV = Path("examples/results/159915_real_5m_2020_2026.csv")
 DASHBOARD_HTML = WORKSPACE_DIR / "autonomous_evolution_dashboard.html"
+
+
+class ResearchAuditContext:
+    """Reuse immutable evidence within one prepared research run, without changing any gate.
+
+    Construct after ``prepare_research_pool`` and keep its prices, native signals,
+    higher-timeframe links and cross-sectional inputs frozen. Replacing or editing
+    that data requires a new context; this cache is neither persistent nor shared
+    across runs. Cutoff, fees, pool metadata, factor/ruler configuration and native
+    environment settings are keyed independently. ``clear`` releases evidence
+    between candidate batches when running a large intraday universe.
+    """
+
+    def __init__(self, pool_tf_dfs: dict[str, dict[str, pd.DataFrame]]) -> None:
+        self._pool = pool_tf_dfs
+        self._frames = tuple(
+            (symbol, tf, id(frame), len(frame))
+            for symbol, frames in sorted(pool_tf_dfs.items())
+            for tf, frame in sorted(frames.items())
+        )
+        self.clear()
+
+    def clear(self) -> None:
+        """Release cached signals and audits; the prepared pool binding stays fixed."""
+        self._signals: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
+        self._normalized: dict[tuple, dict] = {}
+        self._pooled: dict[tuple, dict] = {}
+        self._admissions: dict[tuple, dict] = {}
+
+    def cache_info(self) -> dict[str, int]:
+        """Report cached item counts for batch progress and memory management."""
+        return {
+            "signals": len(self._signals),
+            "normalized": len(self._normalized),
+            "pooled": len(self._pooled),
+            "admissions": len(self._admissions),
+        }
+
+    def _key(self, pool: dict, sid: str, tf: str, cutoff: pd.Timestamp) -> tuple:
+        frames = tuple(
+            (symbol, timeframe, id(frame), len(frame))
+            for symbol, data in sorted(pool.items())
+            for timeframe, frame in sorted(data.items())
+        )
+        if pool is not self._pool or frames != self._frames:
+            raise ValueError("ResearchAuditContext requires its original frozen pool; create a new context")
+        metadata = tuple(
+            (
+                symbol,
+                timeframe,
+                float(frame.attrs.get("fee_rate", 0.0002)),
+                frame.attrs.get("pool_group"),
+                frame.attrs.get("microstructure_group"),
+            )
+            for symbol, data in sorted(pool.items())
+            for timeframe, frame in sorted(data.items())
+        )
+        spec = ALL_SIGNAL_SPECS[sid]
+        return (
+            sid,
+            tf,
+            pd.Timestamp(cutoff).value,
+            repr(spec),
+            repr(ARCHETYPE_RULERS[spec.archetype]),
+            TF_SCALE_MAP[tf],
+            metadata,
+            tuple(
+                os.environ.get(name)
+                for name in ("CZSC_MIN_BI_LEN", "czsc_min_bi_len", "CZSC_MAX_BI_NUM", "czsc_max_bi_num")
+            ),
+        )
+
+    def _signal(self, key: tuple, symbol: str, sid: str, tf: str) -> tuple[np.ndarray, np.ndarray]:
+        signal_key = (key, symbol)
+        if signal_key not in self._signals:
+            triggers, weights = compute_research_signal(self._pool[symbol][tf], sid, tf)
+            self._signals[signal_key] = (triggers.copy(), weights.copy())
+        # Callers cannot mutate a cached signal while constructing their audit.
+        triggers, weights = self._signals[signal_key]
+        return triggers.copy(), weights.copy()
+
+
+def prepare_research_pool(
+    pool_tf_dfs: dict[str, dict[str, pd.DataFrame]],
+    metadata: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, pd.DataFrame]]:
+    """在计算任何候选之前挂载同一资产池、同一周期的历史截面。"""
+    metadata = metadata or {}
+    sectors = {}
+    for symbol, frames in pool_tf_dfs.items():
+        item = metadata.get(symbol, {})
+        group = str(item.get("asset_group", infer_asset_pool_group(symbol)))
+        sector = str(item.get("sector", "equity" if group == "equity" else f"unknown:{symbol}"))
+        sectors[symbol] = sector
+        for frame in frames.values():
+            frame.attrs["sector"] = sector
+            frame.attrs["pool_group"] = f"commodity:{sector}" if group == "commodity" else group
+            frame.attrs["microstructure_group"] = item.get("microstructure_group")
+            frame.attrs["fee_rate"] = float(item.get("fee_rate", 0.0002))
+    for tf in TF_SCALE_MAP:
+        panel = {symbol: frames[tf] for symbol, frames in pool_tf_dfs.items() if tf in frames and not frames[tf].empty}
+        if panel:
+            compute_causal_cross_sectional_features(panel, specs=sectors, tf=tf, attach_to_dfs=True)
+    for frames in pool_tf_dfs.values():
+        link_higher_timeframes(frames)
+    return pool_tf_dfs
+
+
+def compute_research_signal(df_tf: pd.DataFrame, sid: str, tf: str) -> tuple[np.ndarray, np.ndarray]:
+    """正式研究统一使用注册表的一次门控输出，下游审计不再隐式改仓位。"""
+    return RuleFactorRegistry().evaluate_factor_on_tf(df_tf, sid, tf, soft_gate=True)
 
 
 def load_all_four_timeframes(
@@ -221,43 +342,88 @@ def evaluate_candidate_pooled_gate1b(
     primary_g1: dict,
     pool_tf_dfs: dict[str, dict[str, pd.DataFrame]],
     rng: np.random.Generator,
-    allow_single_asset_degrade: bool = True,
+    allow_single_asset_degrade: bool = False,
     ledger: AgentStateLedger | None = None,
     per_symbol_gate1_overrides: dict[str, dict] | None = None,
+    *,
+    is_end_dt: pd.Timestamp = IS_END_DT,
+    audit_context: ResearchAuditContext | None = None,
 ) -> dict:
     """
     执行候选原子单元 `sid@tf` 的 Pre-Admission Gate 1B 三级多标的分层池化准入检验。
     若未通过且传入了 `ledger`，则自动将该候选单元记入 `graveyard.jsonl`。
     """
     spec = ALL_SIGNAL_SPECS[sid]
-    ruler = ARCHETYPE_RULERS[spec.archetype]
     unit_id = f"{sid}@{tf}"
+    cache_key = audit_context._key(pool_tf_dfs, sid, tf, is_end_dt) if audit_context is not None else None
+    validator = RuleFactorForensicValidator(is_end_dt=is_end_dt, soft_gate=False)
+    asset_groups = {}
+    microstructure_groups = {}
+    for psym, frames in pool_tf_dfs.items():
+        frame = frames.get(tf)
+        attrs = frame.attrs if frame is not None else {}
+        asset_groups[psym] = str(attrs.get("pool_group", infer_asset_pool_group(psym)))
+        if attrs.get("microstructure_group"):
+            microstructure_groups[psym] = str(attrs["microstructure_group"])
 
     if per_symbol_gate1_overrides is not None:
         per_symbol_gate1 = dict(per_symbol_gate1_overrides)
-        per_symbol_gate1.setdefault(primary_symbol, primary_g1)
     else:
-        per_symbol_gate1 = {primary_symbol: primary_g1}
+        per_symbol_gate1 = {}
         for psym, p_dfs in pool_tf_dfs.items():
-            if psym == primary_symbol or tf not in p_dfs or p_dfs[tf].empty:
+            if tf not in p_dfs or p_dfs[tf].empty:
+                per_symbol_gate1[psym] = {"is_n_purged": 0, "events": []}
                 continue
-            p_trig, p_weight = compute_signal_triggers_and_weights(p_dfs[tf], sid, scale=TF_SCALE_MAP[tf])
-            per_symbol_gate1[psym] = run_gate1_forensic_audit(
+            local_key = (cache_key, psym)
+            if audit_context is not None and local_key in audit_context._normalized:
+                per_symbol_gate1[psym] = audit_context._normalized[local_key]
+                continue
+            p_trig, p_weight = (
+                audit_context._signal(cache_key, psym, sid, tf)
+                if audit_context is not None
+                else compute_research_signal(p_dfs[tf], sid, tf)
+            )
+            per_symbol_gate1[psym] = validator.run_vol_and_regime_normalized_audit(
                 p_dfs[tf],
                 p_trig,
                 spec.direction,
-                ruler,
+                spec.archetype,
                 tf,
-                rng,
                 weights_tf=p_weight,
+                fee_rate=float(p_dfs[tf].attrs.get("fee_rate", 0.0002)),
+                soft_gate=False,
+                event_source="execution",
             )
+            if audit_context is not None:
+                audit_context._normalized[local_key] = per_symbol_gate1[psym]
 
-    g1b = run_stratified_pooled_gate1b_audit(
-        per_symbol_gate1=per_symbol_gate1,
-        archetype=spec.archetype,
-        timeframe=tf,
-        allow_single_asset_degrade=allow_single_asset_degrade,
+    target_group = asset_groups.get(primary_symbol, infer_asset_pool_group(primary_symbol))
+    target_microstructure = microstructure_groups.get(primary_symbol)
+    tier = get_stratified_pool_tier(spec.archetype, tf)
+    pooled_key = (
+        cache_key,
+        None if tier == 1 else target_group,
+        target_microstructure if tier == 3 else None,
+        allow_single_asset_degrade,
     )
+    # Explicit evidence overrides are mutable caller input, so never read/write this cache.
+    cache_pool = audit_context is not None and per_symbol_gate1_overrides is None
+    g1b = (
+        audit_context._pooled[pooled_key]
+        if cache_pool and pooled_key in audit_context._pooled
+        else validator.run_stratified_pooled_gate1b_audit(
+            asset_audits=per_symbol_gate1,
+            archetype=spec.archetype,
+            timeframe=tf,
+            asset_groups=asset_groups,
+            target_pool_group=target_group,
+            microstructure_groups=microstructure_groups,
+            target_microstructure_group=target_microstructure,
+            allow_single_asset_degrade=allow_single_asset_degrade,
+        )
+    )
+    if cache_pool and pooled_key not in audit_context._pooled:
+        audit_context._pooled[pooled_key] = g1b
     if not g1b["passed"] and ledger is not None:
         ledger.bury_rejected_signal(
             unit_id,
@@ -270,7 +436,91 @@ def evaluate_candidate_pooled_gate1b(
             reason=g1b["reason"],
             metrics={**primary_g1, **g1b},
         )
-    return g1b
+    return copy.deepcopy(g1b) if cache_pool else g1b
+
+
+def audit_research_candidate(
+    sid: str,
+    tf: str,
+    primary_symbol: str,
+    pool_tf_dfs: dict[str, dict[str, pd.DataFrame]],
+    *,
+    is_end_dt: pd.Timestamp = IS_END_DT,
+    audit_context: ResearchAuditContext | None = None,
+) -> dict[str, Any]:
+    """供种子、旧库、新候选及入口验证共同使用的强制准入链。"""
+    spec = ALL_SIGNAL_SPECS[sid]
+    frame = pool_tf_dfs[primary_symbol][tf]
+    cache_key = audit_context._key(pool_tf_dfs, sid, tf, is_end_dt) if audit_context is not None else None
+    admission_key = (cache_key, primary_symbol)
+    if audit_context is not None and admission_key in audit_context._admissions:
+        result = copy.deepcopy(audit_context._admissions[admission_key])
+        result["gate1b"] = evaluate_candidate_pooled_gate1b(
+            sid,
+            tf,
+            primary_symbol,
+            result["execution"],
+            pool_tf_dfs,
+            np.random.default_rng(42),
+            is_end_dt=is_end_dt,
+            audit_context=audit_context,
+        )
+        return result
+    triggers, weights = (
+        audit_context._signal(cache_key, primary_symbol, sid, tf)
+        if audit_context is not None
+        else compute_research_signal(frame, sid, tf)
+    )
+    fee_rate = float(frame.attrs.get("fee_rate", 0.0002))
+    gate1 = run_gate1_forensic_audit(
+        frame,
+        triggers,
+        spec.direction,
+        ARCHETYPE_RULERS[spec.archetype],
+        tf,
+        weights_tf=weights,
+        fee_rate=fee_rate,
+        is_end_dt=is_end_dt,
+    )
+    gate1["audit_kind"] = "fixed_atr_diagnostic"
+    gate1["diagnostic_only"] = True
+    execution = run_execution_audit(
+        frame,
+        weights,
+        fee_rate=fee_rate,
+        is_end_dt=is_end_dt,
+        min_net_sharpe=float(ARCHETYPE_RULERS[spec.archetype].min_net_sharpe),
+    )
+    pooled = evaluate_candidate_pooled_gate1b(
+        sid,
+        tf,
+        primary_symbol,
+        execution,
+        pool_tf_dfs,
+        np.random.default_rng(42),
+        is_end_dt=is_end_dt,
+        audit_context=audit_context,
+    )
+    smoothness = {"passed": False, "reason": "基础准入未通过，未执行参数平原检查"}
+    if execution["passed"] and pooled["passed"]:
+        smoothness = run_parameter_smoothness_audit(
+            frame, sid, tf, fee_rate=fee_rate, is_end_dt=is_end_dt, soft_gate=True
+        )
+    stages = {"execution": execution, "gate1b": pooled, "parameter_smoothness": smoothness}
+    failed = next((name for name, result in stages.items() if not result["passed"]), None)
+    result = {
+        "passed": failed is None,
+        "failed_gate": failed,
+        "reason": stages[failed]["reason"] if failed else "所有前置准入检查通过",
+        "is_end_dt": pd.Timestamp(is_end_dt).isoformat(),
+        "gate1": gate1,
+        **stages,
+    }
+    if audit_context is not None:
+        # The full pool event table is already cached once per group. Do not keep
+        # another copy inside every primary asset's local admission record.
+        audit_context._admissions[admission_key] = copy.deepcopy({k: v for k, v in result.items() if k != "gate1b"})
+    return result
 
 
 def evaluate_full_is_oos(df_30m: pd.DataFrame, w_multi: np.ndarray) -> dict:
@@ -336,7 +586,7 @@ def generate_markdown_leaderboard(ledger: AgentStateLedger, niche_df: pd.DataFra
         "",
         "## 二、Agent 新挖掘入库的正交真金原子单元明细",
         "",
-        "| 原子单元ID | 信号名称 | 战略方向 | 专属周期 | 专属检验标尺 | 样本内独立触发 | 样本内超额Alpha | 样本内安全垫 | 最大相关性 | 空仓填补率 | 回撤雪中送炭(BP) | 样本外超额Alpha |",
+        "| 原子单元ID | 信号名称 | 战略方向 | 专属周期 | 专属检验标尺 | 样本内完整交易 | 样本内执行净收益 | 样本内安全垫 | 最大相关性 | 空仓填补率 | 回撤雪中送炭(BP) | 样本外执行净收益 |",
         "| :--- | :--- | :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
     for uid in new_units:
@@ -576,6 +826,15 @@ def main() -> None:
         help="逗号分隔的多标的池代码或路径列表 (用于 Pre-Admission Gate 1B 三级分层池化准入检验；未指定时自动发现本地可用池)",
     )
     parser.add_argument("--status-only", action="store_true", help="仅打印当前持久态信号库与 6×5 全周期生态位矩阵")
+    parser.add_argument(
+        "--pool-metadata",
+        type=Path,
+        help="资产池 JSON：每个 symbol 的 asset_group/sector/microstructure_group/fee_rate",
+    )
+    parser.add_argument(
+        "--validate-only", action="store_true", help="运行真实加载、截面、信号和准入路径并输出验证报告，不修改因子库"
+    )
+    parser.add_argument("--audit-unit", default="BC01L@30m", help="入口验证的候选单元，格式 sig_id@tf")
     args = parser.parse_args()
 
     symbol = args.symbol
@@ -584,7 +843,7 @@ def main() -> None:
         workspace_dir = Path(args.workspace_dir) if args.workspace_dir else WORKSPACE_DIR
         data_path = Path(args.data_path) if args.data_path else REAL_5M_CSV
         symbol_code = "159915"
-        dashboard_html = DASHBOARD_HTML
+        dashboard_html = workspace_dir / "autonomous_evolution_dashboard.html"
     else:
         sym_clean = symbol.replace(".", "_")
         workspace_dir = Path(args.workspace_dir) if args.workspace_dir else (WORKSPACE_DIR / sym_clean)
@@ -593,7 +852,7 @@ def main() -> None:
         dashboard_html = workspace_dir / f"autonomous_evolution_dashboard_{sym_clean}.html"
 
     ledger = AgentStateLedger(workspace_dir)
-    if args.reset:
+    if args.reset and not args.validate_only:
         ledger.reset_workspace()
 
     if args.status_only:
@@ -622,9 +881,7 @@ def main() -> None:
     )
     pool_tf_dfs: dict[str, dict[str, pd.DataFrame]] = {symbol: tf_dfs}
     if len(pool_paths) <= 1:
-        print(
-            f"  [Gate 1B 告警] 当前仅发现单标的数据 ({symbol})，Pre-Admission Gate 1B 三级分层池化门禁将启用单标的平滑降级模式。"
-        )
+        print(f"  [Gate 1B] 当前仅发现单标的数据 ({symbol})；可以诊断，不能通过多资产准入。")
     else:
         print(f"  [Gate 1B 多标的检验池] 已发现 {len(pool_paths)} 个联合检验标的: {list(pool_paths.keys())}")
 
@@ -635,10 +892,32 @@ def main() -> None:
                 pool_tf_dfs[psym] = load_all_four_timeframes(ppath, symbol_name=psym_code, workspace_dir=workspace_dir)
         return pool_tf_dfs
 
+    metadata = json.loads(args.pool_metadata.read_text(encoding="utf-8")) if args.pool_metadata else {}
+    if not isinstance(metadata, dict) or any(not isinstance(v, dict) for v in metadata.values()):
+        parser.error("--pool-metadata 必须为 symbol 到属性对象的 JSON 映射")
+    prepare_research_pool(_ensure_pool_loaded(), metadata)
+
+    if args.validate_only:
+        try:
+            sid, tf = args.audit_unit.split("@")
+            if sid not in ALL_SIGNAL_SPECS or tf not in ALL_SIGNAL_SPECS[sid].eligible_tfs:
+                raise ValueError("unknown factor or unsupported timeframe")
+        except ValueError:
+            parser.error("--audit-unit 必须为已注册且支持该周期的 sig_id@tf")
+        result = audit_research_candidate(sid, tf, symbol, pool_tf_dfs)
+        result["unit_id"] = args.audit_unit
+        result["pool_symbols"] = sorted(pool_tf_dfs)
+        result["cross_section_attached"] = all(
+            "cs_slope_rank" in frames[tf] for frames in pool_tf_dfs.values() if tf in frames and not frames[tf].empty
+        )
+        out_path = workspace_dir / "entrypoint_validation.json"
+        out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"  [入口验证] passed={result['passed']}: {result['reason']} | {out_path}")
+        return
+
     df_1d = tf_dfs["1d"]
     # 将主回测与合成网格下沉至原生 5m 时间轴 (保持变量名 df_30m 兼容后续调用)
     df_30m = tf_dfs["5m"]
-    rng = np.random.default_rng(42)
 
     # 预计算所有 (sig_id, tf) 原子单元在自身周期上的触发序列、连续权重序列，以及无延迟映射到 5m 主时间轴上的持仓序列
     trig_by_unit: dict[str, np.ndarray] = {}
@@ -648,35 +927,76 @@ def main() -> None:
     for sid, spec in ALL_SIGNAL_SPECS.items():
         for tf in spec.eligible_tfs:
             unit_id = f"{sid}@{tf}"
-            t_arr, w_arr = compute_signal_triggers_and_weights(tf_dfs[tf], sid, scale=TF_SCALE_MAP[tf])
+            t_arr, w_arr = compute_research_signal(tf_dfs[tf], sid, tf)
             trig_by_unit[unit_id] = t_arr
             weight_by_unit[unit_id] = w_arr
             w_on_30m_by_unit[unit_id] = map_tf_weight_to_5m_grid(tf_dfs[tf], w_arr, df_30m, tf)
 
-    # 1. 初始化 5 个基石信号在 (1d, 60m, 30m) 上的 15 个种子原子单元
+    admission_cache: dict[str, dict[str, Any]] = {}
+
+    def _audit_unit(sid: str, tf: str) -> dict[str, Any]:
+        uid = f"{sid}@{tf}"
+        if uid not in admission_cache:
+            admission_cache[uid] = audit_research_candidate(sid, tf, symbol, pool_tf_dfs)
+        return admission_cache[uid]
+
+    def _record_rejection(sid: str, tf: str, audit: dict[str, Any]) -> None:
+        spec = ALL_SIGNAL_SPECS[sid]
+        ledger.bury_rejected_signal(
+            f"{sid}@{tf}",
+            sid,
+            tf,
+            spec.name,
+            spec.archetype,
+            spec.direction,
+            failed_gate=str(audit["failed_gate"]),
+            reason=audit["reason"],
+            metrics=audit,
+        )
+
+    # 1. 旧库与种子和新候选使用同一组前置准入，不保留历史豁免。
+    zoo = ledger.load_signal_zoo()
+    for uid, info in list(zoo.items()):
+        sid, tf = info["sig_id"], info["timeframe"]
+        audit = _audit_unit(sid, tf)
+        if not audit["passed"]:
+            _record_rejection(sid, tf, audit)
+            ledger.remove_signal_from_zoo(uid)
+        else:
+            info["admission_audit"] = audit
+            for metric in (
+                "is_n_purged",
+                "is_mean_pct",
+                "is_excess_alpha_pct",
+                "is_win_rate_pct",
+                "is_pl_ratio",
+                "is_safety_margin_pct",
+                "is_boot_pval",
+                "oos_mean_pct",
+                "oos_excess_alpha_pct",
+                "oos_safety_margin_pct",
+            ):
+                info[metric] = audit["execution"][metric]
+            info["ruler_desc"] = "实际结构执行（零仓基准）"
+            ledger.save_signal_to_zoo(AdmittedSignalRecord(**info))
     zoo = ledger.load_signal_zoo()
     if not zoo:
-        print("\n[初始化] 正在将 5 大基石真金信号在 (1d, 60m, 30m) 上的种子原子单元写入 signal_zoo.json ...")
-        ruler_a = ARCHETYPE_RULERS[ARCH_A]
+        print("\n[初始化] 仅将通过完整前置准入的基石种子写入 signal_zoo.json ...")
         for spec in BASE_SEED_SIGNALS:
             for tf in spec.eligible_tfs:
                 unit_id = f"{spec.sig_id}@{tf}"
-                g1 = run_gate1_forensic_audit(
-                    tf_dfs[tf],
-                    trig_by_unit[unit_id],
-                    spec.direction,
-                    ruler_a,
-                    tf,
-                    rng,
-                    weights_tf=weight_by_unit[unit_id],
-                )
+                audit = _audit_unit(spec.sig_id, tf)
+                if not audit["passed"]:
+                    _record_rejection(spec.sig_id, tf, audit)
+                    continue
+                g1 = audit["execution"]
                 rec = AdmittedSignalRecord(
                     unit_id=unit_id,
                     sig_id=spec.sig_id,
                     timeframe=tf,
                     name=f"{spec.name}@{tf}",
                     archetype=spec.archetype,
-                    ruler_desc=ruler_a.ruler_name,
+                    ruler_desc="实际结构执行（零仓基准）",
                     direction=spec.direction,
                     weight_alloc=spec.default_weight,
                     is_base_seed=True,
@@ -696,11 +1016,12 @@ def main() -> None:
                     oos_mean_pct=g1.get("oos_mean_pct", 0.0),
                     oos_excess_alpha_pct=g1.get("oos_excess_alpha_pct", 0.0),
                     oos_safety_margin_pct=g1.get("oos_safety_margin_pct", 0.0),
+                    admission_audit=audit,
                 )
                 ledger.save_signal_to_zoo(rec)
         zoo = ledger.load_signal_zoo()
 
-    base_alloc = {f"{s.sig_id}@{tf}": s.default_weight for s in BASE_SEED_SIGNALS for tf in s.eligible_tfs}
+    base_alloc = {uid: float(info["weight_alloc"]) for uid, info in zoo.items() if info["is_base_seed"]}
     w_base_multi = synthesize_atomic_units_portfolio(df_30m, w_on_30m_by_unit, base_alloc)
     base_eval = evaluate_full_is_oos(df_30m, w_base_multi)
 
@@ -758,6 +1079,8 @@ def main() -> None:
                     inc_uid = added_label.split("(替")[1].rstrip(")").strip()
                     cand_sid = added_label[1:].split("_")[0].strip()
                     uid = f"{cand_sid}@{tf}"
+                    if uid not in zoo:
+                        continue  # A historical record cannot restore a unit rejected by revalidation.
                     step_alloc.pop(inc_uid, None)
                     spec = ALL_SIGNAL_SPECS[cand_sid]
                     ruler = ARCHETYPE_RULERS[spec.archetype]
@@ -791,6 +1114,8 @@ def main() -> None:
                 else:
                     sid = added_label.split("_")[0].strip()
                     uid = f"{sid}@{tf}"
+                    if uid not in zoo:
+                        continue
                     spec = ALL_SIGNAL_SPECS[sid]
                     ruler = ARCHETYPE_RULERS[spec.archetype]
                     same_dir_peers = {
@@ -899,6 +1224,7 @@ def main() -> None:
     gate_stats = {
         "Gate1_Rejected": 0,
         "Gate1B_Rejected": 0,
+        "Parameter_Rejected": 0,
         "Gate2_Rejected": 0,
         "Gate3_Rejected": 0,
         "Admitted": 0,
@@ -921,16 +1247,9 @@ def main() -> None:
             and int(info["direction"]) == spec.direction
         )
 
-        # --- 第一关：Gate 1 分方向专属标尺法医审计 (2020-2023 IS) ---
-        g1 = run_gate1_forensic_audit(
-            tf_dfs[tf],
-            trig_by_unit[unit_id],
-            spec.direction,
-            ruler,
-            tf,
-            rng,
-            weights_tf=weight_by_unit[unit_id],
-        )
+        # --- 正式准入：实际结构退出的完成交易与连续扣费账本 (IS) ---
+        audit = _audit_unit(sid, tf)
+        g1 = audit["execution"]
         if not g1["passed"]:
             gate_stats["Gate1_Rejected"] += 1
             ledger.bury_rejected_signal(
@@ -940,25 +1259,21 @@ def main() -> None:
                 f"{spec.name}@{tf}",
                 spec.archetype,
                 spec.direction,
-                failed_gate="Gate 1 (专属法医标尺关)",
+                failed_gate="Execution (实际结构退出交易关)",
                 reason=g1["reason"],
                 metrics=g1,
             )
             continue
 
         # --- 前置准入关：Pre-Admission Gate 1B 三级多标的分层池化普适审计 ---
-        g1b = evaluate_candidate_pooled_gate1b(
-            sid=sid,
-            tf=tf,
-            primary_symbol=symbol,
-            primary_g1=g1,
-            pool_tf_dfs=_ensure_pool_loaded(),
-            rng=rng,
-            allow_single_asset_degrade=True,
-            ledger=ledger,
-        )
+        g1b = audit["gate1b"]
         if not g1b["passed"]:
             gate_stats["Gate1B_Rejected"] += 1
+            _record_rejection(sid, tf, audit)
+            continue
+        if not audit["parameter_smoothness"]["passed"]:
+            gate_stats["Parameter_Rejected"] += 1
+            _record_rejection(sid, tf, audit)
             continue
 
         # --- 第二关：Gate 2 三维真互补门禁 (配额 + 低相关 + 空仓补盲 & 回撤雪中送炭) ---
@@ -1077,7 +1392,7 @@ def main() -> None:
             timeframe=tf,
             name=f"{spec.name}@{tf}",
             archetype=spec.archetype,
-            ruler_desc=ruler.ruler_name,
+            ruler_desc="实际结构执行（零仓基准）",
             direction=spec.direction,
             weight_alloc=best_trial_w,
             is_base_seed=False,
@@ -1097,6 +1412,7 @@ def main() -> None:
             oos_mean_pct=g1["oos_mean_pct"],
             oos_excess_alpha_pct=g1["oos_excess_alpha_pct"],
             oos_safety_margin_pct=g1["oos_safety_margin_pct"],
+            admission_audit=audit,
         )
         ledger.save_signal_to_zoo(admitted_rec)
         zoo = ledger.load_signal_zoo()
@@ -1138,17 +1454,17 @@ def main() -> None:
                 "战略方向": spec.archetype,
                 "周期": tf,
                 "IS独立样本": g1["is_n_purged"],
-                "IS超额Alpha": f"{g1['is_excess_alpha_pct']:+.2f}%",
+                "IS执行净收益": f"{g1['is_excess_alpha_pct']:+.2f}%",
                 "IS安全垫": f"{g1['is_safety_margin_pct']:+.1f}%",
                 "最大相关性": f"{g2['max_corr']:.2f}",
                 "空仓补盲率": f"{g2['gap_fill_ratio_pct']:.1f}%",
                 "雪中送炭Alpha": f"{g2['dd_rescue_alpha_bp']:+.1f}BP",
-                "OOS超额Alpha": f"{g1['oos_excess_alpha_pct']:+.2f}%",
+                "OOS执行净收益": f"{g1['oos_excess_alpha_pct']:+.2f}%",
             }
         )
         print(
             f"  [★ 晋升 Step {step_counter:02d}] [{spec.archetype} | {tf:3s}] {spec.name}@{tf} 入库! "
-            f"| IS_Alpha={g1['is_excess_alpha_pct']:+.2f}%, 相关性={g2['max_corr']:.2f}, 补盲={g2['gap_fill_ratio_pct']:.1f}%, 雪中送炭={g2['dd_rescue_alpha_bp']:+.1f}BP "
+            f"| IS执行净收益={g1['is_excess_alpha_pct']:+.2f}%, 相关性={g2['max_corr']:.2f}, 补盲={g2['gap_fill_ratio_pct']:.1f}%, 雪中送炭={g2['dd_rescue_alpha_bp']:+.1f}BP "
             f"-> 总笔数={curr_eval['full']['trades']}, 全周期={curr_eval['full']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['full']['sharpe']:.2f}), "
             f"样本外={curr_eval['oos']['cum_ret_pct']:+.2f}% (夏普 {curr_eval['oos']['sharpe']:.2f})"
         )
@@ -1244,28 +1560,10 @@ def main() -> None:
                 uid = f"{spec.sig_id}@{tf}"
                 if uid in zoo or uid in pruned_uids:
                     continue
-                g1 = run_gate1_forensic_audit(
-                    tf_dfs[tf],
-                    trig_by_unit[uid],
-                    spec.direction,
-                    ruler,
-                    tf,
-                    rng,
-                    weights_tf=weight_by_unit[uid],
-                )
-                if g1["passed"] and g1["is_n_purged"] >= 80:
-                    g1b = evaluate_candidate_pooled_gate1b(
-                        sid=spec.sig_id,
-                        tf=tf,
-                        primary_symbol=symbol,
-                        primary_g1=g1,
-                        pool_tf_dfs=_ensure_pool_loaded(),
-                        rng=rng,
-                        allow_single_asset_degrade=True,
-                        ledger=None,
-                    )
-                    if g1b["passed"]:
-                        challengers.append((uid, spec, tf, g1))
+                candidate_audit = _audit_unit(spec.sig_id, tf)
+                g1 = candidate_audit["execution"]
+                if candidate_audit["passed"] and g1["is_n_purged"] >= 80:
+                    challengers.append((uid, spec, tf, g1))
 
         # 按样本深度对数 × 样本内安全垫进行锦标赛种子排序 (完全无样本外信息泄露)
         challengers.sort(key=lambda x: np.log(x[3]["is_n_purged"]) * x[3]["is_safety_margin_pct"], reverse=True)
@@ -1273,6 +1571,7 @@ def main() -> None:
         for cand_uid, spec, tf, g1 in challengers:
             if cand_uid in zoo:
                 continue
+            candidate_audit = _audit_unit(spec.sig_id, tf)
             ruler = ARCHETYPE_RULERS[spec.archetype]
             arch_new_uids = [
                 u for u, inf in zoo.items() if inf["archetype"] == spec.archetype and not inf["is_base_seed"]
@@ -1336,7 +1635,7 @@ def main() -> None:
                         timeframe=tf,
                         name=f"{spec.name}@{tf}",
                         archetype=spec.archetype,
-                        ruler_desc=ruler.ruler_name,
+                        ruler_desc="实际结构执行（零仓基准）",
                         direction=spec.direction,
                         weight_alloc=best_cw,
                         is_base_seed=False,
@@ -1356,6 +1655,7 @@ def main() -> None:
                         oos_mean_pct=g1["oos_mean_pct"],
                         oos_excess_alpha_pct=g1["oos_excess_alpha_pct"],
                         oos_safety_margin_pct=g1["oos_safety_margin_pct"],
+                        admission_audit=candidate_audit,
                     )
                     ledger.save_signal_to_zoo(admitted_rec)
                     zoo = ledger.load_signal_zoo()
@@ -1467,7 +1767,7 @@ def main() -> None:
                         timeframe=tf,
                         name=f"{spec.name}@{tf}",
                         archetype=spec.archetype,
-                        ruler_desc=ruler.ruler_name,
+                        ruler_desc="实际结构执行（零仓基准）",
                         direction=spec.direction,
                         weight_alloc=best_cw,
                         is_base_seed=False,
@@ -1487,6 +1787,7 @@ def main() -> None:
                         oos_mean_pct=g1["oos_mean_pct"],
                         oos_excess_alpha_pct=g1["oos_excess_alpha_pct"],
                         oos_safety_margin_pct=g1["oos_safety_margin_pct"],
+                        admission_audit=candidate_audit,
                     )
                     ledger.save_signal_to_zoo(admitted_rec)
                     zoo = ledger.load_signal_zoo()
@@ -1544,33 +1845,16 @@ def main() -> None:
             h2_mask = is_mask
 
         def _prep_fast_slice(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-            sub = df_30m.iloc[mask].reset_index(drop=True)
-            c = sub["close"].values
-            r = np.zeros(len(c), dtype=np.float64)
-            r[:-1] = (c[1:] - c[:-1]) / c[:-1]
-            _, dids = np.unique(sub["dt"].dt.date.values, return_inverse=True)
-            return r, dids
+            from examples.alpha_mining_agent.forensic_pipeline import _prepare_next_open_slice
 
-        def _fast_slice_stats(close_ret: np.ndarray, day_ids: np.ndarray, w_slice: np.ndarray) -> dict[str, float]:
-            dw = np.abs(np.diff(w_slice, prepend=0.0))
-            bar_net = w_slice * close_ret - dw * 0.0002
-            daily_net = np.bincount(day_ids, weights=bar_net)
-            cum_ret = float(daily_net.sum() * 100.0)
-            n_years = len(daily_net) / 252.0
-            ann_ret = float(cum_ret / max(n_years, 1e-6))
-            std_d = float(daily_net.std(ddof=1))
-            sharpe = float((daily_net.mean() / std_d) * np.sqrt(252.0)) if std_d > 1e-12 else 0.0
-            curve = np.cumsum(daily_net)
-            peak = np.maximum.accumulate(np.maximum(curve, 0.0))
-            mdd = float((peak - curve).max() * 100.0)
-            calmar = float(ann_ret / mdd) if mdd > 1e-6 else 0.0
-            return {
-                "cum_ret_pct": cum_ret,
-                "ann_ret_pct": ann_ret,
-                "sharpe": sharpe,
-                "mdd_pct": mdd,
-                "calmar": calmar,
-            }
+            return _prepare_next_open_slice(df_30m.loc[mask].reset_index(drop=True))
+
+        def _fast_slice_stats(interval_ret: np.ndarray, day_ids: np.ndarray, w_slice: np.ndarray) -> dict[str, float]:
+            from examples.alpha_mining_agent.forensic_pipeline import _fast_next_open_slice_stats
+
+            return _fast_next_open_slice_stats(
+                interval_ret, day_ids, w_slice, fee_rate=float(df_30m.attrs.get("fee_rate", 0.0002))
+            )
 
         ret_is, dids_is = _prep_fast_slice(is_mask)
         ret_h1, dids_h1 = _prep_fast_slice(h1_mask)
@@ -1709,6 +1993,7 @@ def main() -> None:
         f"【一、四级漏斗筛选统计】 总检验原子候选: {len(atomic_candidates)} 个 -> "
         f"Gate1法医关淘汰: {gate_stats['Gate1_Rejected']} | "
         f"Gate1B分层池化关淘汰: {gate_stats['Gate1B_Rejected']} | "
+        f"参数平原淘汰: {gate_stats['Parameter_Rejected']} | "
         f"Gate2互补与配额关淘汰: {gate_stats['Gate2_Rejected']} | "
         f"Gate3组合边际关淘汰: {gate_stats['Gate3_Rejected']} | "
         f"★ 最终晋升入库: {gate_stats['Admitted']} 个"

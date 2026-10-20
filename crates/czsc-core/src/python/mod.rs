@@ -7,7 +7,9 @@
 //! 按 design doc §2.4 的 Pickle（`__getstate__` / `__setstate__`）将会
 //! 在 Phase E/F/G 落地后做一次后续提交，到时各类的 identity 测试可以充分覆盖它。
 
+use polars::prelude::{IpcReader, SerReader};
 use pyo3::prelude::*;
+use std::io::Cursor;
 
 use crate::analyze::CZSC;
 use crate::analyze::utils as analyze_utils;
@@ -25,7 +27,7 @@ use crate::objects::position::{PyLiteBar, PyPos, PyPosition};
 use crate::objects::signal::{PyParsedSignalDoc, PySignal, parse_signal_doc_py};
 use crate::objects::zs::ZS;
 use crate::utils::common::create_naive_pandas_timestamp;
-use pyo3::types::{PyDict, PyDictMethods};
+use pyo3::types::{PyBytes, PyDict, PyDictMethods};
 use pyo3_stub_gen::derive::gen_stub_pyfunction;
 mod structure_exit;
 
@@ -79,6 +81,24 @@ fn remove_include_py(k1: NewBar, k2: NewBar, k3: RawBar) -> PyResult<(bool, NewB
 #[pyo3(name = "format_standard_kline")]
 fn format_standard_kline_py(bars: Vec<RawBar>) -> Vec<RawBar> {
     bars
+}
+
+/// Convert an Arrow IPC research OHLCV file through the shared Rust boundary.
+/// freq accepts a Freq or its string name. volume aliases vol; absent amount is
+/// zero (unavailable), existing amounts are preserved, and IDs follow input order.
+/// Invalid columns, nulls, conflicting aliases and malformed OHLC raise ValueError.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn format_research_kline_bytes(
+    data: &Bound<'_, PyBytes>,
+    freq: &Bound<'_, PyAny>,
+) -> PyResult<Vec<RawBar>> {
+    let freq = Freq::try_from(freq)?;
+    let df = IpcReader::new(Cursor::new(data.as_bytes()))
+        .finish()
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    analyze_utils::format_research_kline(df, freq)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
 /// 将分型序列转换为虚拟笔；非法的非交替分型返回 ValueError。
@@ -155,6 +175,7 @@ fn check_gap_info_py(py: Python<'_>, bars: Vec<RawBar>) -> PyResult<Vec<Py<PyDic
 /// 隐藏在 `python` feature 后面，这样普通 Rust 消费者就不会传递性地引入 pyo3。
 pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     structure_exit::register(m)?;
+    crate::research_execution::register(m)?;
     // 枚举
     m.add_class::<Freq>()?;
     m.add_class::<Market>()?;
@@ -191,6 +212,7 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check_bi_py, m)?)?;
     m.add_function(wrap_pyfunction!(remove_include_py, m)?)?;
     m.add_function(wrap_pyfunction!(format_standard_kline_py, m)?)?;
+    m.add_function(wrap_pyfunction!(format_research_kline_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(create_fake_bis_py, m)?)?;
     m.add_function(wrap_pyfunction!(get_zs_seq_py, m)?)?;
     m.add_function(wrap_pyfunction!(is_symmetry_zs_py, m)?)?;

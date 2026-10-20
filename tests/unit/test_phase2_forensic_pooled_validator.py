@@ -42,6 +42,7 @@ from examples.multi_factor_cta.data_engine import (
     AssetClass,
     AssetSpec,
     CrossAssetDataEngine,
+    compute_causal_cross_sectional_features,
 )
 from examples.multi_factor_cta.forensic_validator import (
     RuleFactorForensicValidator,
@@ -127,6 +128,17 @@ def test_step1_intraday_causal_features_and_d01_d05_zero_lookahead(tmp_path: Pat
     t_cut = checkpoints[0]  # 早盘第 8 根 5m K 线 (15m/30m/60m/1d 均处于未完结半成品分组中)
     sub_tfs = load_all_four_timeframes(df_5m.iloc[:t_cut], symbol_name="159915", workspace_dir=tmp_path / "sub")
 
+    # F 类因子需要真实同时可见的截面；完整样本与前缀各自重新计算同一组同业行情。
+    full_pool = {"159915": full_tfs["5m"]}
+    prefix_pool = {"159915": sub_tfs["5m"]}
+    for seed in (18, 19, 20):
+        symbol = f"PEER{seed}"
+        peer = _make_mock_kline(symbol, freq="5分钟", sdt="20220101", edt="20220125", seed=seed)
+        full_pool[symbol] = peer
+        prefix_pool[symbol] = peer.iloc[:t_cut].copy()
+    for pool in (full_pool, prefix_pool):
+        compute_causal_cross_sectional_features(pool, specs=dict.fromkeys(pool, "equity"), tf="5m", attach_to_dfs=True)
+
     # 检查未完结高周期 K 线绝不会提前混入截断时刻 t_cut
     cut_dt = df_5m["dt"].iloc[t_cut - 1]
     for htf in ("15m", "30m", "60m", "1d"):
@@ -207,13 +219,13 @@ def test_step2_continuous_quality_weighted_gate1_and_mfe_mae_gate() -> None:
     low = df["low"].values.copy()
     open_p = df["open"].values.copy()
 
-    # 构造 36 个不重叠触发点：
+    # 构造 90 个不重叠触发点，保证强弱Q混合后有效样本数仍不少于30：
     # k%3 == 0: 高 Q (q=0.98) 触发止盈大赢
     # k%3 == 1: 低 Q (q=0.12) 时间屏障微赢 (+0.05%)
     # k%3 == 2: 极低 Q (q=0.05) 亏损 (-1.2%)
     triggers = np.zeros(n, dtype=bool)
     weights = np.zeros(n, dtype=np.float64)
-    trigger_indices = list(range(100, min(n - 30, 3700), 90))[:36]
+    trigger_indices = list(range(100, min(n - 30, 9000), 60))[:90]
 
     for k, idx in enumerate(trigger_indices):
         triggers[idx] = True
@@ -421,6 +433,8 @@ def test_step3_stratified_multi_asset_pooling_rejects_single_asset_overfit(
     ruler_b = ARCHETYPE_RULERS[ARCH_B]
 
     per_symbol_g1: dict[str, dict] = {}
+    normalized_audits: dict[str, dict] = {}
+    validator = RuleFactorForensicValidator(soft_gate=False)
     pool_tf_dfs: dict[str, dict[str, pd.DataFrame]] = {}
 
     for sym, raw_df in multi_asset_mock_pool.items():
@@ -433,7 +447,7 @@ def test_step3_stratified_multi_asset_pooling_rejects_single_asset_overfit(
 
         trig = np.zeros(n, dtype=bool)
         w = np.zeros(n, dtype=np.float64)
-        t_idxs = list(range(80, min(n - 25, 2800), 85))[:28]
+        t_idxs = list(range(80, min(n - 25, 4000), 85))[:36]
 
         for idx in t_idxs:
             trig[idx] = True
@@ -463,13 +477,16 @@ def test_step3_stratified_multi_asset_pooling_rejects_single_asset_overfit(
         df_sym = enrich_kline_features(df_sym, scale=1)
         pool_tf_dfs[sym] = {"30m": df_sym}
         per_symbol_g1[sym] = run_gate1_forensic_audit(df_sym, trig, 1, ruler_b, "30m", rng, weights_tf=w)
+        normalized_audits[sym] = validator.run_vol_and_regime_normalized_audit(
+            df_sym, trig, 1, ARCH_B, "30m", weights_tf=w
+        )
 
     # 确认在单标的 159915 上通过了 Gate 1
     assert per_symbol_g1["SZSE.159915"]["passed"] is True
 
     # 验证 Tier 2 (同质资产类别特征簇 B_背驰衰竭)：在 5 个宽基权益池中仅 1/5 = 20% 正期望 (< 75% 门槛)，被拦截
     g1b_tier2 = run_stratified_pooled_gate1b_audit(
-        per_symbol_gate1=per_symbol_g1,
+        asset_audits=normalized_audits,
         archetype=ARCH_B,
         timeframe="30m",
         allow_single_asset_degrade=False,
@@ -478,11 +495,11 @@ def test_step3_stratified_multi_asset_pooling_rejects_single_asset_overfit(
     assert g1b_tier2["pool_size"] == 5  # 仅在 5 个同质权益标的上池化，不混入商品
     assert g1b_tier2["universal_ratio"] == pytest.approx(0.20)
     assert g1b_tier2["passed"] is False
-    assert "Tier2(Equity-Pool)未达标" in g1b_tier2["reason"]
+    assert "普适率" in g1b_tier2["reason"]
 
     # 验证 Tier 1 (跨资产普适簇 A_趋势突破)：在 10 个跨资产标的中仅 1/10 = 10% 正期望 (< 60% 门槛)，被拦截
     g1b_tier1 = run_stratified_pooled_gate1b_audit(
-        per_symbol_gate1=per_symbol_g1,
+        asset_audits=normalized_audits,
         archetype=ARCH_A,
         timeframe="30m",
         allow_single_asset_degrade=False,
@@ -494,7 +511,7 @@ def test_step3_stratified_multi_asset_pooling_rejects_single_asset_overfit(
 
     # 验证 Tier 3 (微结构簇 D_量价筹码)：占比 < 70% 且扣费池化夏普 < 0，被拦截
     g1b_tier3 = run_stratified_pooled_gate1b_audit(
-        per_symbol_gate1=per_symbol_g1,
+        asset_audits=normalized_audits,
         archetype=ARCH_D,
         timeframe="15m",
         allow_single_asset_degrade=False,
@@ -513,7 +530,7 @@ def test_step3_stratified_multi_asset_pooling_rejects_single_asset_overfit(
         rng=rng,
         allow_single_asset_degrade=False,
         ledger=ledger,
-        per_symbol_gate1_overrides=per_symbol_g1,
+        per_symbol_gate1_overrides=normalized_audits,
     )
     assert g1b_loop["passed"] is False
     grave_records = ledger.load_graveyard_records()

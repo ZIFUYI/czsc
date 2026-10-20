@@ -7,8 +7,45 @@
 //! `rust-numpy`），否则所有 wrapper 都处于休眠状态。
 
 use pyo3::prelude::*;
+use pyo3_stub_gen::derive::gen_stub_pyfunction;
 
 use crate::{mixed, pure};
+
+/// Compute Wilder RSI for the close series using an explicit timeperiod.
+/// Returns one value per close. The first timeperiod values are NaN, flat prices
+/// yield zero, and gains without losses yield 100. Empty input returns an empty
+/// list; zero periods or insufficient history return NaN at every position.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn rsi(close: Vec<f64>, timeperiod: usize) -> Vec<f64> {
+    pure::rsi(&close, timeperiod)
+}
+
+/// Compute MACD with explicit fastperiod, slowperiod and signalperiod.
+/// Returns (dif, dea, histogram), each with one value per close and the same full
+/// warmup. EMAs use SMA seeds; histogram is dif-dea, not doubled. Empty input
+/// returns empty lists; zero periods or insufficient history produce NaN.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn macd(
+    close: Vec<f64>,
+    fastperiod: usize,
+    slowperiod: usize,
+    signalperiod: usize,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    pure::macd(&close, fastperiod, slowperiod, signalperiod)
+}
+
+/// Compute close-to-close on-balance volume, seeded with the first volume.
+/// Rising closes add volume, falling closes subtract it, and unchanged closes
+/// add zero. Both inputs must have equal length, otherwise ValueError is raised.
+/// Empty inputs return an empty list. Non-finite input poisons the current and
+/// remaining output with NaN; candle-body flow signals have a separate meaning.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn obv(close: Vec<f64>, volume: Vec<f64>) -> PyResult<Vec<f64>> {
+    pure::obv(&close, &volume).map_err(pyo3::exceptions::PyValueError::new_err)
+}
 
 #[pyfunction]
 fn ultimate_smoother(close: Vec<f64>, period: f64) -> Vec<f64> {
@@ -204,6 +241,9 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     add!(
+        rsi,
+        macd,
+        obv,
         ultimate_smoother,
         rolling_rank,
         sma,

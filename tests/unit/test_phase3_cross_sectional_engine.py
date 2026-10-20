@@ -6,14 +6,13 @@
    `sector_spread_zscore` 以及 `FC01~FC04` 因子，验证与全量计算的前 t 根结果严格一致（`np.allclose`）；
 2. 截面多空镜像对称审计（Mirror Symmetry Audit）：
    将全市场 8 个品种的价格同时做镜像翻转 P'_{i,t} = M_i - P_{i,t}，验证 `cs_slope_rank` 翻转为 1 - R_{i,t}，
-   `sector_leader_dir` 与 `sector_spread_zscore` 严格反号，且 `FC01~FC04` 的多空信号满足 S(P) ≈ -S(M(P))；
+   `sector_leader_dir` 与 `sector_spread_zscore` 严格反号，且 `FC01~FC04` 的触发条件、质量与结构止损逐侧对应；
 3. 连续 Sigmoid 软门控平滑性与防逼空验证：
    - 验证 `SoftCrossSectionalGate` 关于 R_{i,t} ∈ [0, 1] 单调、连续且可微（在 R=0.70 与 R=0.30 邻域微小扰动
      ΔR = 0.01 时门控输出无阶跃跳变，|Δg| < 0.05）；
-   - 构造“强单边逼空上涨龙头品种上出现假顶背驰”的测试场景，验证绑定软门控后 `B_背驰衰竭簇` 的逆势做空亏损
-     被大幅压降，跨商品池化正期望比例显著提升（无需硬编码 `wb = 0`）；
-4. `F` 簇新因子通过 Phase 2 法医检验闭环：
-   验证 `FC01~FC04`（及 `F01~F03` 别名）在多品种池上可正常通过 `RuleFactorRegistry` 与 `RuleFactorForensicValidator` 评估。
+   - 在实际 mock 价格路径上验证连续风险缩放保留全部触发事件，逆势做空亏损不会从准入样本中消失；
+4. `F` 簇新因子接通 Phase 2 法医检验闭环：
+   验证 `FC01~FC04`（及 `F01~F03` 别名）正常输出指标；mock 测试不证明经济准入通过。
 """
 
 from __future__ import annotations
@@ -40,8 +39,8 @@ from examples.multi_factor_cta.atomic_factors import (
     FactorContext,
     SoftCrossSectionalGate,
     compute_atomic_signal,
-    compute_family,
     set_factor_context,
+    two_stage_trigger,
 )
 from examples.multi_factor_cta.data_engine import (
     AssetClass,
@@ -55,7 +54,6 @@ from examples.multi_factor_cta.forensic_validator import (
     RuleFactorForensicValidator,
     run_stratified_pooled_gate1b_audit,
 )
-from examples.multi_factor_cta.synthesis_engine import IntraAssetThreePillarSynthesizer
 
 PRICE_COLS = ("open", "high", "low", "close")
 F_FAMILIES = ("FC01", "FC02", "FC03", "FC04")
@@ -278,7 +276,9 @@ def test_step2_cross_sectional_features_and_fc01_fc04_mirror_symmetry(
     将全市场 8 个品种的价格同时做镜像翻转 P'_{i,t} = M_i - P_{i,t}，验证：
     1. cs_slope_rank 翻转为 1 - R_{i,t}；
     2. sector_leader_dir、leader_lag_gap 与 sector_spread_zscore 严格反号；
-    3. FC01~FC04 的多空信号满足 S(P) ≈ -S(M(P))，且 L(P) ≈ -S_short(M(P))。
+    3. FC01~FC04 的 Setup、Confirmation、质量与结构止损逐侧镜像一致。
+
+    百分比跟踪止盈依赖价格分母，仿射镜像不保持百分比回撤；其两侧退出阈值由原生回归单独验证。
     """
     orig_30m, orig_60m = full_pool_built
     mirror_raw = {sym: _mirror_df(df) for sym, df in raw_pool_8.items()}
@@ -304,43 +304,42 @@ def test_step2_cross_sectional_features_and_fc01_fc04_mirror_symmetry(
             v_m = df_m[signed_col].to_numpy(dtype=np.float64)
             assert np.allclose(v_m, -v_p, atol=1e-11), f"{sym} {signed_col} 在价格镜像下未严格反号"
 
-    # 3) 验证 FC01~FC04 在 8 品种池上的多空信号满足 S(P) ≈ -S(M(P))
-    for fam in F_FAMILIES:
-        all_p = []
-        all_m = []
-        all_l_p = []
-        all_s_m = []
-        for sym in ALL_8_SYMBOLS:
-            ctx_p = FactorContext.from_df(orig_30m[sym], orig_60m[sym])
-            ctx_m = FactorContext.from_df(mirror_30m[sym], mirror_60m[sym])
-            s_p, _ = compute_family(ctx_p, fam)
-            s_m, _ = compute_family(ctx_m, fam)
-            all_p.append(s_p)
-            all_m.append(s_m)
-
-            # 同时验证单向因子 L(P) 与 S(M(P)) 严格镜像反号
-            _, w_l_p = compute_atomic_signal(orig_30m[sym], f"{fam}L")
-            _, w_s_m = compute_atomic_signal(mirror_30m[sym], f"{fam}S")
-            all_l_p.append(w_l_p)
-            all_s_m.append(w_s_m)
-            act_ls = (w_l_p != 0.0) | (w_s_m != 0.0)
-            if np.any(act_ls):
-                assert np.mean(np.abs(w_l_p[act_ls] + w_s_m[act_ls]) <= 0.03) >= 0.96
-
-        vec_l_p = np.concatenate(all_l_p)
-        vec_s_m = np.concatenate(all_s_m)
-        act_pool_ls = (vec_l_p != 0.0) | (vec_s_m != 0.0)
-        assert float(np.mean(np.abs(vec_l_p[act_pool_ls] + vec_s_m[act_pool_ls]) <= 0.03)) >= 0.99
-
-        vec_p = np.concatenate(all_p)
-        vec_m = np.concatenate(all_m)
-        active = (vec_p != 0.0) | (vec_m != 0.0)
-        assert int(active.sum()) >= 50, f"{fam} 在 8 品种池上激活样本应充足"
-        diff = np.abs(vec_p + vec_m)
-        assert float(np.mean(diff[active] <= 0.03)) >= 0.995, (
-            f"{fam} 跨品种池镜像对称率不足: {np.mean(diff[active] <= 0.03):.4f}"
+    # 3) Check the symmetric setup/confirmation rule and structural invalidation itself.
+    # Percentage trailing risk is intentionally tested with percentage paths in native tests.
+    contexts = {
+        sym: (
+            FactorContext.from_df(orig_30m[sym], orig_60m[sym]),
+            FactorContext.from_df(mirror_30m[sym], mirror_60m[sym]),
         )
-        assert float(np.mean(np.sign(vec_p[active]) == -np.sign(vec_m[active]))) >= 0.995
+        for sym in ALL_8_SYMBOLS
+    }
+    for fam in F_FAMILIES:
+        definition = ATOMIC_FACTOR_DEFS[fam]
+        candidates = 0
+        for symbol, (ctx_p, ctx_m) in contexts.items():
+            np.testing.assert_array_equal(ctx_p.bi_flip, -ctx_m.bi_flip)
+            anchors_p = ctx_p.structure_anchors[definition.archetype]
+            anchors_m = ctx_m.structure_anchors[definition.archetype]
+            for side in (1, -1):
+                setup_p, sq_p, confirm_p, cq_p, window_p = definition.build(ctx_p, side)
+                setup_m, sq_m, confirm_m, cq_m, window_m = definition.build(ctx_m, -side)
+                assert window_p == window_m
+                np.testing.assert_array_equal(setup_p, setup_m, err_msg=f"{fam} {symbol} {side}: setup")
+                np.testing.assert_array_equal(confirm_p, confirm_m, err_msg=f"{fam} {symbol} {side}: confirm")
+                np.testing.assert_allclose(sq_p[setup_p], sq_m[setup_m], atol=0.011)
+                np.testing.assert_allclose(cq_p[confirm_p], cq_m[confirm_m], atol=0.011)
+                fire_p, q_p = two_stage_trigger(setup_p, sq_p, confirm_p, cq_p, window_p)
+                fire_m, q_m = two_stage_trigger(setup_m, sq_m, confirm_m, cq_m, window_m)
+                np.testing.assert_array_equal(fire_p, fire_m)
+                np.testing.assert_allclose(q_p[fire_p], q_m[fire_m], atol=0.011)
+                candidates += int(fire_p.sum())
+                key_p, key_m = ("long_stop", "short_stop") if side > 0 else ("short_stop", "long_stop")
+                np.testing.assert_allclose(
+                    side * (ctx_p.c - np.asarray(anchors_p[key_p])),
+                    -side * (ctx_m.c - np.asarray(anchors_m[key_m])),
+                    atol=1e-9,
+                )
+        assert candidates >= 50, f"{fam} 在 8 品种池上应有足够的镜像候选"
 
 
 # ===========================================================================
@@ -396,156 +395,64 @@ def test_step3_soft_cross_sectional_gate_smoothness_and_monotonicity() -> None:
     assert g_c_trend_top < 0.08
 
 
-def test_step3_soft_gate_prevents_short_squeeze_on_bull_leaders(
+def test_step3_soft_gate_scales_risk_without_deleting_events(
     raw_pool_8: dict[str, pd.DataFrame],
     specs_8: dict[str, AssetSpec],
 ) -> None:
-    """
-    构造“强单边逼空上涨龙头品种上出现假顶背驰”的测试场景：
-    - 8 个商品品种中，2 个龙头品种 (SHFE.RB9999, SHFE.CU9999) 处于强单边逼空主升浪 (R_{i,t} > 0.85)，
-      期间频繁出现假顶背驰信号，若不加软门控直接逆势做空将遭遇严重逼空亏损；
-    - 其余 6 个品种在各自震荡/弱势区间 (R_{i,t} <= 0.60) 出现顶背驰做空信号均能稳定获利；
-    - 验证绑定 SoftCrossSectionalGate 后：
-      1) 龙头品种上的逆势摸顶做空亏损被压降 > 85%；
-      2) 跨商品池化正期望比例 (universal_ratio) 从未达标提升至 >= 75%，顺利通过 Tier 2 Gate 1B；
-      3) IntraAssetThreePillarSynthesizer 无需硬编码 `wb = 0`，即可在保留震荡品种反转正收益的同时防御逼空龙头亏损。
-    """
-    squeeze_leaders = {"SHFE.RB9999", "SHFE.CU9999"}
-    pool_dfs: dict[str, pd.DataFrame] = {}
-    triggers_by_sym: dict[str, np.ndarray] = {}
-    weights_by_sym: dict[str, np.ndarray] = {}
-
-    for sym_idx, sym in enumerate(ALL_8_SYMBOLS):
-        df = raw_pool_8[sym].copy()
+    """Continuous sizing retains adverse events; generated data cannot certify profitable admission."""
+    pool = {}
+    for symbol, raw in raw_pool_8.items():
+        df = raw.copy()
         df["date"] = df["dt"].dt.date
-        n = len(df)
-        c = df["close"].to_numpy(dtype=np.float64).copy()
-        o = df["open"].to_numpy(dtype=np.float64).copy()
-        h = df["high"].to_numpy(dtype=np.float64).copy()
-        low_arr = df["low"].to_numpy(dtype=np.float64).copy()
-
-        trig = np.zeros(n, dtype=bool)
-        w_b = np.zeros(n, dtype=np.float64)
-        event_bars = list(range(120, min(n - 35, 1400), 65))[:18]
-
-        for k, idx in enumerate(event_bars):
-            trig[idx] = True
-            w_b[idx : idx + 6] = -0.85  # B 簇空头反转信号
-            p0 = c[idx - 20]
-            if sym in squeeze_leaders and k < 14:
-                # 强单边逼空上涨：前 20 根持续大涨使截面排名稳居全市场 Top，触发假顶背驰后继续逼空暴涨 20 根 (做空大亏)
-                for pre in range(-20, 1):
-                    pos_i = idx + pre
-                    boost = p0 * (1.0 + 0.0045 * (pre + 20))
-                    c[pos_i] = boost
-                    o[pos_i] = boost * 0.998
-                    h[pos_i] = boost * 1.003
-                    low_arr[pos_i] = boost * 0.996
-                p_trig = c[idx]
-                for step in range(1, 22):
-                    squeeze_p = p_trig * (1.0 + 0.006 * step)
-                    c[idx + step] = squeeze_p
-                    o[idx + step] = p_trig if step == 1 else squeeze_p * 0.998
-                    h[idx + step] = squeeze_p * 1.004
-                    low_arr[idx + step] = p_trig * 0.999 if step == 1 else squeeze_p * 0.995
-            else:
-                # 中庸/弱势区真顶背驰：前 20 根温和走弱使截面排名回落至中低位，触发顶背驰后顺利下跌 20 根止盈 (做空盈利)
-                pullback_rate = 0.0020 if sym in squeeze_leaders else 0.0008 * (1 + 0.1 * (sym_idx % 3))
-                for pre in range(-20, 1):
-                    pos_i = idx + pre
-                    mild = p0 * (1.0 - pullback_rate * (pre + 20))
-                    c[pos_i] = mild
-                    o[pos_i] = mild * 1.001
-                    h[pos_i] = mild * 1.002
-                    low_arr[pos_i] = mild * 0.998
-                p_trig = c[idx]
-                for step in range(1, 22):
-                    drop_p = p_trig * (1.0 - 0.0055 * step)
-                    c[idx + step] = drop_p
-                    o[idx + step] = p_trig if step == 1 else drop_p * 1.001
-                    h[idx + step] = p_trig * 1.0005 if step == 1 else drop_p * 1.002
-                    low_arr[idx + step] = drop_p * 0.996
-
-        df["open"] = o
-        df["high"] = h
-        df["low"] = low_arr
-        df["close"] = c
-        df = enrich_kline_features(df, scale=1.0)
-        pool_dfs[sym] = df
-        triggers_by_sym[sym] = trig
-        weights_by_sym[sym] = w_b
-
-    # 计算并挂载 8 品种零前视截面特征
-    cs_pool = compute_causal_cross_sectional_features(
-        pool_dfs, specs=specs_8, tf="30m", slope_window=15, attach_to_dfs=True
-    )
+        pool[symbol] = enrich_kline_features(df)
+    cs_pool = compute_causal_cross_sectional_features(pool, specs=specs_8, tf="30m")
+    gate = SoftCrossSectionalGate()
+    triggers_by_sym, plain_weights, gated_weights = {}, {}, {}
+    adverse_events = 0
+    for symbol, df in cs_pool.items():
+        triggers = np.arange(len(df)) % 17 == 0
+        weights = -triggers.astype(float)
+        rank = df["cs_slope_rank"].to_numpy()
+        er = gate.extract_causal_er(df)
+        gated_triggers, gated = gate.apply_to_triggers_and_weights(triggers, weights, rank, er, ARCH_B, -1)
+        np.testing.assert_array_equal(gated_triggers, triggers)
+        np.testing.assert_allclose(gated, weights * gate.gate_b_short(rank))
+        assert np.all(np.abs(gated) <= np.abs(weights))
+        # Evaluate the same adverse realized moves after sizing; losses are reduced, never erased.
+        next_return = df["close"].pct_change().shift(-1).fillna(0).to_numpy()
+        adverse = triggers & (next_return > 0) & (rank > 0.8)
+        adverse_events += int(adverse.sum())
+        assert np.all(gated[adverse] * next_return[adverse] < 0)
+        assert np.all(gated[adverse] * next_return[adverse] > weights[adverse] * next_return[adverse])
+        triggers_by_sym[symbol] = triggers
+        plain_weights[symbol] = weights
+        gated_weights[symbol] = gated
+    assert adverse_events > 0, "fixture must contain actual adverse high-rank short events"
 
     validator = RuleFactorForensicValidator()
-
-    # 对比 1：禁用软门控 (soft_gate=False) 时，逼空龙头品种严重亏损，拉低池化表现
-    ungated_res = validator.run_stratified_pooled_gate1b_audit(
+    plain = validator.run_stratified_pooled_gate1b_audit(
         archetype=ARCH_B,
         timeframe="30m",
         pool_tf_dfs=cs_pool,
         triggers_by_symbol=triggers_by_sym,
-        weights_by_symbol=weights_by_sym,
+        weights_by_symbol=plain_weights,
         direction=-1,
         target_pool_group="commodity",
         soft_gate=False,
     )
-    # 对比 2：启用连续 Sigmoid 软门控 (soft_gate=True)
-    gated_res = validator.run_stratified_pooled_gate1b_audit(
+    gated = validator.run_stratified_pooled_gate1b_audit(
         archetype=ARCH_B,
         timeframe="30m",
         pool_tf_dfs=cs_pool,
         triggers_by_symbol=triggers_by_sym,
-        weights_by_symbol=weights_by_sym,
+        weights_by_symbol=gated_weights,
         direction=-1,
         target_pool_group="commodity",
-        soft_gate=True,
+        soft_gate=False,
     )
-
-    for leader_sym in squeeze_leaders:
-        loss_ungated = ungated_res["per_asset_audits"][leader_sym]["raw_mean_pct"]
-        r_atr_ungated = ungated_res["per_asset_audits"][leader_sym]["norm_r_atr"]
-        ret_gated = gated_res["per_asset_audits"][leader_sym]["raw_mean_pct"]
-        r_atr_gated = gated_res["per_asset_audits"][leader_sym]["norm_r_atr"]
-        assert loss_ungated < -0.35 and r_atr_ungated < -0.40, f"{leader_sym} 未门控时应体现逼空重亏"
-        assert ret_gated > 0.0 and r_atr_gated > 0.50, (
-            f"{leader_sym} 绑定软门控后逆势逼空触发被压制，期望应转正 (实际={ret_gated}, r_atr={r_atr_gated})"
-        )
-
-    assert gated_res["universal_ratio"] > ungated_res["universal_ratio"]
-    assert gated_res["universal_ratio"] >= 0.85
-    assert gated_res["passed"] is True
-
-    # 对比 3：验证 IntraAssetThreePillarSynthesizer 使用 SoftCrossSectionalGate 替代硬编码 wb=0
-    synth = IntraAssetThreePillarSynthesizer()
-    leader_df = cs_pool["SHFE.RB9999"]
-    weak_df = cs_pool["DCE.JM9999"]
-
-    w_synth_leader = synth.synthesize(
-        leader_df,
-        unit_weights_on_grid={"BC01S@30m": weights_by_sym["SHFE.RB9999"]},
-        unit_alloc_map={"BC01S@30m": 0.50},
-        asset_spec=specs_8["SHFE.RB9999"],
-        rebalance_deadzone=0.01,
-    )
-    w_synth_weak = synth.synthesize(
-        weak_df,
-        unit_weights_on_grid={"BC01S@30m": weights_by_sym["DCE.JM9999"]},
-        unit_alloc_map={"BC01S@30m": 0.50},
-        asset_spec=specs_8["DCE.JM9999"],
-        rebalance_deadzone=0.01,
-    )
-    # 在弱势/中庸品种触发窗口上 B 簇信号得以保留（非全 0），而在强逼空龙头品种的 14 次逼空窗口上空头敞口被大幅压降
-    squeeze_act_mask = np.zeros(len(leader_df), dtype=bool)
-    for idx in list(range(120, min(len(leader_df) - 35, 1400), 65))[:14]:
-        squeeze_act_mask[idx : idx + 6] = True
-    assert float(np.mean(np.abs(w_synth_weak[squeeze_act_mask]))) > 0.025
-    assert float(np.mean(np.abs(w_synth_leader[squeeze_act_mask]))) < (
-        float(np.mean(np.abs(w_synth_weak[squeeze_act_mask]))) * 0.30
-    )
+    assert set(plain["per_asset_audits"]) == set(gated["per_asset_audits"]) == set(cs_pool)
+    for symbol in cs_pool:
+        assert plain["per_asset_audits"][symbol]["is_n_purged"] == gated["per_asset_audits"][symbol]["is_n_purged"]
 
 
 # ===========================================================================
@@ -554,7 +461,7 @@ def test_step3_soft_gate_prevents_short_squeeze_on_bull_leaders(
 def test_step4_f_cluster_factors_forensic_validation_loop(
     full_pool_built: tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]],
 ) -> None:
-    """验证 FC01~FC04（含 F01~F03 别名）在多品种池上正常通过 RuleFactorRegistry 与 RuleFactorForensicValidator。"""
+    """验证 FC01~FC04（含 F01~F03 别名）与评价接口接通，不要求随机样本通过经济准入。"""
     cs_pool_30m, _ = full_pool_built
     registry = RuleFactorRegistry()
     validator = RuleFactorForensicValidator()
@@ -598,7 +505,7 @@ def test_step4_f_cluster_factors_forensic_validation_loop(
             triggers_by_symbol=trig_by_sym,
             weights_by_symbol=w_by_sym,
             direction=1,
-            soft_gate=True,
+            soft_gate=False,  # Registry has already applied the gate exactly once.
         )
         assert pooled_audit["pool_tier"] == "Tier1_CrossAsset"
         assert "universal_ratio" in pooled_audit and "pooled_t_stat" in pooled_audit

@@ -36,6 +36,11 @@
 pub use czsc_core::analyze;
 pub use czsc_core::error_chain;
 pub use czsc_core::objects;
+pub use czsc_core::research_execution::{
+    ClosedExecutionIntervals, ExecutionEpisode, ExecutionLedger, closed_execution_intervals,
+    decision_execution_ledger, decision_interval_ledger, executed_weight_ledger,
+    execution_episodes, execution_ledger, execution_net_returns, standardize_execution_returns,
+};
 pub use czsc_core::structure_exit::{
     StructureFactorConfig, StructureFactorInput, StructureFactorResult, StructureSnapshot,
     StructureStopAnchors, evaluate_structure_decay, evaluate_structure_factor, structure_snapshots,
@@ -72,7 +77,8 @@ pub use czsc_trader::strategy::{JsonStrategy, Strategy, unique_signals_across};
 // ── 顶层 re-export：常用类型直接挂在 czsc::* ────────────────────────────────
 pub use czsc_core::analyze::CZSC;
 pub use czsc_core::analyze::utils::{
-    GapInfo, check_gap_info, get_zs_seq, is_bis_down, is_bis_up, is_symmetry_zs,
+    GapInfo, check_gap_info, format_research_kline, get_zs_seq, is_bis_down, is_bis_up,
+    is_symmetry_zs,
 };
 pub use czsc_core::objects::{
     bar::{NewBar, RawBar, Symbol},

@@ -1,25 +1,7 @@
-"""Issue #7 · [Architecture][Phase 4] 组合动态合成与风险预算闭环专项单元测试。
+"""Phase 4 engineering tests: rolling causality, signed exposure and full cost accounting.
 
-完整覆盖 Phase 4 五大核心工程验收项（测试数据统一来自 `czsc.mock.generate_symbol_kines`）：
-1. `test_step1_rolling_empirical_bayes_zero_lookahead_and_shrinkage`:
-   验证 `RollingEmpiricalBayesWeighter` / `compute_rolling_empirical_bayes_weights` 在 λ_prior = 0.70 下的先验锚定性质，
-   以及在任意 t_cut 截断前后的严格零前视一致性（最大绝对误差 < 1e-12），同时验证旧接口向后兼容；
-2. `test_step2_gram_schmidt_six_cluster_orthogonality`:
-   构造存在明显共线性的六大簇合成输入信号（`ARCH_A` ~ `ARCH_F`），验证经 `gram_schmidt_cluster_orthogonalize`
-   及 `IntraAssetThreePillarSynthesizer.synthesize_cluster_orthogonals` 处理后，任意两簇正交化信号之间的相关系数
-   （含全样本相关与激活态并集相关）严格满足 |ρ_{m,n}| < 0.25，且主基向量 `ARCH_A` 保持完整趋势形态；
-3. `test_step3_continuous_state_machine_hysteresis_and_cs_tilt`:
-   验证 `ContinuousSignalStateMachine` 的非对称进出场滞回门限与调仓死区将高频微幅抖动换手率降低 > 40%，
-   同时在方向反转或触发清仓门限时零延迟执行；验证 `apply_cross_sectional_budget_tilt` 严格保持原多空符号不变，
-   且多头在截面龙头（R^{strength} > 0）上获得更高预算、空头在截面弱势品种（R^{strength} < 0）上获得更高预算；
-4. `test_step4_dynamic_active_pool_eliminates_cash_drag`:
-   构造 8 品种跨板块组合（任意时刻仅 3~4 个品种有活跃信号，其余品种空仓静默），对比静态 1/N_total 分配与
-   动态活跃池 1/N_active + 因果逆波动率 + Sector HRP 分配，验证动态活跃池在严守单品种权重上限 <= 0.35 的同时，
-   显著消除空仓品种造成的现金拖累，提升有效资金利用率与夏普比率；
-5. `test_step5_end_to_end_multi_asset_portfolio_10bp_stress_audit`:
-   在多品种数据集上运行从原子信号 + F 簇截面信号 -> 软空间门控 -> 滚动经验贝叶斯配权 -> 施密特六簇正交合成
-   -> 滞回状态机 -> 截面预算倾斜 -> 动态活跃池 HRP 组合的端到端流水线，验证在双边 10 BP (0.10%) 严苛冲击成本下，
-   样本内（IS）与样本外（OOS）组合净夏普比率稳健为正且最大回撤受控。
+Mock prices test deterministic behavior only. Profitability, PnL decorrelation and
+10 BP economic acceptance require the separately declared real-data OOS study.
 """
 
 from __future__ import annotations
@@ -31,7 +13,6 @@ import pandas as pd
 import pytest
 
 from czsc.mock import generate_symbol_kines
-from examples.alpha_mining_agent.forensic_pipeline import compute_active_union_correlation
 from examples.alpha_mining_agent.hypothesis_bank import (
     ALL_ARCHETYPES,
     ARCH_A,
@@ -44,7 +25,6 @@ from examples.alpha_mining_agent.hypothesis_bank import (
     enrich_kline_features,
 )
 from examples.multi_factor_cta.atomic_factors import (
-    SoftCrossSectionalGate,
     compute_atomic_signal,
     set_factor_context,
 )
@@ -66,6 +46,7 @@ from examples.multi_factor_cta.synthesis_engine import (
     IntraAssetSixClusterSynthesizer,
     IntraAssetThreePillarSynthesizer,
     apply_cross_sectional_budget_tilt,
+    build_asset_execution_inputs,
     gram_schmidt_cluster_orthogonalize,
 )
 
@@ -236,14 +217,7 @@ def test_step1_rolling_empirical_bayes_zero_lookahead_and_shrinkage(
 # Step 2: 六簇二级分层合成与跨簇施密特残差正交验证
 # ===========================================================================
 def test_step2_gram_schmidt_six_cluster_orthogonality() -> None:
-    """
-    构造存在明显共线性的六大簇合成输入信号（ARCH_A ~ ARCH_F），验证：
-    1. 正交化前多簇之间存在显著共线性（|ρ| > 0.65）；
-    2. 经 `gram_schmidt_cluster_orthogonalize` 及 `IntraAssetThreePillarSynthesizer.synthesize_cluster_orthogonals`
-       处理后，任意两簇正交化信号之间的全样本相关系数与激活态并集相关系数均严格满足 |ρ_{m,n}| < 0.25；
-    3. 主基向量 `ARCH_A` 保持完整趋势形态（与原始 S^(A) 相关系数 > 0.999）；
-    4. 因果滚动窗口模式 (`causal_window=120`) 同样满足零前视截断不变性与正交性约束。
-    """
+    """Default and explicit rolling windows preserve every historical prefix."""
     df_grid = _generate_mock_30m("SHFE.CU9999", seed=402)
     n = len(df_grid)
     rng = np.random.default_rng(77)
@@ -280,18 +254,11 @@ def test_step2_gram_schmidt_six_cluster_orthogonality() -> None:
     assert np.allclose(ortho[ARCH_A], collinear_clusters[ARCH_A], atol=1e-12)
     assert float(np.corrcoef(ortho[ARCH_A], collinear_clusters[ARCH_A])[0, 1]) > 0.9999
 
-    # 验证任意两簇之间的全样本相关系数与激活态并集相关系数均严格 < 0.25
+    # Causal rolling residuals cannot promise an ex-post global correlation bound.
     arch_list = list(ALL_ARCHETYPES)
-    for i in range(len(arch_list)):
-        u_m = ortho[arch_list[i]]
-        assert np.all((u_m >= -1.0 - 1e-12) & (u_m <= 1.0 + 1e-12))
-        assert float(np.std(u_m)) > 0.05, f"{arch_list[i]} 正交残差不应退化为全 0"
-        for j in range(i + 1, len(arch_list)):
-            u_n = ortho[arch_list[j]]
-            full_corr = abs(float(np.corrcoef(u_m, u_n)[0, 1]))
-            act_corr = abs(float(compute_active_union_correlation(u_m, u_n, eps=1e-3, min_active_bars=30)))
-            assert full_corr < 0.25, f"{arch_list[i]} vs {arch_list[j]} 全样本相关={full_corr:.4f} >= 0.25"
-            assert act_corr < 0.25, f"{arch_list[i]} vs {arch_list[j]} 激活并集相关={act_corr:.4f} >= 0.25"
+    for arch in arch_list:
+        assert np.isfinite(ortho[arch]).all()
+        assert np.max(np.abs(ortho[arch])) <= 1.0
 
     # 2) 验证 IntraAssetThreePillarSynthesizer / IntraAssetSixClusterSynthesizer.synthesize_cluster_orthogonals
     spec = _build_8_asset_specs()["SHFE.CU9999"]
@@ -316,10 +283,17 @@ def test_step2_gram_schmidt_six_cluster_orthogonality() -> None:
     )
     assert len(w_synth) == n
     assert np.all((w_synth >= -1.0) & (w_synth <= 1.0))
-    for i in range(len(arch_list)):
-        for j in range(i + 1, len(arch_list)):
-            c_ij = abs(float(np.corrcoef(ortho_from_synth[arch_list[i]], ortho_from_synth[arch_list[j]])[0, 1]))
-            assert c_ij < 0.25
+    cut = 360
+    prefix_w, prefix_ortho = synth.synthesize_cluster_orthogonals(
+        df_grid=df_grid.iloc[:cut].copy(),
+        unit_weights_on_grid={k: v[:cut] for k, v in unit_weights_on_grid.items()},
+        unit_alloc_map=unit_alloc,
+        asset_spec=spec,
+        soft_gate=False,
+    )
+    np.testing.assert_allclose(w_synth[:cut], prefix_w, atol=1e-12)
+    for arch in arch_list:
+        np.testing.assert_allclose(ortho_from_synth[arch][:cut], prefix_ortho[arch], atol=1e-12)
 
     # 3) 验证因果滚动窗口正交化模式 (causal_window=120) 的零前视截断不变性
     ortho_causal_full = gram_schmidt_cluster_orthogonalize(collinear_clusters, causal_window=120)
@@ -448,8 +422,8 @@ def test_step4_dynamic_active_pool_eliminates_cash_drag() -> None:
         vol_scale = 0.008 if sym in BLACK_SECTOR_SYMBOLS else 0.011
         centered_noise = (raw_r - np.mean(raw_r)) / max(np.std(raw_r), 1e-6) * vol_scale
         act_col = active_matrix[:, idx]
-        # 激活期具备正期望 Alpha，未激活期严格空仓 (0 收益)
-        strat_ret = np.where(act_col > 0.0, 0.0012 + centered_noise, 0.0)
+        # Raw price moves are independent of activation; no invented alpha term.
+        strat_ret = centered_noise
         cs_str = np.where(act_col > 0.0, 0.55 + 0.25 * rng.random(n_days), -0.30)
 
         daily_returns[sym] = pd.Series(strat_ret, index=dates)
@@ -466,6 +440,9 @@ def test_step4_dynamic_active_pool_eliminates_cash_drag() -> None:
         asset_sectors=asset_sectors,
         asset_positions_df=daily_positions,
         asset_cs_strength_df=daily_cs_strength,
+        asset_fee_rates=dict.fromkeys(ALL_8_SYMBOLS, 0.0002),
+        returns_kind="price",
+        positions_timing="close",
     )
 
     # 1) 验证单品种权重上限严格 <= 0.35
@@ -485,30 +462,20 @@ def test_step4_dynamic_active_pool_eliminates_cash_drag() -> None:
     assert float(res_dyn["n_active_series"].loc[single_active_dt]) == 1.0
     assert float(unscaled_w_df.loc[single_active_dt].sum()) == pytest.approx(1.0 / 3.0, abs=1e-6)
 
-    # 3) 验证有效资金利用率相比静态 1/N_total 提升 > 2 倍，且组合收益与夏普显著提升
+    # 3) Compare utilization only; mock returns cannot certify higher performance.
     assert res_dyn["static_active_capital_utilization_ratio"] < 0.46  # (3.5 / 8 = 0.4375)
     assert res_dyn["active_capital_utilization_ratio"] > 0.95
     assert res_dyn["utilization_lift_ratio"] > 2.0
-    assert res_dyn["full"]["cum_ret_pct"] > res_dyn["eq_full"]["cum_ret_pct"] * 1.5
-    assert res_dyn["full"]["sharpe"] >= res_dyn["eq_full"]["sharpe"]
+    assert (res_dyn["cost_returns_df"] >= 0.0).all().all()
+    assert np.isfinite(res_dyn["daily_returns"]).all()
 
 
 # ===========================================================================
-# Step 5: 多品种端到端流水线 + 双边 10 BP 严苛冲击成本压力审计
+# Step 5: 多品种端到端流水线 + 单边 10 BP 冲击成本压力审计
 # ===========================================================================
 def test_step5_end_to_end_multi_asset_portfolio_10bp_stress_audit(tmp_path: Path) -> None:
-    """
-    在 8 品种跨板块数据集上运行完整 Phase 1 ~ Phase 4 端到端闭环流水线：
-    原子信号 (ARCH_A ~ ARCH_E) + F 簇截面共振信号 (FC01~FC04)
-      -> SoftCrossSectionalGate 连续软门控
-      -> RollingEmpiricalBayesWeighter 滚动经验贝叶斯配权
-      -> IntraAssetSixClusterSynthesizer 施密特六簇正交合成
-      -> ContinuousSignalStateMachine 滞回状态机
-      -> apply_cross_sectional_budget_tilt 截面强弱预算倾斜
-      -> DynamicActivePoolAllocator 动态活跃池三层 HRP 组合
-    验证在双边 10 BP (0.10%) 严苛交易摩擦压力测试下，样本内 (IS) 与样本外 (OOS) 组合净夏普比率稳健为正且最大回撤受控。
-    """
-    stress_fee_rate = 0.0010  # 双边 10 BP (0.10%) 严苛冲击成本
+    """Exercise the multi-asset pipeline and assert 10 BP costs, not mock alpha."""
+    stress_fee_rate = 0.0010  # 单边 10 BP (0.10%)，每笔实际成交名义额计费
     specs = _build_8_asset_specs(fee_rate=stress_fee_rate)
     is_end_dt = pd.Timestamp("2022-03-01 23:59:59")
 
@@ -562,7 +529,6 @@ def test_step5_end_to_end_multi_asset_portfolio_10bp_stress_audit(tmp_path: Path
         set_factor_context(cs_dfs_30m[sym], htf=dfs_60m[sym])
 
     synthesizer = IntraAssetSixClusterSynthesizer()
-    soft_gate = SoftCrossSectionalGate()
     state_machine = ContinuousSignalStateMachine(
         entry_threshold=0.08,
         exit_threshold=0.03,
@@ -585,13 +551,6 @@ def test_step5_end_to_end_multi_asset_portfolio_10bp_stress_audit(tmp_path: Path
     for sym in ALL_8_SYMBOLS:
         df_sym = cs_dfs_30m[sym]
         n = len(df_sym)
-        close_arr = df_sym["close"].to_numpy(dtype=np.float64)
-        # 因果趋势顺势组件与多簇原子信号融合
-        ma20 = df_sym["ma20"].bfill().to_numpy(dtype=np.float64)
-        ma60 = df_sym["ma60"].bfill().to_numpy(dtype=np.float64)
-        atr = np.maximum(df_sym["atr14"].bfill().to_numpy(dtype=np.float64), 1e-4)
-        causal_trend = np.tanh((ma20 - ma60) / (1.5 * atr))
-
         unit_weights_on_grid: dict[str, np.ndarray] = {}
         prior_map: dict[str, float] = {}
         for fam in selected_families:
@@ -603,10 +562,6 @@ def test_step5_end_to_end_multi_asset_portfolio_10bp_stress_audit(tmp_path: Path
             unit_weights_on_grid[uid_s] = w_s
             prior_map[uid_l] = 0.35
             prior_map[uid_s] = 0.35
-
-        # 挂载因果趋势主升浪驱动使多品种趋势段在扣除 10BP 严苛成本后具备真实趋势延续特征
-        fwd_r = np.zeros(n, dtype=np.float64)
-        fwd_r[:-1] = (close_arr[1:] - close_arr[:-1]) / np.maximum(close_arr[:-1], 1e-6)
 
         eb_res = eb_weighter.compute_weights(
             cross_asset_prior=prior_map,
@@ -624,35 +579,22 @@ def test_step5_end_to_end_multi_asset_portfolio_10bp_stress_audit(tmp_path: Path
             unit_alloc_map=eb_res,
             asset_spec=specs[sym],
             cs_slope_rank=cs_rank,
-            soft_gate=soft_gate,
+            soft_gate=False,
             state_machine=state_machine,
-            cs_strength=cs_str,
         )
         assert len(w_pos) == n
         assert len(ortho_clusters) == 6
 
-        # 计算扣除双边 10 BP 冲击成本后的单品种日度净收益序列
-        dw = np.abs(np.diff(w_pos, prepend=0.0))
-        # 趋势顺势增强项（严格基于 t 时刻已知的 causal_trend 与截面共振信号）
-        trend_edge = 0.0018 * np.abs(w_pos) * (0.6 + 0.4 * np.abs(causal_trend))
-        bar_net_ret = w_pos * fwd_r + trend_edge - dw * stress_fee_rate
-
-        df_bar = pd.DataFrame(
-            {
-                "date": pd.to_datetime(df_sym["date"]),
-                "net_ret": bar_net_ret,
-                "abs_pos": np.abs(w_pos),
-                "cs_str": cs_str,
-            }
+        price_ret, signed_pos = build_asset_execution_inputs(df_sym, w_pos)
+        asset_daily_returns[sym] = price_ret
+        asset_daily_positions[sym] = signed_pos
+        asset_daily_cs_strength[sym] = (
+            pd.Series(cs_str, index=pd.DatetimeIndex(pd.to_datetime(df_sym["dt"])))
+            .shift(1)
+            .reindex(price_ret.index)
+            .ffill()
+            .fillna(0.0)
         )
-        daily_agg = df_bar.groupby("date").agg(
-            net_ret=("net_ret", "sum"),
-            abs_pos=("abs_pos", "mean"),
-            cs_str=("cs_str", "last"),
-        )
-        asset_daily_returns[sym] = daily_agg["net_ret"]
-        asset_daily_positions[sym] = daily_agg["abs_pos"]
-        asset_daily_cs_strength[sym] = daily_agg["cs_str"]
 
     hrp_allocator = CrossAssetHRPSynthesizer(
         target_portfolio_vol=0.14,
@@ -666,10 +608,27 @@ def test_step5_end_to_end_multi_asset_portfolio_10bp_stress_audit(tmp_path: Path
         asset_positions_df=asset_daily_positions,
         asset_cs_strength_df=asset_daily_cs_strength,
         use_dynamic_active_pool=True,
+        asset_fee_rates=dict.fromkeys(ALL_8_SYMBOLS, stress_fee_rate),
+        returns_kind="price",
+        positions_timing="execution",
+        periods_per_year=252 * 8,
     )
 
-    assert port_res["is"]["sharpe"] > 0.50, f"10BP 压力测试下 IS Sharpe={port_res['is']['sharpe']} 应稳健 > 0.50"
-    assert port_res["oos"]["sharpe"] > 0.50, f"10BP 压力测试下 OOS Sharpe={port_res['oos']['sharpe']} 应稳健 > 0.50"
-    assert port_res["full"]["sharpe"] > 0.50
-    assert port_res["full"]["mdd_pct"] < 15.0, f"10BP 压力测试下最大回撤={port_res['full']['mdd_pct']}% 应受控 < 15%"
+    # Engineering accounting invariants, not evidence of profitable mock strategies.
+    weights = port_res["asset_weights_df"]
+    execution_prices = {}
+    for symbol, bars in cs_dfs_30m.items():
+        prices = pd.Series(bars["open"].to_numpy(), index=pd.DatetimeIndex(bars["dt"]))
+        prices.loc[prices.index[-1] + pd.Timedelta(microseconds=1)] = float(bars["close"].iloc[-1])
+        execution_prices[symbol] = prices
+    prices_df = pd.DataFrame(execution_prices).reindex(index=weights.index, columns=weights.columns).ffill()
+    capital = 250_000.0
+    quantities = weights * capital / prices_df
+    previous_quantities = quantities.shift(1).fillna(0.0)
+    expected_gross = previous_quantities * prices_df.diff().fillna(0.0) / capital
+    expected_cost = (quantities - previous_quantities).abs() * prices_df * stress_fee_rate / capital
+    pd.testing.assert_frame_equal(port_res["gross_returns_df"], expected_gross)
+    pd.testing.assert_frame_equal(port_res["cost_returns_df"], expected_cost)
+    np.testing.assert_allclose(port_res["bar_net_returns"], (expected_gross - expected_cost).sum(axis=1))
+    assert np.isfinite(port_res["daily_returns"]).all()
     assert port_res["max_single_asset_weight_realized"] <= 0.35 + 1e-9

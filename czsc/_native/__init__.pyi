@@ -10,10 +10,13 @@ __all__ = [
     "BI",
     "BarGenerator",
     "CZSC",
+    "ClosedExecutionIntervals",
     "CzscSignals",
     "CzscTrader",
     "Direction",
     "Event",
+    "ExecutionEpisode",
+    "ExecutionLedger",
     "FX",
     "FakeBI",
     "Freq",
@@ -27,21 +30,39 @@ __all__ = [
     "Position",
     "RawBar",
     "Signal",
+    "StructureSnapshot",
     "ZS",
     "check_bi",
     "check_fx",
     "check_fxs",
     "check_gap_info",
     "chip_distribution_triangle",
+    "closed_execution_intervals",
     "create_fake_bis",
+    "decision_execution_ledger",
+    "decision_interval_ledger",
+    "evaluate_structure_decay",
+    "evaluate_structure_factor",
+    "executed_weight_ledger",
+    "execution_episodes",
+    "execution_ledger",
+    "execution_net_returns",
+    "format_research_kline_bytes",
     "format_standard_kline",
     "get_zs_seq",
     "is_bis_down",
     "is_bis_up",
     "is_symmetry_zs",
+    "macd",
     "monotonicity",
+    "obv",
     "parse_signal_doc",
     "remove_include",
+    "rsi",
+    "standardize_execution_returns",
+    "structure_snapshots",
+    "structure_stop_anchors",
+    "two_stage_trigger",
 ]
 
 @typing.final
@@ -337,6 +358,17 @@ class CZSC:
         """
 
 @typing.final
+class ClosedExecutionIntervals:
+    r"""
+    Completed forward intervals with entry costs attributed to the start mark
+    and explicit terminal liquidation costs attributed to the last interval.
+    """
+    @property
+    def net_returns(self) -> builtins.list[builtins.float]: ...
+    @property
+    def turnover(self) -> builtins.list[builtins.float]: ...
+
+@typing.final
 class CzscSignals:
     r"""
     CzscSignals 的 PyO3 包装
@@ -593,6 +625,52 @@ class Event:
         r"""
         支持 pickle 序列化 - 使用 __reduce__ 方法
         """
+
+@typing.final
+class ExecutionEpisode:
+    @property
+    def trigger_idx(self) -> builtins.int: ...
+    @property
+    def entry_idx(self) -> builtins.int: ...
+    @property
+    def exit_idx(self) -> builtins.int: ...
+    @property
+    def direction(self) -> builtins.int: ...
+    @property
+    def net_ret(self) -> builtins.float: ...
+    @property
+    def weighted_net_ret(self) -> builtins.float: ...
+    @property
+    def quality_w(self) -> builtins.float: ...
+    @property
+    def atr_pct(self) -> builtins.float: ...
+    @property
+    def mfe_atr(self) -> builtins.float: ...
+    @property
+    def mae_atr(self) -> builtins.float: ...
+
+@typing.final
+class ExecutionLedger:
+    r"""
+    Fixed-initial-capital execution accounting. Monetary flows are divided by the
+    initial capital; quantities are available only when actual prices are supplied.
+    """
+    @property
+    def gross_returns(self) -> builtins.list[builtins.float]: ...
+    @property
+    def turnover(self) -> builtins.list[builtins.float]: ...
+    @property
+    def cost_returns(self) -> builtins.list[builtins.float]: ...
+    @property
+    def net_returns(self) -> builtins.list[builtins.float]: ...
+    @property
+    def pretrade_weights(self) -> builtins.list[builtins.float]: ...
+    @property
+    def executed_weights(self) -> builtins.list[builtins.float]: ...
+    @property
+    def quantities(self) -> typing.Optional[builtins.list[builtins.float]]: ...
+    @property
+    def trade_quantities(self) -> typing.Optional[builtins.list[builtins.float]]: ...
 
 @typing.final
 class FX:
@@ -889,6 +967,10 @@ class Position:
     def unique_signals(self) -> builtins.list[builtins.str]: ...
     @property
     def events(self) -> builtins.list[Event]: ...
+    def evaluate_signals(self, bars: typing.Sequence[RawBar], rows: typing.Sequence[typing.Mapping[builtins.str, builtins.str]]) -> tuple[builtins.list[builtins.bool], builtins.list[builtins.float]]:
+        r"""
+        Replay bars and signal rows from a fresh configuration; returns opening pulses and close-time positions.
+        """
     def __new__(cls, symbol: builtins.str, opens: typing.Sequence[Event], exits: typing.Sequence[Event] = [], interval: builtins.int = 0, timeout: builtins.int = 1000, stop_loss: builtins.float = 1000.0, t0: builtins.bool = False, name: typing.Optional[builtins.str] = None) -> Position: ...
     @classmethod
     def load_from_file(cls, path: builtins.str) -> Position: ...
@@ -1041,6 +1123,60 @@ class Signal:
         r"""
         获取Signal的完整字符串表示
         """
+
+@typing.final
+class StructureSnapshot:
+    r"""
+    Structures known at this bar's close. Missing prices are NaN and missing IDs are -1.
+    IDs are the structure's endpoint timestamp in milliseconds; completed_bi_dir is
+    an event, not a persistent direction, and is emitted only for a newly completed BI.
+    The row's input bar is the confirmation time; the earlier endpoint ID is never
+    used as its availability time.
+    """
+    @property
+    def asof_utc(self) -> builtins.str: ...
+    @property
+    def fx_low(self) -> builtins.float: ...
+    @property
+    def fx_high(self) -> builtins.float: ...
+    @property
+    def fx_low_id(self) -> builtins.int: ...
+    @property
+    def fx_high_id(self) -> builtins.int: ...
+    @property
+    def bi_low(self) -> builtins.float: ...
+    @property
+    def bi_high(self) -> builtins.float: ...
+    @property
+    def bi_id(self) -> builtins.int: ...
+    @property
+    def bi_second_low(self) -> builtins.float: ...
+    @property
+    def bi_second_high(self) -> builtins.float: ...
+    @property
+    def bi_second_low_id(self) -> builtins.int: ...
+    @property
+    def bi_second_high_id(self) -> builtins.int: ...
+    @property
+    def zs_low(self) -> builtins.float: ...
+    @property
+    def zs_high(self) -> builtins.float: ...
+    @property
+    def zs_mid(self) -> builtins.float: ...
+    @property
+    def zs_zd(self) -> builtins.float: ...
+    @property
+    def zs_zg(self) -> builtins.float: ...
+    @property
+    def zs_id(self) -> builtins.int: ...
+    @property
+    def completed_bi_dir(self) -> builtins.int: ...
+    @property
+    def completed_bi_id(self) -> builtins.int: ...
+    @property
+    def completed_fx_dir(self) -> builtins.int: ...
+    @property
+    def completed_fx_id(self) -> builtins.int: ...
 
 @typing.final
 class ZS:
@@ -1382,9 +1518,70 @@ def chip_distribution_triangle(data: numpy.typing.NDArray[numpy.float64], price_
     返回的两个数组长度相同，可用于绘制筹码分布图或进一步分析。
     """
 
+def closed_execution_intervals(ledger: ExecutionLedger) -> ClosedExecutionIntervals:
+    r"""
+    Attribute a closed boundary ledger to forward intervals without changing totals.
+    Entry costs belong to the starting mark and terminal liquidation costs to the final
+    interval. Requires at least two marks and an explicitly zero terminal position.
+    """
+
 def create_fake_bis(fxs: typing.Sequence[FX]) -> builtins.list[FakeBI]:
     r"""
     将分型序列转换为虚拟笔；非法的非交替分型返回 ValueError。
+    """
+
+def decision_execution_ledger(open: typing.Sequence[builtins.float], weights: typing.Sequence[builtins.float], fee_rate: builtins.float = 0.0002, terminal_close: typing.Optional[builtins.float] = None) -> ExecutionLedger:
+    r"""
+    Fill close-time decisions in [-1, 1] at the next open using the shared quantity ledger.
+    With terminal_close=None, preserve terminal inventory. A supplied positive close
+    appends an explicit liquidation mark, so every result array has one extra item.
+    """
+
+def decision_interval_ledger(interval_returns: typing.Sequence[builtins.float], weights: typing.Sequence[builtins.float], fee_rate: builtins.float = 0.0002) -> ExecutionLedger:
+    r"""
+    Account close-time decisions from forward holding intervals without synthetic prices.
+    The first interval must be zero. Nonempty inputs produce one extra boundary with
+    explicit terminal liquidation; decision weights must lie in [-1, 1].
+    """
+
+def evaluate_structure_decay(direction: typing.Sequence[builtins.int], quality: typing.Sequence[builtins.float], close: typing.Sequence[builtins.float], stop_level: typing.Sequence[builtins.float], reverse_dir: typing.Sequence[builtins.int], atr_fast: typing.Sequence[builtins.float], atr_slow: typing.Sequence[builtins.float], lam0: builtins.float = 0.1, rho_min: builtins.float = 0.5, rho_max: builtins.float = 2.0, d_eps: builtins.float = 0.02, max_hold: builtins.int = 64, trailing: builtins.float = 0.0, trail_activation: builtins.float = 0.0, ratchet_stop: builtins.bool = False, min_hold: builtins.int = 0, cooldown: builtins.int = 0, track_signal: builtins.bool = False, zs_zg: typing.Optional[typing.Sequence[builtins.float]] = None, zs_zd: typing.Optional[typing.Sequence[builtins.float]] = None, completed_fx_dir: typing.Optional[typing.Sequence[builtins.int]] = None, soft_exit: typing.Optional[typing.Sequence[builtins.bool]] = None, reentry_mode: builtins.str = 'none', reentry_breakout_buf: builtins.float = 0.0, partial_exit_ratio: builtins.float = 0.0, breakeven_buffer: builtins.float = 0.0, runner_trail_mult: builtins.float = 1.5) -> dict:
+    r"""
+    Already-confirmed-trigger or continuous-weight entry using the identical shared structural exit transition.
+    """
+
+def evaluate_structure_factor(setup_long: typing.Sequence[builtins.bool], setup_short: typing.Sequence[builtins.bool], setup_quality_long: typing.Sequence[builtins.float], setup_quality_short: typing.Sequence[builtins.float], confirm_long: typing.Sequence[builtins.bool], confirm_short: typing.Sequence[builtins.bool], confirm_quality_long: typing.Sequence[builtins.float], confirm_quality_short: typing.Sequence[builtins.float], close: typing.Sequence[builtins.float], long_stop: typing.Sequence[builtins.float], short_stop: typing.Sequence[builtins.float], completed_bi_dir: typing.Sequence[builtins.int], atr_fast: typing.Sequence[builtins.float], atr_slow: typing.Sequence[builtins.float], window: builtins.int = 6, lam0: builtins.float = 0.1, rho_min: builtins.float = 0.5, rho_max: builtins.float = 2.0, d_eps: builtins.float = 0.02, max_hold: builtins.int = 64, trailing: builtins.float = 0.013, trail_activation: builtins.float = 0.0, ratchet_stop: builtins.bool = False, min_hold: builtins.int = 0, cooldown: builtins.int = 0, zs_zg: typing.Optional[typing.Sequence[builtins.float]] = None, zs_zd: typing.Optional[typing.Sequence[builtins.float]] = None, completed_fx_dir: typing.Optional[typing.Sequence[builtins.int]] = None, soft_exit: typing.Optional[typing.Sequence[builtins.bool]] = None, reentry_mode: builtins.str = 'none', reentry_breakout_buf: builtins.float = 0.0, partial_exit_ratio: builtins.float = 0.0, breakeven_buffer: builtins.float = 0.0, runner_trail_mult: builtins.float = 1.5) -> dict:
+    r"""
+    Shared two-stage machine: freeze the Setup anchor, confirm on a later close,
+    exit on structural invalidation, opposite completed BI, trailing, decay or timeout.
+    Result targets are close-time decisions for execution at the next tradable open.
+    """
+
+def executed_weight_ledger(price_returns: typing.Sequence[builtins.float], weights: typing.Sequence[builtins.float], fee_rate: builtins.float = 0.0002, tradable: typing.Optional[typing.Sequence[builtins.bool]] = None) -> ExecutionLedger:
+    r"""
+    Account already executed finite target weights against mark-to-mark price returns.
+    Every tradable mark rebalances on fixed initial capital and charges actual traded
+    notional. Missing marks require zero return and unchanged weight. Results are
+    initial-capital fractions; quantity fields are None. No terminal exit is inserted.
+    """
+
+def execution_episodes(open: typing.Sequence[builtins.float], high: typing.Sequence[builtins.float], low: typing.Sequence[builtins.float], close: typing.Sequence[builtins.float], atr: typing.Sequence[builtins.float], weights: typing.Sequence[builtins.float], fee_rate: builtins.float = 0.0002) -> builtins.list[ExecutionEpisode]: ...
+
+def execution_ledger(prices: typing.Sequence[builtins.float], weights: typing.Sequence[builtins.float], fee_rate: builtins.float = 0.0002, initial_capital: builtins.float = 1.0, tradable: typing.Optional[typing.Sequence[builtins.bool]] = None) -> ExecutionLedger:
+    r"""
+    Account already executed weights with q = weight * initial_capital / price.
+    Returns and fees use fixed initial capital; quantities use a unit multiplier.
+    Missing quotes require tradable=False and unchanged weight, allow NaN or an
+    unchanged carried price, and freeze quantity. Final inventory is retained.
+    """
+
+def execution_net_returns(open: typing.Sequence[builtins.float], weights: typing.Sequence[builtins.float], fee_rate: builtins.float = 0.0002) -> builtins.list[builtins.float]: ...
+
+def format_research_kline_bytes(data: bytes, freq: typing.Any) -> builtins.list[RawBar]:
+    r"""
+    Convert an Arrow IPC research OHLCV file through the shared Rust boundary.
+    freq accepts a Freq or its string name. volume aliases vol; absent amount is
+    zero (unavailable), existing amounts are preserved, and IDs follow input order.
+    Invalid columns, nulls, conflicting aliases and malformed OHLC raise ValueError.
     """
 
 def format_standard_kline(bars: typing.Sequence[RawBar]) -> builtins.list[RawBar]:
@@ -1415,6 +1612,14 @@ def is_symmetry_zs(bis: typing.Sequence[BI], th: builtins.float = 0.3) -> builti
     判断一组连续笔是否构成对称中枢。
     """
 
+def macd(close: typing.Sequence[builtins.float], fastperiod: builtins.int, slowperiod: builtins.int, signalperiod: builtins.int) -> tuple[builtins.list[builtins.float], builtins.list[builtins.float], builtins.list[builtins.float]]:
+    r"""
+    Compute MACD with explicit fastperiod, slowperiod and signalperiod.
+    Returns (dif, dea, histogram), each with one value per close and the same full
+    warmup. EMAs use SMA seeds; histogram is dif-dea, not doubled. Empty input
+    returns empty lists; zero periods or insufficient history produce NaN.
+    """
+
 def monotonicity(sequence: typing.Sequence[builtins.float]) -> builtins.float:
     r"""
     `czsc.monotonicity(sequence)` → float。
@@ -1422,6 +1627,15 @@ def monotonicity(sequence: typing.Sequence[builtins.float]) -> builtins.float:
     计算序列与自然数序列的 Spearman 秩相关，等价于
     `scipy.stats.spearmanr(sequence, range(len(sequence))).statistic`。
     详见 [`crate::monotonicity::monotonicity`] 的算法说明与对齐口径。
+    """
+
+def obv(close: typing.Sequence[builtins.float], volume: typing.Sequence[builtins.float]) -> builtins.list[builtins.float]:
+    r"""
+    Compute close-to-close on-balance volume, seeded with the first volume.
+    Rising closes add volume, falling closes subtract it, and unchanged closes
+    add zero. Both inputs must have equal length, otherwise ValueError is raised.
+    Empty inputs return an empty list. Non-finite input poisons the current and
+    remaining output with NaN; candle-body flow signals have a separate meaning.
     """
 
 def parse_signal_doc(doc: builtins.str) -> ParsedSignalDoc:
@@ -1432,5 +1646,34 @@ def parse_signal_doc(doc: builtins.str) -> ParsedSignalDoc:
 def remove_include(k1: NewBar, k2: NewBar, k3: RawBar) -> tuple[builtins.bool, NewBar]:
     r"""
     对 `analyze::utils::remove_include` 的 Python 友好的薄 wrapper。
+    """
+
+def rsi(close: typing.Sequence[builtins.float], timeperiod: builtins.int) -> builtins.list[builtins.float]:
+    r"""
+    Compute Wilder RSI for the close series using an explicit timeperiod.
+    Returns one value per close. The first timeperiod values are NaN, flat prices
+    yield zero, and gains without losses yield 100. Empty input returns an empty
+    list; zero periods or insufficient history return NaN at every position.
+    """
+
+def standardize_execution_returns(gross_returns: typing.Sequence[builtins.float], cost_returns: typing.Sequence[builtins.float]) -> builtins.list[builtins.float]:
+    r"""
+    Subtract standardized quantity-based costs from an independently calculated gross ledger.
+    Inputs must be finite, equal-length initial-capital fractions; costs must be nonnegative.
+    """
+
+def structure_snapshots(bars: typing.Sequence[RawBar], min_bi_len: builtins.int = 0, max_bi_num: builtins.int = 0) -> builtins.list[StructureSnapshot]:
+    r"""
+    Structures known at each completed close; no future bars or direction-string inference.
+    """
+
+def structure_stop_anchors(bars: typing.Sequence[RawBar], snapshots: typing.Sequence[StructureSnapshot], stop_plugin: builtins.str, htf_ma: typing.Optional[typing.Sequence[builtins.float]] = None, box_window: builtins.int = 20) -> dict:
+    r"""
+    Dispatch FX, completed BI, ZS exterior, setup flow bar, rolling box, or causal HTF MA stops.
+    """
+
+def two_stage_trigger(setup: typing.Sequence[builtins.bool], setup_quality: typing.Sequence[builtins.float], confirm: typing.Sequence[builtins.bool], confirm_quality: typing.Sequence[builtins.float], window: builtins.int) -> tuple[builtins.list[builtins.bool], builtins.list[builtins.float]]:
+    r"""
+    Trigger-only compatibility entry with strict Setup-before-Confirmation ordering.
     """
 

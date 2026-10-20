@@ -14,8 +14,8 @@ use crate::params::ParamView;
 use crate::types::TaCache;
 use crate::utils::cxt::{fx_power_str, get_zs_seq, raw_bar_lower, raw_bar_upper};
 use crate::utils::sig::{get_sub_elements, get_usize_param, make_kline_signal_scored};
-use czsc_core::analyze::utils::check_fx;
 use czsc_core::analyze::CZSC;
+use czsc_core::analyze::utils::check_fx;
 use czsc_core::objects::bar::RawBar;
 use czsc_core::objects::bi::BI;
 use czsc_core::objects::direction::Direction;
@@ -101,7 +101,7 @@ fn extreme_shadow_ratio(mark: &Mark, raw: &[RawBar]) -> f64 {
     .unwrap_or(0.0)
 }
 
-/// strength_fx_V260601：分型强度
+/// strength_fx：分型强度
 ///
 /// 参数模板：`"{freq}_N{n}_FX强度V260601"`
 ///
@@ -118,12 +118,12 @@ fn extreme_shadow_ratio(mark: &Mark, raw: &[RawBar]) -> f64 {
 /// 参数说明：`n`：ATR 窗口，默认 `14`。
 #[signal(
     category = "kline",
-    name = "strength_fx_V260601",
+    name = "strength_fx",
     template = "{freq}_N{n}_FX强度V260601",
-    opcode = "StrengthFxV260601",
+    opcode = "StrengthFx",
     param_kind = "StrengthFxV260601"
 )]
-pub fn strength_fx_v260601(c: &CZSC, params: &ParamView, _cache: &mut TaCache) -> Vec<Signal> {
+pub fn strength_fx(c: &CZSC, params: &ParamView, _cache: &mut TaCache) -> Vec<Signal> {
     let n = get_usize_param(params, "n", 14).max(2);
     let k1 = c.freq.to_string();
     let k2 = format!("N{n}");
@@ -160,7 +160,7 @@ pub fn strength_fx_v260601(c: &CZSC, params: &ParamView, _cache: &mut TaCache) -
     emit(&k1, &k2, k3, dir, q)
 }
 
-/// strength_bi_div_V260601：笔背驰强度
+/// strength_bi_div：笔背驰强度
 ///
 /// 参数模板：`"{freq}_N{n}_笔背驰强度V260601"`
 ///
@@ -173,16 +173,12 @@ pub fn strength_fx_v260601(c: &CZSC, params: &ParamView, _cache: &mut TaCache) -
 /// 参数说明：`n`：笔结束后的有效 K 线根数，默认 `10`。
 #[signal(
     category = "kline",
-    name = "strength_bi_div_V260601",
+    name = "strength_bi_div",
     template = "{freq}_N{n}_笔背驰强度V260601",
-    opcode = "StrengthBiDivV260601",
+    opcode = "StrengthBiDiv",
     param_kind = "StrengthBiDivV260601"
 )]
-pub fn strength_bi_div_v260601(
-    c: &CZSC,
-    params: &ParamView,
-    _cache: &mut TaCache,
-) -> Vec<Signal> {
+pub fn strength_bi_div(c: &CZSC, params: &ParamView, _cache: &mut TaCache) -> Vec<Signal> {
     let n = get_usize_param(params, "n", 10).max(1);
     let k1 = c.freq.to_string();
     let k2 = format!("N{n}");
@@ -210,11 +206,15 @@ pub fn strength_bi_div_v260601(
     if m.is_nan() || m >= 1.0 {
         return none(&k1, &k2, k3);
     }
-    let dir = if b0.direction == Direction::Down { LONG } else { SHORT };
+    let dir = if b0.direction == Direction::Down {
+        LONG
+    } else {
+        SHORT
+    };
     emit(&k1, &k2, k3, dir, (1.0 - m).clamp(0.1, 1.0))
 }
 
-/// strength_zs_revert_V260601：中枢偏离回归强度
+/// strength_zs_revert：中枢偏离回归强度
 ///
 /// 参数模板：`"{freq}_K{k}_中枢回归强度V260601"`
 ///
@@ -227,22 +227,22 @@ pub fn strength_bi_div_v260601(
 /// 参数说明：`k`：陡峭度的 10 倍整数，默认 `15`（即 `k = 1.5`）。
 #[signal(
     category = "kline",
-    name = "strength_zs_revert_V260601",
+    name = "strength_zs_revert",
     template = "{freq}_K{k}_中枢回归强度V260601",
-    opcode = "StrengthZsRevertV260601",
+    opcode = "StrengthZsRevert",
     param_kind = "StrengthZsRevertV260601"
 )]
-pub fn strength_zs_revert_v260601(
-    c: &CZSC,
-    params: &ParamView,
-    _cache: &mut TaCache,
-) -> Vec<Signal> {
+pub fn strength_zs_revert(c: &CZSC, params: &ParamView, _cache: &mut TaCache) -> Vec<Signal> {
     let k = get_usize_param(params, "k", 15).max(1);
     let k1 = c.freq.to_string();
     let k2 = format!("K{k}");
     let k3 = "中枢回归强度V260601";
 
-    let sub = get_sub_elements(finished_bis(c), 1, 20);
+    let sub = get_sub_elements(
+        finished_bis(c),
+        1,
+        czsc_core::structure_exit::ZS_REVERSION_BI_WINDOW,
+    );
     let (Some(last), true) = (c.bars_raw.last(), sub.len() >= 3) else {
         return none(&k1, &k2, k3);
     };
@@ -262,7 +262,7 @@ pub fn strength_zs_revert_v260601(
     emit(&k1, &k2, k3, dir, q)
 }
 
-/// strength_zs_break_V260601：中枢脱离（三买/三卖）强度
+/// strength_zs_break：中枢脱离（三买/三卖）强度
 ///
 /// 参数模板：`"{freq}_N{n}_中枢脱离强度V260601"`
 ///
@@ -276,16 +276,12 @@ pub fn strength_zs_revert_v260601(
 /// 参数说明：`n`：回踩笔结束后的有效 K 线根数，默认 `10`。
 #[signal(
     category = "kline",
-    name = "strength_zs_break_V260601",
+    name = "strength_zs_break",
     template = "{freq}_N{n}_中枢脱离强度V260601",
-    opcode = "StrengthZsBreakV260601",
+    opcode = "StrengthZsBreak",
     param_kind = "StrengthZsBreakV260601"
 )]
-pub fn strength_zs_break_v260601(
-    c: &CZSC,
-    params: &ParamView,
-    _cache: &mut TaCache,
-) -> Vec<Signal> {
+pub fn strength_zs_break(c: &CZSC, params: &ParamView, _cache: &mut TaCache) -> Vec<Signal> {
     let n = get_usize_param(params, "n", 10).max(1);
     let k1 = c.freq.to_string();
     let k2 = format!("N{n}");
@@ -334,7 +330,7 @@ pub fn strength_zs_break_v260601(
     emit(&k1, &k2, k3, dir, ext.tanh() * margin.clamp(0.1, 1.0))
 }
 
-/// strength_flow_V260601：量价资金流强度
+/// strength_flow：量价资金流强度
 ///
 /// 参数模板：`"{freq}_N{n}K{k}_资金流强度V260601"`
 ///
@@ -346,12 +342,12 @@ pub fn strength_zs_break_v260601(
 /// 参数说明：`n`：窗口，默认 `20`；`k`：陡峭度的 10 倍整数，默认 `20`（`k = 2.0`）。
 #[signal(
     category = "kline",
-    name = "strength_flow_V260601",
+    name = "strength_flow",
     template = "{freq}_N{n}K{k}_资金流强度V260601",
-    opcode = "StrengthFlowV260601",
+    opcode = "StrengthFlow",
     param_kind = "StrengthFlowV260601"
 )]
-pub fn strength_flow_v260601(c: &CZSC, params: &ParamView, _cache: &mut TaCache) -> Vec<Signal> {
+pub fn strength_flow(c: &CZSC, params: &ParamView, _cache: &mut TaCache) -> Vec<Signal> {
     let n = get_usize_param(params, "n", 20).max(2);
     let k = get_usize_param(params, "k", 20).max(1);
     let k1 = c.freq.to_string();
@@ -393,7 +389,7 @@ pub fn strength_flow_v260601(c: &CZSC, params: &ParamView, _cache: &mut TaCache)
     emit(&k1, &k2, k3, dir, q)
 }
 
-/// strength_squeeze_V260601：波动率压缩后扩张强度
+/// strength_squeeze：波动率压缩后扩张强度
 ///
 /// 参数模板：`"{freq}_N{n}M{m}TH{th}_压缩扩张强度V260601"`
 ///
@@ -406,16 +402,12 @@ pub fn strength_flow_v260601(c: &CZSC, params: &ParamView, _cache: &mut TaCache)
 /// 参数说明：`n`：ATR 窗口，默认 `14`；`m`：分位回看，默认 `60`；`th`：压缩分位阈值（百分数），默认 `30`。
 #[signal(
     category = "kline",
-    name = "strength_squeeze_V260601",
+    name = "strength_squeeze",
     template = "{freq}_N{n}M{m}TH{th}_压缩扩张强度V260601",
-    opcode = "StrengthSqueezeV260601",
+    opcode = "StrengthSqueeze",
     param_kind = "StrengthSqueezeV260601"
 )]
-pub fn strength_squeeze_v260601(
-    c: &CZSC,
-    params: &ParamView,
-    _cache: &mut TaCache,
-) -> Vec<Signal> {
+pub fn strength_squeeze(c: &CZSC, params: &ParamView, _cache: &mut TaCache) -> Vec<Signal> {
     let n = get_usize_param(params, "n", 14).max(2);
     let m = get_usize_param(params, "m", 60).max(5);
     let th = get_usize_param(params, "th", 30).clamp(1, 100);
@@ -429,7 +421,10 @@ pub fn strength_squeeze_v260601(
         return none(&k1, &k2, k3);
     }
     let tail = &bars[bars.len() - (m + n + 1)..];
-    let tr: Vec<f64> = tail.windows(2).map(|w| true_range(&w[1], w[0].close)).collect();
+    let tr: Vec<f64> = tail
+        .windows(2)
+        .map(|w| true_range(&w[1], w[0].close))
+        .collect();
     // atr[j] = tr[j+1-n ..= j] 的均值，j ∈ [n-1, m+n-1]，共 m+1 个，最后一个对应当前根
     let atr: Vec<f64> = (n - 1..tr.len())
         .map(|j| tr[j + 1 - n..=j].iter().sum::<f64>() / n as f64)
@@ -439,7 +434,8 @@ pub fn strength_squeeze_v260601(
     if atr_prev <= EPS {
         return none(&k1, &k2, k3);
     }
-    let rank = prev_window.iter().filter(|x| **x <= atr_prev).count() as f64 / prev_window.len() as f64;
+    let rank =
+        prev_window.iter().filter(|x| **x <= atr_prev).count() as f64 / prev_window.len() as f64;
     if rank * 100.0 > th as f64 {
         return none(&k1, &k2, k3);
     }
@@ -451,6 +447,82 @@ pub fn strength_squeeze_v260601(
     }
     let dir = if last.close > last.open { LONG } else { SHORT };
     emit(&k1, &k2, k3, dir, (1.0 - rank) * ratio.tanh())
+}
+
+/// Legacy alias; preserves the historical signal key and value exactly.
+#[signal(
+    category = "kline",
+    name = "strength_fx_V260601",
+    template = "{freq}_N{n}_FX强度V260601",
+    opcode = "StrengthFxV260601",
+    param_kind = "StrengthFxV260601"
+)]
+pub fn strength_fx_v260601(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> Vec<Signal> {
+    strength_fx(c, params, cache)
+}
+
+/// Legacy alias; preserves the historical signal key and value exactly.
+#[signal(
+    category = "kline",
+    name = "strength_bi_div_V260601",
+    template = "{freq}_N{n}_笔背驰强度V260601",
+    opcode = "StrengthBiDivV260601",
+    param_kind = "StrengthBiDivV260601"
+)]
+pub fn strength_bi_div_v260601(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> Vec<Signal> {
+    strength_bi_div(c, params, cache)
+}
+
+/// Legacy alias; preserves the historical signal key and value exactly.
+#[signal(
+    category = "kline",
+    name = "strength_zs_revert_V260601",
+    template = "{freq}_K{k}_中枢回归强度V260601",
+    opcode = "StrengthZsRevertV260601",
+    param_kind = "StrengthZsRevertV260601"
+)]
+pub fn strength_zs_revert_v260601(
+    c: &CZSC,
+    params: &ParamView,
+    cache: &mut TaCache,
+) -> Vec<Signal> {
+    strength_zs_revert(c, params, cache)
+}
+
+/// Legacy alias; preserves the historical signal key and value exactly.
+#[signal(
+    category = "kline",
+    name = "strength_zs_break_V260601",
+    template = "{freq}_N{n}_中枢脱离强度V260601",
+    opcode = "StrengthZsBreakV260601",
+    param_kind = "StrengthZsBreakV260601"
+)]
+pub fn strength_zs_break_v260601(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> Vec<Signal> {
+    strength_zs_break(c, params, cache)
+}
+
+/// Legacy alias; preserves the historical signal key and value exactly.
+#[signal(
+    category = "kline",
+    name = "strength_flow_V260601",
+    template = "{freq}_N{n}K{k}_资金流强度V260601",
+    opcode = "StrengthFlowV260601",
+    param_kind = "StrengthFlowV260601"
+)]
+pub fn strength_flow_v260601(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> Vec<Signal> {
+    strength_flow(c, params, cache)
+}
+
+/// Legacy alias; preserves the historical signal key and value exactly.
+#[signal(
+    category = "kline",
+    name = "strength_squeeze_V260601",
+    template = "{freq}_N{n}M{m}TH{th}_压缩扩张强度V260601",
+    opcode = "StrengthSqueezeV260601",
+    param_kind = "StrengthSqueezeV260601"
+)]
+pub fn strength_squeeze_v260601(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> Vec<Signal> {
+    strength_squeeze(c, params, cache)
 }
 
 #[cfg(test)]
@@ -465,12 +537,12 @@ mod tests {
     type SigFn = fn(&CZSC, &ParamView, &mut TaCache) -> Vec<Signal>;
 
     const FUNCS: [(&str, SigFn); 6] = [
-        ("fx", strength_fx_v260601),
-        ("bi_div", strength_bi_div_v260601),
-        ("zs_revert", strength_zs_revert_v260601),
-        ("zs_break", strength_zs_break_v260601),
-        ("flow", strength_flow_v260601),
-        ("squeeze", strength_squeeze_v260601),
+        ("fx", strength_fx),
+        ("bi_div", strength_bi_div),
+        ("zs_revert", strength_zs_revert),
+        ("zs_break", strength_zs_break),
+        ("flow", strength_flow),
+        ("squeeze", strength_squeeze),
     ];
 
     fn lcg(seed: &mut u64) -> f64 {
@@ -560,6 +632,33 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_aliases_are_exactly_equivalent_on_every_prefix() {
+        let aliases: [SigFn; 6] = [
+            strength_fx_v260601,
+            strength_bi_div_v260601,
+            strength_zs_revert_v260601,
+            strength_zs_break_v260601,
+            strength_flow_v260601,
+            strength_squeeze_v260601,
+        ];
+        let bars = raw_bars(&synth(600, 19));
+        let params = HashMap::new();
+        let view = ParamView::new(&params);
+        let mut c = CZSC::new(bars[..60].to_vec(), 50, 6);
+        for bar in &bars[60..] {
+            c.update_bar(bar.clone());
+            for ((_, canonical), legacy) in FUNCS.iter().zip(aliases) {
+                let actual = canonical(&c, &view, &mut TaCache::default());
+                let expected = legacy(&c, &view, &mut TaCache::default());
+                assert_eq!(
+                    actual.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    expected.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_scores_in_range_and_each_signal_fires() {
         let rows = run_incremental(&synth(4000, 7));
         let mut fired = [0usize; 6];
@@ -595,7 +694,11 @@ mod tests {
         for t in (warm + 40..data.len()).step_by(53) {
             let bars = raw_bars(&data[..=t]);
             let c = CZSC::new(bars, 50, 6);
-            assert_eq!(eval_all(&c), full[t - warm], "截断到 t={t} 的信号与全量不一致");
+            assert_eq!(
+                eval_all(&c),
+                full[t - warm],
+                "截断到 t={t} 的信号与全量不一致"
+            );
         }
     }
 
@@ -611,7 +714,11 @@ mod tests {
         for (t, (ra, rb)) in a.iter().zip(b.iter()).enumerate() {
             for (j, ((va, sa), (vb, sb))) in ra.iter().zip(rb.iter()).enumerate() {
                 assert_eq!(flip(va), vb, "{} t={t}: 方向未镜像 {va}/{vb}", FUNCS[j].0);
-                assert!((sa - sb).abs() <= 1, "{} t={t}: score {sa} vs {sb}", FUNCS[j].0);
+                assert!(
+                    (sa - sb).abs() <= 1,
+                    "{} t={t}: score {sa} vs {sb}",
+                    FUNCS[j].0
+                );
                 if va != NONE {
                     checked += 1;
                 }
@@ -641,8 +748,14 @@ mod tests {
         // 底分型取最低价K线 -> 第一根 (下影线 2 / 振幅 4)；镜像后的顶分型必须取回同一根
         let d = extreme_shadow_ratio(&Mark::D, &raw);
         let g_mirror = extreme_shadow_ratio(&Mark::G, &raw_m);
-        assert!((d - 0.5).abs() < 1e-12, "底分型应取第一根并列最低价K线: {d}");
-        assert!((d - g_mirror).abs() < 1e-12, "顶/底并列极值选择不对称: {d} vs {g_mirror}");
+        assert!(
+            (d - 0.5).abs() < 1e-12,
+            "底分型应取第一根并列最低价K线: {d}"
+        );
+        assert!(
+            (d - g_mirror).abs() < 1e-12,
+            "顶/底并列极值选择不对称: {d} vs {g_mirror}"
+        );
         // 反方向同理
         let g = extreme_shadow_ratio(&Mark::G, &raw);
         let d_mirror = extreme_shadow_ratio(&Mark::D, &raw_m);

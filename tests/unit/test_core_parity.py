@@ -1,14 +1,14 @@
-"""CZSC 核心算法（FX/BI/ZS）一致性单元测试。
+"""CZSC 核心算法（FX/BI）固定基线回归。
 
-本测试套件验证迁移后的 czsc-core（Rust 实现）在固定输入下产生的
-分型（FX）、笔（BI）、中枢（ZS）结果，与基线快照（baseline snapshot）
-逐字节一致（byte-for-byte identical）。
+本测试套件验证 czsc-core（Rust 实现）在固定输入及显式参数下产生的
+分型（FX）、笔（BI）数量与序列，与仓库维护的基线快照逐项一致。
 
-业务背景：
-    缠论的核心识别算法对最终交易信号有决定性影响，任何细微的实现差异都
-    可能导致大量信号漂移。因此在从 ``rs_czsc`` 迁移到 in-repo 的
-    ``czsc._native`` 过程中，必须保证算法输出与一个锁定的基线（
-    rs-czsc commit ``47ef6efa``，seed=42）完全一致。
+基线来源与修订：
+    最初随提交 ``66a7432`` 导入，记录来源为 rs-czsc ``47ef6efa``、seed=42。
+    当时 min_bi_len 在 Rust 中固定为 6，max_bi_num 默认为 50。
+    2026-10-17 修复初始化包含方向后，仅修订 FX 数量 175→173 及对应方向序列、
+    首笔长度 8→6；43 笔的方向及其余 42 笔长度保持不变。快照保留修订证据。
+    分析参数显式锁定，避免 tests/__init__.py 或用户环境变量改变回放口径。
 
 测试覆盖：
     - ``czsc.CZSC`` 的来源必须是 ``czsc._native``，而不是外部 ``rs_czsc``；
@@ -25,6 +25,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 # 基线快照文件路径，存放固定输入下应得的标准输出
 SNAPSHOT_PATH = Path(__file__).parent / "snapshots" / "core_parity_seed42.json"
@@ -52,7 +54,7 @@ def _build_czsc() -> tuple[Any | None, str | None]:
 
         df = generate_symbol_kines("000001", "30分钟", "20240101", "20240301", seed=42)
         bars = czsc.format_standard_kline(df, freq=czsc.Freq.F30)
-        return czsc.CZSC(bars), None
+        return czsc.CZSC(bars, **_load_snapshot()["analysis_config"]), None
     except Exception as exc:  # noqa: BLE001
         return None, f"build failed: {type(exc).__name__}: {exc}"
 
@@ -131,3 +133,23 @@ def test_bi_lengths_sequence_matches_baseline() -> None:
     snap = _load_snapshot()
     actual = [bi.length for bi in obj.bi_list]
     assert actual == snap["bi_lengths"], f"BI 长度序列出现漂移；期望 {snap['bi_lengths'][:5]}…，实际 {actual[:5]}…"
+
+
+@pytest.mark.parametrize("prefix", ["CZSC_", "czsc_"])
+def test_baseline_replay_ignores_environment_configuration(monkeypatch, prefix: str) -> None:
+    """基线的显式分析参数不受测试进程或用户的大小写环境变量影响。"""
+    for name in ("CZSC_MIN_BI_LEN", "CZSC_MAX_BI_NUM", "czsc_min_bi_len", "czsc_max_bi_num"):
+        monkeypatch.delenv(name, raising=False)
+    suffixes = ("MIN_BI_LEN", "MAX_BI_NUM") if prefix == "CZSC_" else ("min_bi_len", "max_bi_num")
+    monkeypatch.setenv(prefix + suffixes[0], "9")
+    monkeypatch.setenv(prefix + suffixes[1], "3")
+    obj, err = _build_czsc()
+    assert obj is not None, err
+    snap = _load_snapshot()
+    assert obj.min_bi_len == snap["analysis_config"]["min_bi_len"]
+    assert obj.max_bi_num == snap["analysis_config"]["max_bi_num"]
+    assert len(obj.fx_list) == snap["fx_list_count"]
+    assert len(obj.bi_list) == snap["bi_list_count"]
+    assert [str(fx.mark) for fx in obj.fx_list] == snap["fx_marks"]
+    assert [str(bi.direction) for bi in obj.bi_list] == snap["bi_directions"]
+    assert [bi.length for bi in obj.bi_list] == snap["bi_lengths"]

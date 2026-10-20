@@ -84,6 +84,19 @@ impl SignalConfig {
         let key = parts[..3].join("_");
 
         for (func_name, meta) in SIGNAL_REGISTRY.iter() {
+            // A dated compatibility alias shares the canonical output key. Do not
+            // let HashMap iteration randomly choose the alias during reverse parsing.
+            if let Some((canonical, version)) = func_name.rsplit_once("_V")
+                && !version.is_empty()
+                && version.chars().all(|c| c.is_ascii_digit())
+                && SIGNAL_REGISTRY
+                    .get(canonical)
+                    .is_some_and(|canonical_meta| {
+                        canonical_meta.param_template == meta.param_template
+                    })
+            {
+                continue;
+            }
             let Some(tpl_parts) = split_template_parts(meta.param_template) else {
                 continue;
             };
@@ -378,6 +391,29 @@ mod tests {
     };
     use serde_json::Value;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_strength_reverse_parsing_prefers_canonical_name() {
+        for (name, key, param, value) in [
+            ("strength_fx", "N14_FX强度V260601", "n", 14),
+            ("strength_bi_div", "N10_笔背驰强度V260601", "n", 10),
+            ("strength_zs_revert", "K15_中枢回归强度V260601", "k", 15),
+            ("strength_zs_break", "N10_中枢脱离强度V260601", "n", 10),
+            ("strength_flow", "N20K20_资金流强度V260601", "k", 20),
+            (
+                "strength_squeeze",
+                "N14M60TH30_压缩扩张强度V260601",
+                "m",
+                60,
+            ),
+        ] {
+            let cfg = SignalConfig::from_signal_str(&format!("30分钟_{key}_看多_任意_任意_50"))
+                .expect("canonical config");
+            assert_eq!(cfg.name, name);
+            assert_eq!(cfg.freq.as_deref(), Some("30分钟"));
+            assert_eq!(cfg.params.get(param), Some(&Value::from(value)));
+        }
+    }
 
     #[test]
     fn test_from_signal_str_parses_bar_single_di_n() {

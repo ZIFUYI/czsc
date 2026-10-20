@@ -12,7 +12,7 @@
 
 ## 提供的宏
 
-- `#[signal(category = "kline", template = "{freq}_{name}_{ver}")]`
+- `#[signal(category = "kline", name = "my_signal", template = "{freq}_参数_信号", opcode = "MySignal", param_kind = "MyParams")]`
   —— 标记一个函数为信号入口，校验签名并把元数据写入 `inventory`
 - `#[signal_module(category = "kline")]`
   —— 标记一个 `mod` 为信号模块，统一应用类别默认值
@@ -23,6 +23,7 @@
 [dependencies]
 czsc-signal-macros = "1.0"
 czsc-signals       = "1.0"
+czsc-core          = "1.0"
 inventory          = "0.3"
 ```
 
@@ -33,10 +34,20 @@ use czsc_signal_macros::{signal, signal_module};
 pub mod my_signals {
     use super::*;
 
-    #[signal(template = "{freq}_我的信号_V250101")]
-    pub fn sig_v250101(/* ... */) -> /* ... */ { /* ... */ }
+    use czsc_core::{analyze::CZSC, objects::signal::Signal};
+    use czsc_signals::{params::ParamView, types::TaCache};
+
+    #[signal(
+        category = "kline", name = "my_signal", template = "{freq}_默认_我的信号",
+        opcode = "MySignal", param_kind = "MyParams"
+    )]
+    pub fn my_signal(_c: &CZSC, _params: &ParamView, _cache: &mut TaCache) -> Vec<Signal> {
+        Vec::new()
+    }
 }
 ```
+
+新信号名称与 Rust 函数名一致，不使用日期后缀。既有 `foo_v230101` / `foo_V230101` 名称仍可作为兼容入口，宏会继续校验其版本与模板一致。
 
 ## 项目主页
 

@@ -33,12 +33,12 @@ from examples.alpha_mining_agent.hypothesis_bank import ALL_SIGNAL_SPECS  # noqa
 from examples.multi_factor_cta.data_engine import (  # noqa: E402
     AssetClass,
     CrossAssetDataEngine,
-    map_tf_weight_to_base_grid,
 )
-from examples.multi_factor_cta.factor_engine import RuleFactorRegistry  # noqa: E402
+from examples.multi_factor_cta.run_framework_demo import load_research_universe, synthesize_admitted_asset  # noqa: E402
 from examples.multi_factor_cta.synthesis_engine import (  # noqa: E402
     CrossAssetHRPSynthesizer,
     IntraAssetThreePillarSynthesizer,
+    build_asset_execution_inputs,
     evaluate_single_asset_backtest,
 )
 from examples.multi_factor_cta.test_all_weather_9assets_portfolio import (  # noqa: E402
@@ -89,7 +89,7 @@ def compute_latest_pillar_breakdown(
             else:
                 wc += val
         a_last += tw * float(np.clip(wa, -1.0, 1.0))
-        b_last += 0.0 if is_commodity else tw * float(np.clip(wb, -1.0, 1.0))
+        b_last += tw * float(np.clip(wb, -1.0, 1.0))
         c_last += tw * float(np.clip(wc, -1.0, 1.0))
 
     regimes = intra_synth._get_causal_regimes(df_grid)
@@ -110,7 +110,6 @@ def main() -> None:
     print("=" * 135)
 
     data_engine = CrossAssetDataEngine(cache_dir=WORKSPACE_DIR)
-    registry = RuleFactorRegistry()
     intra_synth = IntraAssetThreePillarSynthesizer()
     hrp_synth = CrossAssetHRPSynthesizer(target_portfolio_vol=0.14)
 
@@ -118,38 +117,32 @@ def main() -> None:
     champ_alloc: dict[str, float] = json.loads(champ_path.read_text(encoding="utf-8"))["alloc_map"]
 
     universe = build_nine_assets_universe()
+    pool_frames = load_research_universe(data_engine, [spec for _, spec in universe])
     asset_daily_returns: dict[str, pd.Series] = {}
+    execution_returns, execution_positions, execution_strengths, execution_fees = {}, {}, {}, {}
     asset_sectors: dict[str, str] = {}
     live_snapshots: dict[str, dict] = {}
 
     for short_id, spec in universe:
         is_comm = spec.asset_class == AssetClass.COMMODITY_FUTURES
-        tf_dfs = data_engine.load_asset_multi_timeframes(spec, attach_czsc=not is_comm)
+        tf_dfs = pool_frames[spec.symbol]
         df_grid = tf_dfs[spec.base_tf]
-
-        w_on_grid: dict[str, np.ndarray] = {}
-        active_alloc: dict[str, float] = {}
-        for uid, w_val in champ_alloc.items():
-            sid, tf = uid.split("@")
-            if tf not in spec.eligible_tfs:
-                continue
-            if is_comm:
-                if sid.startswith("CZ") or sid.startswith("M5"):
-                    continue
-                sig_spec = registry._factors.get(sid)
-                if sig_spec is not None and sig_spec.archetype == "B_背驰反转簇":
-                    continue
-            _, w_arr = registry.evaluate_factor_on_tf(tf_dfs[tf], sid, tf)
-            w_on_grid[uid] = map_tf_weight_to_base_grid(tf_dfs[tf], w_arr, df_grid)
-            active_alloc[uid] = w_val
-
-        w_synth = intra_synth.synthesize(
-            df_grid,
-            w_on_grid,
-            active_alloc,
+        w_synth, w_on_grid, active_alloc, audits = synthesize_admitted_asset(
             spec,
-            enable_regime_gating=True,
+            pool_frames,
+            sorted(champ_alloc),
+            intra_synth,
         )
+        # A prospective next-open order snapshot uses information at the latest
+        # close; its allocation ledger is not a realized execution backtest.
+        execution_returns[short_id], execution_positions[short_id] = build_asset_execution_inputs(
+            df_grid, w_synth, execution_clock="close", liquidate_at_end=False
+        )
+        execution_fees[short_id] = spec.fee_rate
+        if "cs_strength" in df_grid:
+            execution_strengths[short_id] = pd.Series(
+                df_grid["cs_strength"].to_numpy(), index=execution_returns[short_id].index
+            )
         ev = evaluate_single_asset_backtest(df_grid, w_synth, spec.symbol, fee_rate=spec.fee_rate)
         asset_daily_returns[short_id] = ev["daily_return"]
         asset_sectors[short_id] = spec.sector
@@ -181,8 +174,17 @@ def main() -> None:
             "oos_sharpe": ev["oos"]["sharpe"],
         }
 
-    hrp_res = hrp_synth.build_multi_asset_portfolio(asset_daily_returns, asset_sectors)
-    common_dates = pd.DataFrame(asset_daily_returns).dropna().index
+    hrp_res = hrp_synth.build_multi_asset_portfolio(
+        execution_returns,
+        asset_sectors,
+        asset_positions_df=execution_positions,
+        asset_cs_strength_df=execution_strengths,
+        asset_fee_rates=execution_fees,
+        returns_kind="price",
+        positions_timing="close",
+        periods_per_year=252 * 48,
+    )
+    common_dates = pd.DataFrame(execution_returns).dropna().index
     ref_dt = common_dates[-1] if len(common_dates) > 0 else hrp_res["equal_weights_df"].index[-1]
     eq_w_last = hrp_res["equal_weights_df"].loc[ref_dt]
     hrp_unscaled_last = hrp_res["unscaled_hrp_weights_df"].loc[ref_dt]
@@ -200,7 +202,7 @@ def main() -> None:
         snap["w_hrp_base_pct"] = round(w_hrp_base * 100.0, 1)
         snap["w_hrp_eff_pct"] = round(w_hrp_eff * 100.0, 1)
         snap["net_pos_1n_pct"] = round(w_1n * w_sig * 100.0, 2)
-        snap["net_pos_hrp_pct"] = round(w_hrp_eff * w_sig * 100.0, 2)
+        snap["net_pos_hrp_pct"] = round(w_hrp_eff * 100.0, 2)
 
         monitor_rows.append(
             {
@@ -210,7 +212,7 @@ def main() -> None:
                 "最新时间": snap["latest_dt"][:16],
                 "当前趋势状态": snap["regime_label"],
                 "A簇(顺势)": f"{snap['A_signal']:+.2f}",
-                "B簇(反转)": "已剔除" if snap["is_commodity"] else f"{snap['B_signal']:+.2f}",
+                "B簇(反转)": f"{snap['B_signal']:+.2f}",
                 "C簇(结构)": f"{snap['C_signal']:+.2f}",
                 "单品种信号w": f"{w_sig:+.2f}",
                 "60日波动率": f"{snap['vol_60d_pct']:.1f}%",
@@ -256,18 +258,18 @@ def main() -> None:
         cards_html += f"""
         <div class="p-3 rounded-xl bg-[var(--background)] border border-[var(--border)] flex flex-col justify-between">
           <div class="flex items-center justify-between">
-            <span class="font-bold text-sm text-[var(--foreground)]">{s['short_id']} · {s['name'].split('_')[1]}</span>
+            <span class="font-bold text-sm text-[var(--foreground)]">{s["short_id"]} · {s["name"].split("_")[1]}</span>
             <span class="px-2 py-0.5 rounded-full text-[11px] font-semibold border {badge_cls}">{dir_txt} ({w_sig:+.2f})</span>
           </div>
-          <div class="text-[11px] text-[var(--muted-foreground)] mt-1">板块: {s['sector']} | 状态: {s['regime_label'].split(' ')[0]}</div>
+          <div class="text-[11px] text-[var(--muted-foreground)] mt-1">板块: {s["sector"]} | 状态: {s["regime_label"].split(" ")[0]}</div>
           <div class="grid grid-cols-3 gap-1 my-2 text-[11px] font-mono bg-slate-900/50 p-1.5 rounded-lg border border-slate-800">
-            <div>A顺势: <span class="text-emerald-400">{s['A_signal']:+.2f}</span></div>
-            <div>B反转: <span class="text-amber-400">{'剔除' if s['is_commodity'] else f"{s['B_signal']:+.2f}"}</span></div>
-            <div>C结构: <span class="text-sky-400">{s['C_signal']:+.2f}</span></div>
+            <div>A顺势: <span class="text-emerald-400">{s["A_signal"]:+.2f}</span></div>
+            <div>B反转: <span class="text-amber-400">{"剔除" if s["is_commodity"] else f"{s['B_signal']:+.2f}"}</span></div>
+            <div>C结构: <span class="text-sky-400">{s["C_signal"]:+.2f}</span></div>
           </div>
           <div class="flex items-center justify-between text-xs pt-1 border-t border-[var(--border)]">
-            <span class="text-[var(--muted-foreground)]">等权1/N: <b class="text-sky-400">{s['w_1n_pct']:.1f}%</b> | HRP权重: <b class="text-emerald-400">{s['w_hrp_eff_pct']:.1f}%</b></span>
-            <span class="font-mono font-bold text-[var(--foreground)]">目标仓位: {s['net_pos_hrp_pct']:+.1f}%</span>
+            <span class="text-[var(--muted-foreground)]">等权1/N: <b class="text-sky-400">{s["w_1n_pct"]:.1f}%</b> | HRP权重: <b class="text-emerald-400">{s["w_hrp_eff_pct"]:.1f}%</b></span>
+            <span class="font-mono font-bold text-[var(--foreground)]">目标仓位: {s["net_pos_hrp_pct"]:+.1f}%</span>
           </div>
         </div>
         """

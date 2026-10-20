@@ -1,5 +1,170 @@
 //! 纯 Rust 实现
 
+/// Wilder RSI, shared by research features and signal caches.
+///
+/// Returns one value per close. The first `timeperiod` entries are NaN; the
+/// first value is seeded from the mean of the first `timeperiod` changes, then
+/// Wilder smoothing is used. Flat prices yield 0, gains without losses yield
+/// 100. Empty input is empty; zero/insufficient periods yield all NaN.
+pub fn rsi(close: &[f64], timeperiod: usize) -> Vec<f64> {
+    let now_len = close.len();
+    let mut rsi_res = vec![f64::NAN; now_len];
+    if now_len <= timeperiod || timeperiod == 0 {
+        return rsi_res;
+    }
+
+    let mut avg_gain = 0.0;
+    let mut avg_loss = 0.0;
+    for i in 1..=timeperiod {
+        let change = close[i] - close[i - 1];
+        if change > 0.0 {
+            avg_gain += change;
+        } else {
+            avg_loss += -change;
+        }
+    }
+    avg_gain /= timeperiod as f64;
+    avg_loss /= timeperiod as f64;
+
+    rsi_res[timeperiod] = {
+        let sum = avg_gain + avg_loss;
+        if sum != 0.0 {
+            100.0 * (avg_gain / sum)
+        } else {
+            0.0
+        }
+    };
+
+    for i in (timeperiod + 1)..now_len {
+        let delta = close[i] - close[i - 1];
+
+        // 逐步对齐 TA-Lib: 先乘 period-1，再加今日涨跌，最后除以 period。
+        avg_gain *= timeperiod as f64 - 1.0;
+        avg_loss *= timeperiod as f64 - 1.0;
+        if delta < 0.0 {
+            avg_loss -= delta;
+        } else {
+            avg_gain += delta;
+        }
+        avg_gain /= timeperiod as f64;
+        avg_loss /= timeperiod as f64;
+
+        let sum = avg_gain + avg_loss;
+        rsi_res[i] = if sum != 0.0 {
+            100.0 * (avg_gain / sum)
+        } else {
+            0.0
+        };
+    }
+
+    rsi_res
+}
+
+/// Canonical MACD `(dif, dea, histogram)` with SMA-seeded EMAs.
+///
+/// All three outputs keep the input length and share the full signal-line
+/// warmup. The histogram is `dif - dea`, without the display-only factor of 2.
+/// Empty input is empty; zero periods or insufficient observations yield NaN.
+pub fn macd(series: &[f64], short: usize, long: usize, m: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let len = series.len();
+    let mut dif = vec![f64::NAN; len];
+    let mut dea = vec![f64::NAN; len];
+    let mut macd = vec![f64::NAN; len];
+    if len == 0 || short == 0 || long == 0 || m == 0 || len < long {
+        return (dif, dea, macd);
+    }
+
+    let fast_offset = long.saturating_sub(short);
+    let ema_short_tail = calc_ema_talib_style(&series[fast_offset..], short);
+    let ema_long = calc_ema_talib_style(series, long);
+    let mut dif_input = vec![f64::NAN; len];
+    let mut dif_raw = vec![f64::NAN; len];
+    for i in 0..len {
+        let ema_short_i = if i >= fast_offset {
+            ema_short_tail[i - fast_offset]
+        } else {
+            f64::NAN
+        };
+        if ema_short_i.is_finite() && ema_long[i].is_finite() {
+            dif_raw[i] = ema_short_i - ema_long[i];
+            dif_input[i] = dif_raw[i];
+        }
+    }
+
+    dea = calc_ema_talib_skip_leading_nan(&dif_input, m);
+
+    for i in 0..len {
+        if dif_raw[i].is_finite() && dea[i].is_finite() {
+            dif[i] = dif_raw[i];
+            macd[i] = dif_raw[i] - dea[i];
+        }
+    }
+
+    (dif, dea, macd)
+}
+
+fn calc_ema_talib_style(series: &[f64], n: usize) -> Vec<f64> {
+    let len = series.len();
+    let mut out = vec![f64::NAN; len];
+    if len < n || n == 0 {
+        return out;
+    }
+    let alpha = 2.0 / (n as f64 + 1.0);
+    let seed = series[..n].iter().sum::<f64>() / n as f64;
+    out[n - 1] = seed;
+    for i in n..len {
+        out[i] = alpha * series[i] + (1.0 - alpha) * out[i - 1];
+    }
+    out
+}
+
+fn calc_ema_talib_skip_leading_nan(series: &[f64], n: usize) -> Vec<f64> {
+    let len = series.len();
+    let mut out = vec![f64::NAN; len];
+    let Some(start) = series.iter().position(|x| x.is_finite()) else {
+        return out;
+    };
+    let tail = calc_ema_talib_style(&series[start..], n);
+    for (i, value) in tail.into_iter().enumerate() {
+        out[start + i] = value;
+    }
+    out
+}
+
+/// Close-to-close on-balance volume, seeded with the first observed volume.
+///
+/// Rising closes add volume, falling closes subtract it, and unchanged closes
+/// add zero. This is distinct from legacy candle-body flow signals, which use
+/// close versus open. Non-finite data makes that value and the remaining output
+/// NaN. Empty inputs return an empty vector; unequal lengths return an error.
+pub fn obv(close: &[f64], volume: &[f64]) -> Result<Vec<f64>, &'static str> {
+    if close.len() != volume.len() {
+        return Err("close and volume must have the same length");
+    }
+    if close.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut output = vec![f64::NAN; close.len()];
+    if !close[0].is_finite() || !volume[0].is_finite() {
+        return Ok(output);
+    }
+    output[0] = volume[0];
+    for i in 1..close.len() {
+        if !close[i].is_finite() || !volume[i].is_finite() {
+            break;
+        }
+        let flow = if close[i] > close[i - 1] {
+            volume[i]
+        } else if close[i] < close[i - 1] {
+            -volume[i]
+        } else {
+            0.0
+        };
+        output[i] = output[i - 1] + flow;
+    }
+    Ok(output)
+}
+
 /// 简单移动平均 —— 与 talib.SMA 兼容。
 ///
 /// 返回 `series` 在窗口大小为 `n` 下的滚动均值。索引 0..n-1 用 NaN

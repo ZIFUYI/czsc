@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
 import czsc
@@ -104,8 +105,11 @@ def test_strength_signals_reachable_via_generate_czsc_signals():
     """通过公共 API（generate_czsc_signals）能解析并计算 strength 信号，score 以第 4 段落盘。"""
     df = generate_symbol_kines("000001", "30分钟", "20230101", "20230630", seed=11)
     bars = format_standard_kline(df, freq=Freq.F30)
-    cfg = [{"name": name, "freq": Freq.F30.value} for name in STRENGTH_SIGNALS]
+    cfg = [{"name": name.removesuffix("_V260601"), "freq": Freq.F30.value} for name in STRENGTH_SIGNALS]
     out = czsc.generate_czsc_signals(bars, cfg, sdt="2023-02-01", init_n=100, df=True)
+    legacy_cfg = [{"name": name, "freq": Freq.F30.value} for name in STRENGTH_SIGNALS]
+    legacy = czsc.generate_czsc_signals(bars, legacy_cfg, sdt="2023-02-01", init_n=100, df=True)
+    pd.testing.assert_frame_equal(out.sort_index(axis=1), legacy.sort_index(axis=1))
     sig_cols = [c for c in out.columns if "V260601" in c]
     assert len(sig_cols) == len(STRENGTH_SIGNALS)
     for col in sig_cols:
@@ -113,3 +117,30 @@ def test_strength_signals_reachable_via_generate_czsc_signals():
         assert parts.shape[1] == 4  # v1_v2_v3_score
         scores = parts[3].astype(int)
         assert scores.between(0, 100).all()
+
+
+@pytest.mark.parametrize("legacy_name", STRENGTH_SIGNALS)
+def test_strength_canonical_name_matches_legacy(legacy_name: str, czsc_obj: CZSC):
+    canonical = legacy_name.removesuffix("_V260601")
+    assert canonical in native.list_signal_names("strength")
+    assert native.get_signal_template(canonical) == native.get_signal_template(legacy_name)
+    old = native.call_signal(legacy_name, czsc_obj)
+    new = native.call_signal(canonical, czsc_obj)
+    assert [signal.to_json() for signal in old] == [signal.to_json() for signal in new]
+
+
+def test_research_default_strength_config_uses_canonical_names():
+    from examples.alpha_mining_agent.hypothesis_bank import _extended_native_signal_cfgs
+
+    names = [item["name"].rsplit(".", 1)[-1] for item in _extended_native_signal_cfgs("30分钟")]
+    assert {name.removesuffix("_V260601") for name in STRENGTH_SIGNALS}.issubset(names)
+    assert not set(STRENGTH_SIGNALS).intersection(names)
+
+
+@pytest.mark.parametrize("legacy_name", STRENGTH_SIGNALS)
+def test_strength_reverse_config_prefers_canonical_name(legacy_name: str, czsc_obj: CZSC):
+    signal = native.call_signal(legacy_name, czsc_obj)[0]
+    # Use a non-default target value so the public parser includes the signal.
+    configs = czsc.get_signals_config([f"{signal.key}_看多_任意_任意_50"])
+    assert len(configs) == 1
+    assert configs[0]["name"].rsplit(".", 1)[-1] == legacy_name.removesuffix("_V260601")

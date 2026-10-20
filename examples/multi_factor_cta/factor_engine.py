@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from czsc import Event, Freq, Operate, Position, Signal, format_standard_kline
+from czsc import Event, Operate, Position, Signal
 from examples.alpha_mining_agent.hypothesis_bank import (
     ALL_SIGNAL_SPECS,
     ARCHETYPE_RULERS,
@@ -30,6 +30,7 @@ from examples.alpha_mining_agent.hypothesis_bank import (
     CANDIDATE_HYPOTHESIS_POOL,
     TF_SCALE_MAP,
     compute_signal_triggers_and_weights,
+    research_bars,
 )
 
 
@@ -118,19 +119,22 @@ class RuleFactorRegistry:
 
     @classmethod
     def compute_asset_vol_multiplier(cls, df_tf: pd.DataFrame, tf: str) -> float:
+        """Read a frozen, pre-sample volatility calibration; never fit to the evaluated history.
+
+        The caller supplies ``df.attrs["vol_calibration"]`` with ``multiplier`` and
+        ``calibrated_until`` from a strictly earlier training slice. A reference asset
+        is not exempt from this boundary check.
         """
-        计算标的在当前周期上的因果相对波动率乘数 κ_s(τ)：
-        采用样本内 75% 分位 ATR% (兼顾商品夜盘厚尾脉冲) 与参考基准对齐，使规则内部空间阈值适配高低波品种。
-        """
-        ref = cls.REF_BAR_ATR_PCT.get(tf, 0.0061)
-        is_sub = df_tf[df_tf["dt"] <= pd.Timestamp("2023-12-31 23:59:59")]
-        if len(is_sub) < 30:
-            is_sub = df_tf
-        atr_pct = (is_sub["atr14"] / np.maximum(is_sub["close"], 1e-6)).dropna()
-        if len(atr_pct) == 0:
-            return 1.0
-        p75_atr = float(np.percentile(atr_pct.values, 75))
-        return float(np.clip(p75_atr / ref, 0.75, 1.80))
+        del tf
+        calibration = df_tf.attrs.get("vol_calibration")
+        if not isinstance(calibration, dict) or not {"multiplier", "calibrated_until"} <= calibration.keys():
+            raise ValueError("missing calibration: adaptive volatility requires a frozen pre-sample calibration")
+        if df_tf.empty or pd.Timestamp(calibration["calibrated_until"]) >= pd.to_datetime(df_tf["dt"]).min():
+            raise ValueError("invalid calibration: calibrated_until must be strictly before the evaluation sample")
+        multiplier = float(calibration["multiplier"])
+        if not np.isfinite(multiplier) or not 0.75 <= multiplier <= 1.80:
+            raise ValueError("invalid calibration: multiplier must be finite and within [0.75, 1.80]")
+        return multiplier
 
     def evaluate_factor_on_tf(
         self,
@@ -148,25 +152,27 @@ class RuleFactorRegistry:
         resolved_id = self._resolve_factor_id(factor_id)
         spec = self._factors[resolved_id]
         base_scale = TF_SCALE_MAP.get(tf, 1.0)
-        vol_mult = (
-            1.0
-            if (not adaptive_vol_scale or str(df_tf["symbol"].iloc[0]) == "SZSE.159915")
-            else self.compute_asset_vol_multiplier(df_tf, tf)
-        )
+        vol_mult = 1.0 if not adaptive_vol_scale else self.compute_asset_vol_multiplier(df_tf, tf)
         scale = base_scale * vol_mult
 
         if spec.mode == "custom_func" and spec.custom_eval_func is not None:
             trig, w = spec.custom_eval_func(df_tf, scale)
         elif spec.mode == "czsc_position" and spec.czsc_position_builder is not None:
             trig, w = self._eval_czsc_native_position(df_tf, spec.czsc_position_builder(tf), tf)
+        elif spec.output_kind == "continuous":
+            from examples.multi_factor_cta.atomic_factors import compute_atomic_signal
+
+            trig, w = compute_atomic_signal(df_tf, resolved_id, scale=scale, soft_gate=False)
         elif resolved_id in ALL_SIGNAL_SPECS:
             trig, w = compute_signal_triggers_and_weights(df_tf, resolved_id, scale=scale)
         else:
             raise KeyError(f"Factor {factor_id} has no valid evaluation backend.")
 
-        if soft_gate is not None and soft_gate is not False:
-            from examples.multi_factor_cta.atomic_factors import SoftCrossSectionalGate
+        # Registry owns the single gate application, including dataframe-attached configuration.
+        from examples.multi_factor_cta.atomic_factors import SoftCrossSectionalGate, _unbox
 
+        soft_gate = soft_gate if soft_gate is not None else _unbox(df_tf, "soft_gate")
+        if soft_gate is not None and soft_gate is not False:
             gate_obj = soft_gate if isinstance(soft_gate, SoftCrossSectionalGate) else SoftCrossSectionalGate()
             cs_rank = gate_obj.extract_cs_rank(df_tf)
             if cs_rank is not None:
@@ -178,24 +184,10 @@ class RuleFactorRegistry:
 
     @staticmethod
     def _eval_czsc_native_position(df_tf: pd.DataFrame, pos: Position, tf: str) -> tuple[np.ndarray, np.ndarray]:
-        """支持直接通过 czsc.Position / Event 原生状态机导出触发与持仓序列"""
-        freq_map = {
-            "5m": Freq.F5,
-            "15m": Freq.F15,
-            "30m": Freq.F30,
-            "60m": Freq.F60,
-            "1d": Freq.D,
-        }
-        df_std = df_tf[["dt", "symbol", "open", "close", "high", "low", "volume"]].copy()
-        df_std = df_std.rename(columns={"volume": "vol"})
-        df_std["amount"] = df_std["close"] * df_std["vol"]
-        bars = format_standard_kline(df_std, freq=freq_map.get(tf, Freq.F30))
-        n = len(bars)
-        w_arr = np.zeros(n, dtype=np.float64)
-        t_arr = np.zeros(n, dtype=np.int8)
-        # 若 df_tf 已挂载对应列则直接映射
-        _ = pos
-        return t_arr, w_arr
+        """Serialize the research frame for the shared Rust Position replay (close-time targets)."""
+        bars = research_bars(df_tf, tf)
+        triggers, weights = pos.evaluate_signals(bars, df_tf.astype(str).to_dict("records"))
+        return np.asarray(triggers, dtype=bool), np.asarray(weights, dtype=np.float64)
 
 
 def build_sample_czsc_native_event_spec(

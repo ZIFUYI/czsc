@@ -57,6 +57,7 @@ class AdmittedSignalRecord:
     oos_excess_alpha_pct: float
     oos_safety_margin_pct: float
     admitted_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    admission_audit: dict[str, Any] = field(default_factory=dict)
 
 
 class AgentStateLedger:

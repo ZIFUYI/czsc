@@ -253,45 +253,7 @@ fn calc_wma_cache_style(series: &[f64], n: usize) -> Vec<f64> {
 /// - `dea` = 信号线
 /// - `macd` = 柱状图
 pub fn calc_macd(series: &[f64], short: usize, long: usize, m: usize) -> MacdSeries {
-    let len = series.len();
-    let mut dif = vec![f64::NAN; len];
-    let mut dea = vec![f64::NAN; len];
-    let mut macd = vec![f64::NAN; len];
-    if len == 0 || short == 0 || long == 0 || m == 0 || len < long {
-        return MacdSeries {
-            ids: Vec::new(),
-            dif,
-            dea,
-            macd,
-        };
-    }
-
-    let fast_offset = long.saturating_sub(short);
-    let ema_short_tail = calc_ema_talib_style(&series[fast_offset..], short);
-    let ema_long = calc_ema_talib_style(series, long);
-    let mut dif_input = vec![f64::NAN; len];
-    let mut dif_raw = vec![f64::NAN; len];
-    for i in 0..len {
-        let ema_short_i = if i >= fast_offset {
-            ema_short_tail[i - fast_offset]
-        } else {
-            f64::NAN
-        };
-        if ema_short_i.is_finite() && ema_long[i].is_finite() {
-            dif_raw[i] = ema_short_i - ema_long[i];
-            dif_input[i] = dif_raw[i];
-        }
-    }
-
-    dea = calc_ema_talib_skip_leading_nan(&dif_input, m);
-
-    for i in 0..len {
-        if dif_raw[i].is_finite() && dea[i].is_finite() {
-            dif[i] = dif_raw[i];
-            macd[i] = dif_raw[i] - dea[i];
-        }
-    }
-
+    let (dif, dea, macd) = czsc_ta::pure::macd(series, short, long, m);
     MacdSeries {
         ids: Vec::new(),
         dif,
@@ -311,19 +273,6 @@ fn calc_ema_talib_style(series: &[f64], n: usize) -> Vec<f64> {
     out[n - 1] = seed;
     for i in n..len {
         out[i] = alpha * series[i] + (1.0 - alpha) * out[i - 1];
-    }
-    out
-}
-
-fn calc_ema_talib_skip_leading_nan(series: &[f64], n: usize) -> Vec<f64> {
-    let len = series.len();
-    let mut out = vec![f64::NAN; len];
-    let Some(start) = series.iter().position(|x| x.is_finite()) else {
-        return out;
-    };
-    let tail = calc_ema_talib_style(&series[start..], n);
-    for (i, value) in tail.into_iter().enumerate() {
-        out[start + i] = value;
     }
     out
 }
@@ -1274,57 +1223,7 @@ fn calc_sar(high: &[f64], low: &[f64], acceleration: f64, max_acceleration: f64)
 }
 
 fn calc_rsi(close: &[f64], timeperiod: usize) -> Vec<f64> {
-    let now_len = close.len();
-    let mut rsi_res = vec![f64::NAN; now_len];
-    if now_len <= timeperiod || timeperiod == 0 {
-        return rsi_res;
-    }
-
-    let mut avg_gain = 0.0;
-    let mut avg_loss = 0.0;
-    for i in 1..=timeperiod {
-        let change = close[i] - close[i - 1];
-        if change > 0.0 {
-            avg_gain += change;
-        } else {
-            avg_loss += -change;
-        }
-    }
-    avg_gain /= timeperiod as f64;
-    avg_loss /= timeperiod as f64;
-
-    rsi_res[timeperiod] = {
-        let sum = avg_gain + avg_loss;
-        if sum != 0.0 {
-            100.0 * (avg_gain / sum)
-        } else {
-            0.0
-        }
-    };
-
-    for i in (timeperiod + 1)..now_len {
-        let delta = close[i] - close[i - 1];
-
-        // 逐步对齐 TA-Lib: 先乘 period-1，再加今日涨跌，最后除以 period。
-        avg_gain *= timeperiod as f64 - 1.0;
-        avg_loss *= timeperiod as f64 - 1.0;
-        if delta < 0.0 {
-            avg_loss -= delta;
-        } else {
-            avg_gain += delta;
-        }
-        avg_gain /= timeperiod as f64;
-        avg_loss /= timeperiod as f64;
-
-        let sum = avg_gain + avg_loss;
-        rsi_res[i] = if sum != 0.0 {
-            100.0 * (avg_gain / sum)
-        } else {
-            0.0
-        };
-    }
-
-    rsi_res
+    czsc_ta::pure::rsi(close, timeperiod)
 }
 
 fn calc_sma_nan(series: &[f64], n: usize) -> Vec<f64> {

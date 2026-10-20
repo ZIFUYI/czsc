@@ -4,17 +4,18 @@
 (Archetype-Specific Forensic Rulers & 3D Complementarity Pipeline)
 
 核心升级：
-1. 第一关 [Gate 1 · 分方向定制法医标尺 (Archetype-Specific Ruler)]：
+1. 固定 ATR 事件诊断 [Gate 1 · Archetype-Specific Ruler，不能代替实际执行准入]：
    - 趋势突破簇用趋势尺 (+2.2*ATR / -1.1*ATR / 16根)
    - 背驰反转簇用反转尺 (+1.35*ATR / -0.95*ATR / 8根)
    - 震荡回归簇用回归尺 (+1.15*ATR / -0.85*ATR / 6根)
    - 日内微结构簇用日内尺 (+1.25*ATR / -0.85*ATR / 6根)
    - 在候选信号的专属周期 (1d / 60m / 30m / 15m) 上独立执行 Purged + Next-Open + 2BP + Bootstrap 审计
-2. 第二关 [Gate 2 · 三维真互补门禁 (3D Complementarity Gate)]：
+2. 正式执行准入 [Execution]：Rust 实际结构退出交易、完整交易统计与连续扣费账本。
+3. 互补性门禁 [Gate 2 · Three-Dimensional Complementarity]：
    - 维度 A (生态位配额)：检查该战略方向是否已达配额上限 (防止扎堆单一方向)
    - 维度 B (时序低相关)：与已入库同向信号在主时间轴上的最大相关系数 |ρ_max| < 0.32
    - 维度 C (空仓填补 + 回撤期雪中送炭)：空仓期填补率 >= 35% 且 在原组合亏损/回撤时刻具备正超额收益 (dd_rescue_alpha_bp > 0)
-3. 第三关 [Gate 3 · 专属周期独立路由与组合边际增益]：
+4. 第三关 [Gate 3 · 专属周期独立路由与组合边际增益]：
    - 仅在该信号通过检验的专属周期 tf 上挂载权重（不再强制三周期一刀切捆绑），验证样本内 (2020-2023) 边际增益。
 """
 
@@ -27,12 +28,18 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from czsc import WeightBacktest
+from czsc import (
+    closed_execution_intervals,
+    daily_performance,
+    decision_execution_ledger,
+    decision_interval_ledger,
+    execution_episodes,
+    execution_ledger,
+)
 from examples.alpha_mining_agent.hypothesis_bank import (
     ALL_ARCHETYPES,
     ALL_SIGNAL_SPECS,
     ARCH_A,
-    ARCHETYPE_RULERS,
     ATOMIC_EXIT_MODE,
     TF_SCALE_MAP,
     ArchetypeRuler,
@@ -61,14 +68,19 @@ def evaluate_triple_barrier(
     sl_atr: float,
     fee_rate: float = 0.0002,
     weights_tf: np.ndarray | None = None,
+    *,
+    label_end_dt: pd.Timestamp | None = None,
+    purge_overlaps: bool = False,
 ) -> pd.DataFrame:
     """
-    评估分战略簇三重屏障标尺 (Next-Bar Open 入场 + 止盈/止损/时间屏障 + 双边费率扣除)，
+    评估分战略簇三重屏障标尺 (Next-Bar Open 入场 + 止盈/止损/时间屏障 + 实际成交数量双边计费)，
     同步提取：
     1. 触发时刻连续质量权重 `quality_w = |w_{t_k}| ∈ (0, 1]`（供连续强度因子质量加权审计）；
     2. 持仓路径内的最大有利偏离 `mfe_atr` 与最大不利偏离 `mae_atr`（以入场时刻因果 ATR 无量纲化）。
     """
     n = len(df)
+    if label_end_dt is not None:
+        n = int((pd.to_datetime(df["dt"]) <= label_end_dt).sum())
     o_arr = df["open"].values
     h_arr = df["high"].values
     l_arr = df["low"].values
@@ -76,9 +88,10 @@ def evaluate_triple_barrier(
     atr_arr = df["atr14"].values
 
     records = []
-    for idx in entry_indices:
+    last_exit = -1
+    for idx in np.sort(np.unique(entry_indices)):
         idx_int = int(idx)
-        if idx_int + 1 >= n:
+        if idx_int < 0 or idx_int + 1 >= n or (purge_overlaps and idx_int < last_exit):
             continue
         entry_p = float(o_arr[idx_int + 1])
         atr = float(atr_arr[idx_int])
@@ -88,55 +101,78 @@ def evaluate_triple_barrier(
         q_w = 1.0
         if weights_tf is not None and 0 <= idx_int < len(weights_tf):
             raw_q = abs(float(weights_tf[idx_int]))
-            if raw_q <= 1e-6 and idx_int + 1 < len(weights_tf):
-                raw_q = abs(float(weights_tf[idx_int + 1]))
-            q_w = float(np.clip(raw_q, 1e-4, 1.0)) if raw_q > 1e-6 else 1.0
+            if not np.isfinite(raw_q) or raw_q <= 0.0:
+                continue
+            q_w = float(np.clip(raw_q, 0.0, 1.0))
 
         tp_dist = tp_atr * atr
         sl_dist = sl_atr * atr
         exit_p = entry_p
-        end_bar = min(idx_int + 1 + max_bars, n - 1)
+        timeout_bar = idx_int + max(1, max_bars)
+        end_bar = min(timeout_bar, n - 1)
+        completed = False
         exit_bar = end_bar
         mfe_atr = 0.0
         mae_atr = 0.0
 
         for j in range(idx_int + 1, end_bar + 1):
+            bar_open = float(o_arr[j])
+            stop_price = entry_p - direction * sl_dist
+            if direction * (bar_open - stop_price) <= 0:
+                # A gap through the stop is executable only at the opening price, not at
+                # a skipped stop level. No later excursion of this bar was held.
+                exit_p = bar_open
+                exit_bar = j
+                completed = True
+                opening_move = direction * (bar_open - entry_p) / atr
+                mfe_atr = max(mfe_atr, opening_move, 0.0)
+                mae_atr = max(mae_atr, -opening_move, 0.0)
+                break
             hi, lo, cl = float(h_arr[j]), float(l_arr[j]), float(c_arr[j])
-            if direction == 1:
-                fav = max(0.0, (hi - entry_p) / atr)
-                adv = max(0.0, (entry_p - lo) / atr)
-                mfe_atr = max(mfe_atr, fav)
-                mae_atr = max(mae_atr, adv)
-                if lo <= entry_p - sl_dist:
-                    exit_p = entry_p - sl_dist
-                    exit_bar = j
-                    break
-                if hi >= entry_p + tp_dist:
-                    exit_p = entry_p + tp_dist
-                    exit_bar = j
-                    break
-            else:
-                fav = max(0.0, (entry_p - lo) / atr)
-                adv = max(0.0, (hi - entry_p) / atr)
-                mfe_atr = max(mfe_atr, fav)
-                mae_atr = max(mae_atr, adv)
-                if hi >= entry_p + sl_dist:
-                    exit_p = entry_p + sl_dist
-                    exit_bar = j
-                    break
-                if lo <= entry_p - tp_dist:
-                    exit_p = entry_p - tp_dist
-                    exit_bar = j
-                    break
+            opening_move = direction * (bar_open - entry_p) / atr
+            mfe_atr = max(mfe_atr, opening_move, 0.0)
+            mae_atr = max(mae_atr, -opening_move, 0.0)
+            favorable = hi if direction == 1 else lo
+            adverse = lo if direction == 1 else hi
+            stop_hit = direction * (adverse - entry_p) <= -sl_dist
+            profit_hit = direction * (favorable - entry_p) >= tp_dist
+            if opening_move >= tp_atr:
+                # An opening gap is observed before either intrabar extreme.
+                exit_p, exit_bar, completed = bar_open, j, True
+                break
+            if stop_hit:
+                # OHLC does not reveal ordering. Stop wins if both barriers hit;
+                # only the open and the executable stop were certainly held.
+                exit_p, exit_bar, completed = entry_p - direction * sl_dist, j, True
+                mae_atr = max(mae_atr, sl_atr)
+                break
+            if profit_hit:
+                exit_p, exit_bar, completed = entry_p + direction * tp_dist, j, True
+                mfe_atr = max(mfe_atr, tp_atr)
+                break
+            mfe_atr = max(mfe_atr, direction * (favorable - entry_p) / atr, 0.0)
+            mae_atr = max(mae_atr, -direction * (adverse - entry_p) / atr, 0.0)
             if j == end_bar:
                 exit_p = cl
                 exit_bar = j
+                completed = j == timeout_bar
 
-        raw_ret = (exit_p - entry_p) / entry_p if direction == 1 else (entry_p - exit_p) / entry_p
-        net_ret = raw_ret - fee_rate
+        if not completed:
+            continue  # The outcome is not observable inside this training fold.
+        last_exit = exit_bar
+        # A barrier event holds its entry quantity until exit, without intermediate
+        # rebalancing. Quality remains an independent statistical observation weight.
+        ledger = execution_ledger([entry_p, exit_p], [float(direction), 0.0], fee_rate)
+        net_ret = sum(ledger.net_returns)
         records.append(
             {
                 "trigger_idx": idx_int,
+                "entry_idx": idx_int + 1,
+                "exit_idx": int(exit_bar),
+                "trigger_dt": pd.Timestamp(df["dt"].iloc[idx_int]).isoformat(),
+                "entry_dt": pd.Timestamp(df["dt"].iloc[idx_int + 1]).isoformat(),
+                "exit_dt": pd.Timestamp(df["dt"].iloc[exit_bar]).isoformat(),
+                "atr_pct": atr / entry_p,
                 "net_ret": float(net_ret),
                 "quality_w": float(q_w),
                 "mfe_atr": float(mfe_atr),
@@ -146,6 +182,180 @@ def evaluate_triple_barrier(
         )
 
     return pd.DataFrame(records)
+
+
+_EXECUTION_EVENT_COLUMNS = (
+    "trigger_idx",
+    "entry_idx",
+    "exit_idx",
+    "direction",
+    "net_ret",
+    "weighted_net_ret",
+    "quality_w",
+    "atr_pct",
+    "mfe_atr",
+    "mae_atr",
+)
+
+
+def evaluate_execution_events(
+    df: pd.DataFrame,
+    weights_tf: np.ndarray,
+    fee_rate: float = 0.0002,
+    *,
+    label_end_dt: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Expose completed Rust execution episodes with their observed timestamps.
+
+    The input weights already include the selected structural exit policy. Same
+    direction resizing remains one episode; unfinished positions and decisions
+    without an observable next open never become independent completed samples.
+    """
+    timestamps = pd.DatetimeIndex(pd.to_datetime(df["dt"]))
+    if not timestamps.is_monotonic_increasing or timestamps.has_duplicates:
+        raise ValueError("Execution timestamps must be unique and ordered")
+    weights = np.asarray(weights_tf, dtype=np.float64)
+    if len(weights) != len(df):
+        raise ValueError("Execution weights and frame must have equal lengths")
+    n = len(df) if label_end_dt is None else int((timestamps <= label_end_dt).sum())
+    episodes = execution_episodes(
+        *(df[column].iloc[:n].to_numpy(dtype=np.float64) for column in ("open", "high", "low", "close", "atr14")),
+        weights[:n],
+        fee_rate,
+    )
+    records = []
+    for episode in episodes:
+        record = {key: getattr(episode, key) for key in _EXECUTION_EVENT_COLUMNS}
+        for key in ("trigger", "entry", "exit"):
+            record[f"{key}_dt"] = timestamps[record[f"{key}_idx"]].isoformat()
+        record["bars_held"] = record["exit_idx"] - record["entry_idx"]
+        records.append(record)
+    return pd.DataFrame(records, columns=[*_EXECUTION_EVENT_COLUMNS, "trigger_dt", "entry_dt", "exit_dt", "bars_held"])
+
+
+def compute_execution_net_metrics(
+    df: pd.DataFrame,
+    weights_tf: np.ndarray,
+    *,
+    fee_rate: float = 0.0002,
+    is_end_dt: pd.Timestamp = IS_END_DT,
+) -> dict[str, float]:
+    """Aggregate the shared Rust next-open ledger; never invent a fold-end trade."""
+    timestamps = pd.DatetimeIndex(pd.to_datetime(df["dt"]))
+    if not timestamps.is_monotonic_increasing or timestamps.has_duplicates:
+        raise ValueError("Execution timestamps must be unique and ordered")
+    mask = timestamps <= is_end_dt
+    weights = np.asarray(weights_tf, dtype=np.float64)
+    if len(weights) != len(df):
+        raise ValueError("Execution weights and frame must have equal lengths")
+    if not mask.any():
+        return {"is_net_sharpe": 0.0, "is_net_cum_ret_pct": 0.0, "is_net_mdd_pct": 0.0, "ann_turnover": 0.0}
+    ledger = decision_execution_ledger(df.loc[mask, "open"].to_numpy(dtype=np.float64), weights[mask], fee_rate)
+    daily = (
+        pd.Series(ledger.net_returns, index=pd.DatetimeIndex(pd.to_datetime(df.loc[mask, "dt"]))).resample("D").sum()
+    )
+    # Keep actual observation dates, not invented overnight/weekend sessions.
+    daily = daily.reindex(pd.DatetimeIndex(pd.to_datetime(df.loc[mask, "dt"])).normalize().unique())
+    metrics = daily_performance(daily.to_numpy(dtype=np.float64), yearly_days=252)
+    turnover = sum(ledger.turnover)
+    return {
+        "is_net_sharpe": float(metrics["夏普"]),
+        "is_net_cum_ret_pct": float(metrics["绝对收益"]) * 100.0,
+        "is_net_mdd_pct": float(metrics["最大回撤"]) * 100.0,
+        "ann_turnover": float(turnover * 252.0 / len(daily)),
+    }
+
+
+def run_execution_audit(
+    df_tf: pd.DataFrame,
+    weights_tf: np.ndarray,
+    *,
+    fee_rate: float = 0.0002,
+    is_end_dt: pd.Timestamp = IS_END_DT,
+    min_net_sharpe: float = 0.0,
+) -> dict[str, Any]:
+    """Apply formal SOP admission to completed structural-exit execution episodes.
+
+    Fixed ATR ruler results are separate diagnostics. Statistical evidence is
+    computed from actual resized, fee-paid episodes and their entry quality; the
+    continuous net Sharpe comes from the same Rust execution clock. The zero
+    exposure benchmark is explicit and is not presented as randomized-entry alpha.
+    """
+    events = evaluate_execution_events(df_tf, weights_tf, fee_rate, label_end_dt=is_end_dt)
+    count = len(events)
+    result = {
+        "passed": False,
+        "reason": "",
+        "audit_kind": "structural_execution",
+        "benchmark_kind": "zero_exposure",
+        "is_n_purged": count,
+        "is_effective_n": 0.0,
+        "is_mean_ci_low_pct": None,
+        "events": [],
+        **compute_execution_net_metrics(df_tf, weights_tf, fee_rate=fee_rate, is_end_dt=is_end_dt),
+    }
+    if not count:
+        result["reason"] = "样本内完整执行交易仅 0 次 (< 30)"
+        return result
+    returns = events["net_ret"].to_numpy(dtype=float)
+    quality = events["quality_w"].to_numpy(dtype=float)
+    effective_n = float(quality.sum() ** 2 / (quality @ quality))
+    edge = _compute_weighted_edge_metrics(returns, quality)
+    p_value, ci_low = (1.0, float("-inf"))
+    if count >= 30 and effective_n >= 30 - 1e-9:
+        p_value, ci_low = _weighted_bootstrap_evidence(
+            returns,
+            quality,
+            returns - float(np.average(returns, weights=quality)),
+            np.random.default_rng(4242),
+            paired_zero_null=True,
+        )
+    result.update(
+        {
+            "is_effective_n": effective_n,
+            "is_mean_ci_low_pct": ci_low * 100.0 if np.isfinite(ci_low) else None,
+            "is_mean_pct": edge["mean"] * 100.0,
+            "is_excess_alpha_pct": edge["mean"] * 100.0,
+            "is_win_rate_pct": edge["win_rate"] * 100.0,
+            "is_pl_ratio": edge["pl_ratio"],
+            "is_safety_margin_pct": edge["safety_margin"] * 100.0,
+            "is_boot_pval": p_value,
+            "events": events.assign(r_atr=events["net_ret"] / events["atr_pct"]).to_dict("records"),
+        }
+    )
+    reasons = []
+    if count < 30:
+        reasons.append(f"样本内完整执行交易仅 {count} 次 (< 30)")
+    if effective_n < 30 - 1e-9:
+        reasons.append(f"Q加权有效执行样本={effective_n:.2f} < 30")
+    if edge["win_rate"] <= 0.5:
+        reasons.append("实际交易胜率未超过50%")
+    if edge["pl_ratio"] <= 1.5:
+        reasons.append("实际交易盈亏比未超过1.5")
+    if ci_low <= 0.0:
+        reasons.append("实际交易净收益95%置信下界不大于0")
+    if edge["safety_margin"] <= 0.10:
+        reasons.append("实际交易安全边际未超过10%")
+    if result["is_net_sharpe"] <= min_net_sharpe:
+        reasons.append(f"实际执行扣费Sharpe未超过{min_net_sharpe:.2f}")
+    result["passed"] = not reasons
+    result["reason"] = "; ".join(reasons) if reasons else "实际结构退出交易通过 SOP 门槛"
+    # OOS episodes remain descriptive, and are never used in the acceptance decision.
+    all_events = evaluate_execution_events(df_tf, weights_tf, fee_rate)
+    oos = all_events.loc[pd.to_datetime(all_events["trigger_dt"]) > is_end_dt]
+    oos_edge = _compute_weighted_edge_metrics(
+        oos["net_ret"].to_numpy(dtype=float),
+        oos["quality_w"].to_numpy(dtype=float),
+    )
+    result.update(
+        {
+            "oos_n": len(oos),
+            "oos_mean_pct": oos_edge["mean"] * 100.0,
+            "oos_excess_alpha_pct": oos_edge["mean"] * 100.0,
+            "oos_safety_margin_pct": oos_edge["safety_margin"] * 100.0,
+        }
+    )
+    return result
 
 
 def compute_forward_rank_ic_profile(
@@ -160,8 +370,6 @@ def compute_forward_rank_ic_profile(
     以及信号一阶自相关系数、隐含半衰期与单根换手率。
     """
     is_mask = (df_tf["dt"] <= is_end_dt).values
-    if int(is_mask.sum()) < 25:
-        is_mask = np.ones(len(df_tf), dtype=bool)
 
     w_is = np.asarray(weights_tf[is_mask], dtype=np.float64)
     c_is = np.asarray(df_tf["close"].values[is_mask], dtype=np.float64)
@@ -238,6 +446,62 @@ def compute_forward_rank_ic_profile(
     }
 
 
+def _prepare_next_open_slice(df_slice: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Precompute a completed fold's execution intervals without reading outside the fold."""
+    n = len(df_slice)
+    returns = np.zeros(n, dtype=np.float64)
+    if not n:
+        return returns, np.zeros(0, dtype=np.int64)
+    timestamps = pd.DatetimeIndex(pd.to_datetime(df_slice["dt"]))
+    if not timestamps.is_monotonic_increasing or timestamps.has_duplicates:
+        raise ValueError("Execution timestamps must be unique and ordered")
+    opens = df_slice["open"].to_numpy(dtype=np.float64)
+    terminal_close = float(df_slice["close"].iloc[-1])
+    if not np.isfinite(opens).all() or (opens <= 0).any() or not np.isfinite(terminal_close) or terminal_close <= 0:
+        raise ValueError("Execution prices must be finite and positive")
+    returns[1:-1] = opens[2:] / opens[1:-1] - 1.0
+    if n > 1:
+        returns[-1] = terminal_close / opens[-1] - 1.0
+    _, day_ids = np.unique(timestamps.date, return_inverse=True)
+    return returns, day_ids
+
+
+def _fast_next_open_slice_stats(
+    interval_returns: np.ndarray,
+    day_ids: np.ndarray,
+    decision_weights: np.ndarray,
+    fee_rate: float,
+) -> dict[str, float]:
+    """Score next-open fills plus final-close liquidation using the reporting engine's statistics.
+
+    Price intervals are prepared once per fold. Rust shifts each candidate's decisions,
+    charges actual rebalancing quantities and calls the native daily metrics routine.
+    This is the same execution clock as ``backtest_slice`` without rebuilding a backtest.
+    """
+    from czsc import daily_performance
+
+    keys = ("cum_ret_pct", "ann_ret_pct", "sharpe", "mdd_pct", "calmar")
+    weights = np.asarray(decision_weights, dtype=np.float64)
+    if len(weights) != len(interval_returns) or len(weights) != len(day_ids):
+        raise ValueError("Execution intervals, dates and weights must have equal lengths")
+    if not np.isfinite(fee_rate) or fee_rate < 0 or not np.isfinite(weights).all():
+        raise ValueError("Execution weights and nonnegative fee must be finite")
+    if not len(weights):
+        return dict.fromkeys(keys, 0.0)
+    ledger = decision_interval_ledger(interval_returns, weights, fee_rate)
+    # The explicit final close belongs to the last observed day. Interval PnL
+    # belongs to its ending mark, matching the complete execution report.
+    daily = np.bincount(np.r_[day_ids, day_ids[-1]], weights=ledger.net_returns)
+    metrics = daily_performance(daily, yearly_days=252)
+    return {
+        "cum_ret_pct": float(metrics["绝对收益"] * 100),
+        "ann_ret_pct": float(metrics["年化"] * 100),
+        "sharpe": float(metrics["夏普"]),
+        "mdd_pct": float(metrics["最大回撤"] * 100),
+        "calmar": float(metrics["卡玛"]),
+    }
+
+
 def compute_single_factor_net_sharpe_and_turnover(
     df_tf: pd.DataFrame,
     weights_tf: np.ndarray,
@@ -250,8 +514,6 @@ def compute_single_factor_net_sharpe_and_turnover(
     拦截高频刷单净亏损因子。
     """
     is_mask = (df_tf["dt"] <= is_end_dt).values
-    if int(is_mask.sum()) < 20:
-        is_mask = np.ones(len(df_tf), dtype=bool)
 
     w_is = np.asarray(weights_tf[is_mask], dtype=np.float64)
     c_is = np.asarray(df_tf["close"].values[is_mask], dtype=np.float64)
@@ -259,13 +521,14 @@ def compute_single_factor_net_sharpe_and_turnover(
     if n < 2 or np.max(np.abs(w_is)) <= 1e-6:
         return {"is_net_sharpe": 0.0, "ann_turnover": 0.0, "is_net_cum_ret_pct": 0.0}
 
-    fwd_ret = np.zeros(n, dtype=np.float64)
-    fwd_ret[:-1] = (c_is[1:] - c_is[:-1]) / np.maximum(c_is[:-1], 1e-6)
-    dw = np.abs(np.diff(w_is, prepend=0.0))
-    bar_net = w_is * fwd_ret - dw * fee_rate
+    ledger = decision_execution_ledger(
+        df_tf.loc[is_mask, "open"].to_numpy(dtype=np.float64), w_is, fee_rate, terminal_close=float(c_is[-1])
+    )
+    dw = np.asarray(ledger.turnover)
+    bar_net = np.asarray(ledger.net_returns)
 
     dts = pd.to_datetime(df_tf["dt"].iloc[is_mask]).dt.date.values
-    uniq_dates, day_ids = np.unique(dts, return_inverse=True)
+    uniq_dates, day_ids = np.unique(np.r_[dts, dts[-1]], return_inverse=True)
     if len(uniq_dates) >= 5:
         daily_net = np.bincount(day_ids, weights=bar_net)
         std_d = float(daily_net.std(ddof=1)) if len(daily_net) > 1 else 0.0
@@ -291,19 +554,20 @@ def _compute_weighted_edge_metrics(rets: np.ndarray, q_weights: np.ndarray) -> d
     """根据质量权重 q_k ∈ (0, 1] 计算加权期望净收益、加权胜率、加权盈亏比与加权安全边际。"""
     if len(rets) == 0:
         return {"mean": 0.0, "win_rate": 0.0, "pl_ratio": 0.0, "safety_margin": 0.0}
-    q = np.clip(np.asarray(q_weights, dtype=np.float64), 1e-4, 1.0)
+    q = np.clip(np.asarray(q_weights, dtype=np.float64), 0.0, 1.0)
     q_sum = float(np.sum(q))
     if q_sum <= 1e-12:
-        q = np.ones_like(rets, dtype=np.float64)
-        q_sum = float(len(rets))
+        return {"mean": 0.0, "win_rate": 0.0, "pl_ratio": 0.0, "safety_margin": 0.0}
 
     w_mean = float(np.sum(q * rets) / q_sum)
     win_mask = rets > 0
     loss_mask = ~win_mask
     w_win_rate = float(np.sum(q[win_mask]) / q_sum)
-    avg_win = float(np.sum(q[win_mask] * rets[win_mask]) / np.sum(q[win_mask])) if np.any(win_mask) else 0.0
+    avg_win = float(np.sum(q[win_mask] * rets[win_mask]) / np.sum(q[win_mask])) if float(q[win_mask].sum()) > 0 else 0.0
     avg_loss = (
-        float(np.sum(q[loss_mask] * np.abs(rets[loss_mask])) / np.sum(q[loss_mask])) if np.any(loss_mask) else 1e-6
+        float(np.sum(q[loss_mask] * np.abs(rets[loss_mask])) / np.sum(q[loss_mask]))
+        if float(q[loss_mask].sum()) > 0
+        else 1e-6
     )
     pl_ratio = avg_win / max(avg_loss, 1e-6)
     be_win = 1.0 / (1.0 + pl_ratio)
@@ -316,6 +580,40 @@ def _compute_weighted_edge_metrics(rets: np.ndarray, q_weights: np.ndarray) -> d
     }
 
 
+def _weighted_bootstrap_evidence(
+    returns: np.ndarray,
+    quality: np.ndarray,
+    null_returns: np.ndarray,
+    rng: np.random.Generator,
+    iterations: int = 1000,
+    *,
+    paired_zero_null: bool = False,
+) -> tuple[float, float]:
+    """Compare the same Q-weighted statistic under the null and resample adjacent events for its CI."""
+    returns = np.asarray(returns, dtype=float)
+    quality = np.asarray(quality, dtype=float)
+    n = len(returns)
+    if n < 2 or quality.sum() <= 0 or len(null_returns) < 2:
+        return 1.0, float("-inf")
+    q = quality / quality.sum()
+    observed = float(q @ returns)
+    block = max(2, int(np.ceil(np.sqrt(n))))
+    null_means, observed_means = [], []
+    for _ in range(iterations):
+        starts = rng.integers(0, len(null_returns), size=int(np.ceil(n / block)))
+        null_idx = ((starts[:, None] + np.arange(block)) % len(null_returns)).ravel()[:n]
+        starts = rng.integers(0, n, size=int(np.ceil(n / block)))
+        idx = ((starts[:, None] + np.arange(block)) % n).ravel()[:n]
+        observed_mean = float(np.average(returns[idx], weights=quality[idx]))
+        observed_means.append(observed_mean)
+        # For an execution zero-exposure null, resample return/quality pairs and
+        # recenter that same statistic. Random-entry ruler diagnostics retain
+        # their separate null pool with the observed quality vector.
+        null_means.append(observed_mean - observed if paired_zero_null else float(q @ null_returns[null_idx]))
+    p_value = (1 + np.count_nonzero(np.asarray(null_means) >= observed)) / (iterations + 1)
+    return float(p_value), float(np.quantile(observed_means, 0.025))
+
+
 def run_gate1_forensic_audit(
     df_tf: pd.DataFrame,
     triggers_tf: np.ndarray,
@@ -325,6 +623,7 @@ def run_gate1_forensic_audit(
     rng: np.random.Generator | None = None,
     weights_tf: np.ndarray | None = None,
     fee_rate: float = 0.0002,
+    is_end_dt: pd.Timestamp = IS_END_DT,
 ) -> dict[str, Any]:
     """
     使用该战略方向专属的法医三重屏障标尺 (ruler) 在特定周期 df_tf 上执行样本内 (2020-2023) 审计。
@@ -334,12 +633,10 @@ def run_gate1_forensic_audit(
     3. 考核单因子扣费后 `is_net_sharpe` 与前向多期 Rank IC / ICIR 衰减曲线。
     """
     del rng
-    is_mask = (df_tf["dt"] <= IS_END_DT).values
-    if int(is_mask.sum()) < 25:
-        is_mask = np.ones(len(df_tf), dtype=bool)
-    oos_mask = (df_tf["dt"] > IS_END_DT).values
+    is_mask = (df_tf["dt"] <= is_end_dt).values
+    oos_mask = (df_tf["dt"] > is_end_dt).values
 
-    min_samples = 8 if timeframe == "1d" else (12 if timeframe == "60m" else (20 if timeframe == "5m" else 15))
+    min_samples = 30
     eff_max_bars = ruler.max_bars * 2 if timeframe == "5m" else ruler.max_bars
     eff_tp_atr = ruler.tp_atr * 1.35 if timeframe == "5m" else ruler.tp_atr
     eff_sl_atr = ruler.sl_atr * 1.20 if timeframe == "5m" else ruler.sl_atr
@@ -347,7 +644,7 @@ def run_gate1_forensic_audit(
 
     trig_bool = np.asarray(triggers_tf, dtype=bool)
     is_raw_idx = np.where(trig_bool & is_mask)[0]
-    is_purged_idx = purge_overlapping_triggers(is_raw_idx, cooldown_bars=eff_max_bars)
+    is_purged_idx = is_raw_idx
 
     tb_is = evaluate_triple_barrier(
         df_tf,
@@ -358,6 +655,8 @@ def run_gate1_forensic_audit(
         sl_atr=eff_sl_atr,
         fee_rate=fee_rate,
         weights_tf=weights_tf,
+        label_end_dt=is_end_dt,
+        purge_overlaps=True,
     )
     n_purged = len(tb_is)
     if n_purged < min_samples:
@@ -384,23 +683,24 @@ def run_gate1_forensic_audit(
     mfe_arr = tb_is["mfe_atr"].values
     mae_arr = tb_is["mae_atr"].values
     q_norm = q_w / max(float(np.sum(q_w)), 1e-12)
+    effective_n = float(1.0 / np.sum(q_norm**2))
     mean_mfe_atr = float(np.sum(q_norm * mfe_arr))
     mean_mae_atr = float(np.sum(q_norm * mae_arr))
     excursion_ratio = float(mean_mfe_atr / max(mean_mae_atr, 1e-6))
 
     # 500 轮随机入场置换检验 (同样使用该专属标尺)
     valid_pool = np.where(
-        is_mask & (np.arange(len(df_tf)) >= min_warmup) & (np.arange(len(df_tf)) < len(df_tf) - eff_max_bars - 2)
+        is_mask & (np.arange(len(df_tf)) >= min_warmup) & (np.arange(len(df_tf)) < int(is_mask.sum()) - eff_max_bars)
     )[0]
     if len(valid_pool) < 5:
-        valid_pool = np.arange(max(1, len(df_tf) - eff_max_bars - 2))
+        return {"passed": False, "reason": "样本内基准事件不足", "is_n_purged": n_purged}
     unit_seed = (
         4242
         + int(np.sum(is_raw_idx))
         + sum((idx + 1) * ord(c) for idx, c in enumerate(f"{ruler.archetype}_{timeframe}"))
     )
     local_rng = np.random.default_rng(unit_seed)
-    rand_pool_idx = local_rng.choice(valid_pool, size=min(1000, len(valid_pool)), replace=False)
+    rand_pool_idx = np.sort(local_rng.choice(valid_pool, size=min(1000, len(valid_pool)), replace=False))
     rand_tb = evaluate_triple_barrier(
         df_tf,
         rand_pool_idx,
@@ -409,34 +709,41 @@ def run_gate1_forensic_audit(
         tp_atr=eff_tp_atr,
         sl_atr=eff_sl_atr,
         fee_rate=fee_rate,
+        label_end_dt=is_end_dt,
+        purge_overlaps=True,
     )
-    rand_rets = rand_tb["net_ret"].values if not rand_tb.empty else np.zeros(50, dtype=np.float64)
+    if rand_tb.empty:
+        return {"passed": False, "reason": "样本内基准事件不足", "is_n_purged": n_purged}
+    rand_rets = rand_tb["net_ret"].values
     bench_drift = float(np.mean(rand_rets))
     excess_alpha = f_mean - bench_drift
 
-    boot_means = np.array([np.mean(local_rng.choice(rand_rets, size=n_purged, replace=True)) for _ in range(500)])
-    boot_pval = float(np.mean(boot_means >= f_mean))
+    boot_pval, mean_ci_low = _weighted_bootstrap_evidence(rets_is, q_w, rand_rets, local_rng)
 
     # 单因子扣费 Net Sharpe 与前向 Rank IC 衰减曲线审计
     if weights_tf is not None:
-        net_sh_pack = compute_single_factor_net_sharpe_and_turnover(df_tf, weights_tf, timeframe, fee_rate=fee_rate)
-        ic_pack = compute_forward_rank_ic_profile(df_tf, weights_tf)
+        net_sh_pack = compute_single_factor_net_sharpe_and_turnover(
+            df_tf, weights_tf, timeframe, fee_rate=fee_rate, is_end_dt=is_end_dt
+        )
+        ic_pack = compute_forward_rank_ic_profile(df_tf, weights_tf, is_end_dt=is_end_dt)
     else:
         synth_w = np.zeros(len(df_tf), dtype=np.float64)
         for row_idx, r_row in tb_is.iterrows():
             _ = row_idx
-            st_i = int(r_row["trigger_idx"]) + 1
-            ed_i = min(st_i + max(1, int(r_row["bars_held"])), len(df_tf))
+            st_i = int(r_row["trigger_idx"])
+            ed_i = int(r_row["exit_idx"])
             synth_w[st_i:ed_i] = float(direction)
-        net_sh_pack = compute_single_factor_net_sharpe_and_turnover(df_tf, synth_w, timeframe, fee_rate=fee_rate)
-        ic_pack = compute_forward_rank_ic_profile(df_tf, synth_w)
+        net_sh_pack = compute_single_factor_net_sharpe_and_turnover(
+            df_tf, synth_w, timeframe, fee_rate=fee_rate, is_end_dt=is_end_dt
+        )
+        ic_pack = compute_forward_rank_ic_profile(df_tf, synth_w, is_end_dt=is_end_dt)
 
     is_net_sharpe = float(net_sh_pack["is_net_sharpe"])
     ann_turnover = float(net_sh_pack["ann_turnover"])
 
     # 样本外 (2024-2026) 盲测表现跟踪
     oos_raw_idx = np.where(trig_bool & oos_mask)[0]
-    oos_purged_idx = purge_overlapping_triggers(oos_raw_idx, cooldown_bars=eff_max_bars)
+    oos_purged_idx = oos_raw_idx
     tb_oos = evaluate_triple_barrier(
         df_tf,
         oos_purged_idx,
@@ -446,6 +753,7 @@ def run_gate1_forensic_audit(
         sl_atr=eff_sl_atr,
         fee_rate=fee_rate,
         weights_tf=weights_tf,
+        purge_overlaps=True,
     )
     if len(tb_oos) >= 2:
         r_oos = tb_oos["net_ret"].values
@@ -459,23 +767,35 @@ def run_gate1_forensic_audit(
 
     tf_alpha_scale = {"1d": 1.2, "60m": 1.0, "30m": 0.85, "15m": 0.55, "5m": 0.40}.get(timeframe, 1.0)
     min_alpha_dec = (ruler.min_alpha_bp * tf_alpha_scale) / 10000.0
-    min_safety_dec = ruler.min_safety_pct / 100.0
-    max_pval = ruler.max_boot_pval + (0.02 if timeframe in ("60m", "1d") else 0.0)
+    min_safety_dec = max(0.10, ruler.min_safety_pct / 100.0)
+    max_pval = min(0.05, ruler.max_boot_pval)
     min_exc_ratio = float(getattr(ruler, "min_excursion_ratio", 0.90))
     min_net_sh = float(getattr(ruler, "min_net_sharpe", 0.0))
 
     passed = (
-        excess_alpha >= min_alpha_dec
-        and safety_margin >= min_safety_dec
+        effective_n >= min_samples - 1e-9
+        and f_win > 0.50
+        and pl_ratio > 1.5
+        and mean_ci_low > 0.0
+        and excess_alpha >= min_alpha_dec
+        and safety_margin > min_safety_dec
         and boot_pval <= max_pval
         and excursion_ratio >= min_exc_ratio
         and (weights_tf is None or is_net_sharpe > min_net_sh)
     )
     reasons = []
+    if effective_n < min_samples - 1e-9:
+        reasons.append(f"Q加权有效样本数={effective_n:.2f} < {min_samples}")
+    if f_win <= 0.50:
+        reasons.append("胜率未超过50%")
+    if pl_ratio <= 1.5:
+        reasons.append("盈亏比未超过1.5")
+    if mean_ci_low <= 0.0:
+        reasons.append("净收益95%置信下界不大于0")
     if excess_alpha < min_alpha_dec:
         reasons.append(f"超额Alpha={excess_alpha * 100:+.2f}% < +{min_alpha_dec * 100:.2f}%")
-    if safety_margin < min_safety_dec:
-        reasons.append(f"安全垫={safety_margin * 100:+.1f}% < +{ruler.min_safety_pct:.1f}%")
+    if safety_margin <= min_safety_dec:
+        reasons.append(f"安全垫={safety_margin * 100:+.1f}% 未超过 +{min_safety_dec * 100:.1f}%")
     if boot_pval > max_pval:
         reasons.append(f"Bootstrap p={boot_pval:.3f} > {max_pval:.2f}")
     if excursion_ratio < min_exc_ratio:
@@ -499,6 +819,9 @@ def run_gate1_forensic_audit(
         "is_unweighted_safety_margin_pct": round(eq_stats["safety_margin"] * 100, 2),
         "is_q_weighted_safety_margin_pct": round(qw_stats["safety_margin"] * 100, 2),
         "is_boot_pval": round(boot_pval, 4),
+        "is_effective_n": effective_n,
+        "is_mean_ci_low_pct": mean_ci_low * 100.0,
+        "events": tb_is.assign(r_atr=tb_is["net_ret"] / tb_is["atr_pct"]).to_dict("records"),
         "mfe_atr_mean": round(mean_mfe_atr, 3),
         "mae_atr_mean": round(mean_mae_atr, 3),
         "excursion_ratio": round(excursion_ratio, 3),
@@ -584,7 +907,8 @@ def run_parameter_smoothness_audit(
     neighbor_metrics: Sequence[float] | None = None,
     center_metric: float | None = None,
     min_retention_ratio: float = 0.70,
-    max_cv: float = 0.40,
+    max_cv: float = 0.35,
+    soft_gate: bool = False,
     fee_rate: float = 0.0002,
     is_end_dt: pd.Timestamp = IS_END_DT,
 ) -> dict[str, Any]:
@@ -592,7 +916,7 @@ def run_parameter_smoothness_audit(
     参数平原检验 (Parameter Smoothness Gate)：
     对候选信号的核心参数（如 DecayConfig.lam0、scale 或窗口长度）执行 ±20% 共 3~5 组邻域微扰，
     计算邻域净收益/夏普的变异系数 CV = σ / |μ| 与均值保持率 μ_neighbor / μ_center，
-    要求保持率 >= 0.70 且 CV <= 0.40，剔除“孤岛参数”。
+    要求保持率 >= 0.70 且 CV <= 0.35，剔除“孤岛参数”。
     """
     if callable(df_tf) and eval_fn is None and evaluate_fn is None:
         eval_fn = df_tf
@@ -621,12 +945,9 @@ def run_parameter_smoothness_audit(
                 if isinstance(res, int | float | np.floating):
                     m_val = float(res)
                 elif isinstance(res, dict):
-                    m_val = float(
-                        res.get(
-                            "is_net_sharpe",
-                            res.get("sharpe", res.get("is_mean_pct", res.get("mean_ret", 0.0))),
-                        )
-                    )
+                    if "is_net_sharpe" not in res:
+                        raise ValueError("Parameter audit requires is_net_sharpe, not mean returns.")
+                    m_val = float(res["is_net_sharpe"])
                 elif isinstance(res, tuple) and len(res) == 2 and df_tf is not None:
                     _, w_arr = res
                     sh_pack = compute_single_factor_net_sharpe_and_turnover(
@@ -650,17 +971,33 @@ def run_parameter_smoothness_audit(
                     trig_arr, w_arr = compute_atomic_signal(
                         df_tf,
                         sig_id,
-                        scale=base_scale * r,
+                        scale=base_scale,
                         decay=DecayConfig(lam0=0.10 * r),
+                        soft_gate=False,
                     )
                 else:
                     trig_arr, w_arr = compute_signal_triggers_and_weights(df_tf, sig_id, scale=base_scale * r)
-                ruler = ARCHETYPE_RULERS[spec.archetype] if spec is not None else ARCHETYPE_RULERS[ARCH_A]
-                direction = spec.direction if spec is not None else 1
-                g1_r = run_gate1_forensic_audit(
-                    df_tf, trig_arr, direction, ruler, timeframe, weights_tf=w_arr, fee_rate=fee_rate
+                if soft_gate:
+                    from examples.multi_factor_cta.atomic_factors import SoftCrossSectionalGate
+
+                    gate = SoftCrossSectionalGate()
+                    rank = gate.extract_cs_rank(df_tf)
+                    if rank is None:
+                        raise ValueError(
+                            "Parameter admission requires the same cross-sectional inputs as the candidate."
+                        )
+                    trig_arr, w_arr = gate.apply_to_triggers_and_weights(
+                        trig_arr,
+                        w_arr,
+                        rank,
+                        gate.extract_causal_er(df_tf),
+                        archetype=spec.archetype,
+                        direction=spec.direction,
+                    )
+                sharpe = compute_single_factor_net_sharpe_and_turnover(
+                    df_tf, w_arr, timeframe, fee_rate=fee_rate, is_end_dt=is_end_dt
                 )
-                metrics_list.append(float(g1_r.get("is_mean_pct", 0.0)))
+                metrics_list.append(float(sharpe["is_net_sharpe"]))
             else:
                 raise ValueError("Must provide either neighbor_metrics, eval_fn, or (df_tf, sig_id).")
 
@@ -695,6 +1032,54 @@ def run_parameter_smoothness_audit(
         "grid_metrics": [round(float(x), 4) for x in vals],
         "perturb_ratios": list(ratios),
     }
+
+
+def _next_open_rescue_metrics(
+    df_fold: pd.DataFrame,
+    candidate_decisions: np.ndarray,
+    portfolio_decisions: np.ndarray,
+) -> tuple[float, float]:
+    """Measure fill-aligned gap coverage and net rescue contribution inside one completed fold.
+
+    The drawdown state at an opening execution uses only returns and costs already
+    observed there. Candidate contribution covers that open-to-next-open interval,
+    with final-open-to-close marking and explicit terminal liquidation. Closing-only
+    trades remain in the rescue sample so zero exposure cannot hide their exit fee.
+    """
+    interval_returns, _ = _prepare_next_open_slice(df_fold)
+    n = len(interval_returns)
+    if not n:
+        return 0.0, 0.0
+    fee = float(df_fold.attrs.get("fee_rate", 0.0002))
+    candidate = np.asarray(candidate_decisions, dtype=float)
+    portfolio = np.asarray(portfolio_decisions, dtype=float)
+    if (
+        len(candidate) != n
+        or len(portfolio) != n
+        or not np.isfinite(candidate).all()
+        or not np.isfinite(portfolio).all()
+    ):
+        raise ValueError("Rescue decisions must be finite and aligned with the training fold")
+    if not np.isfinite(fee) or fee < 0:
+        raise ValueError("Rescue execution fee must be finite and nonnegative")
+    opens = df_fold["open"].to_numpy(dtype=float)
+    candidate_ledger = decision_execution_ledger(opens, candidate, fee, terminal_close=float(df_fold["close"].iloc[-1]))
+    portfolio_ledger = decision_execution_ledger(opens, portfolio, fee)
+    intervals = closed_execution_intervals(candidate_ledger)
+    cand_held = np.asarray(candidate_ledger.executed_weights[:-1])
+    port_held = np.asarray(portfolio_ledger.executed_weights)
+    port_nav = 1.0 + np.cumsum(portfolio_ledger.net_returns)
+    peak = np.maximum.accumulate(np.maximum(port_nav, 1.0))
+    drawdown = (port_nav - peak) / peak
+
+    active = np.abs(cand_held) > 0.01
+    gap_fill = float(np.mean(np.abs(port_held[active]) <= 0.25) * 100) if active.any() else 0.0
+    cand_turnover = np.asarray(intervals.turnover)
+    candidate_net = np.asarray(intervals.net_returns)
+    transaction_active = active | (cand_turnover > 0.01)
+    rescue = ((np.abs(port_held) <= 0.20) | (drawdown <= -0.015)) & transaction_active
+    rescue_bp = float(np.mean(candidate_net[rescue]) * 10000) if int(rescue.sum()) >= 5 else 0.0
+    return gap_fill, rescue_bp
 
 
 def run_gate2_3d_complementarity_audit(
@@ -742,7 +1127,15 @@ def run_gate2_3d_complementarity_audit(
 
     is_mask = (df_30m["dt"] <= IS_END_DT).values
     if int(is_mask.sum()) < 25:
-        is_mask = np.ones(len(df_30m), dtype=bool)
+        return {
+            "passed": False,
+            "reason": "样本内历史不足",
+            "max_corr": 0.0,
+            "max_full_sample_corr": 0.0,
+            "max_corr_peer": "None",
+            "gap_fill_ratio_pct": 0.0,
+            "dd_rescue_alpha_bp": 0.0,
+        }
     c_sub = cand_w_on_30m[is_mask]
 
     if np.std(c_sub) < 1e-6:
@@ -773,27 +1166,9 @@ def run_gate2_3d_complementarity_audit(
             max_corr = act_corr
             max_peer = peer_id
 
-    # 空仓填补率
-    active_cand = np.abs(c_sub) > 0.01
-    port_sub = current_portfolio_w_30m[is_mask]
-    gap_fill_pct = float(np.mean(np.abs(port_sub[active_cand]) <= 0.25) * 100.0) if np.sum(active_cand) > 0 else 0.0
-
-    # 无未来函数的空仓期/组合回撤期雪中送炭指标 (以时刻 t 已知的组合回撤状态或空仓状态为条件)
-    bar_ret = df_30m["close"].pct_change().fillna(0.0).values[is_mask]
-    port_cum_nav = np.cumprod(1.0 + port_sub * bar_ret)
-    port_peak = np.maximum.accumulate(port_cum_nav)
-    port_dd_state = (port_cum_nav - port_peak) / port_peak  # t 时刻已知的历史回撤深度
-
-    fwd_bar_ret = df_30m["close"].pct_change().shift(-1).fillna(0.0).values[is_mask]
-    rescue_window_mask = ((np.abs(port_sub) <= 0.20) | (port_dd_state <= -0.015)) & active_cand
-    # 若主网格为 5m (约 78,672 根)，将单根 5m 救援超额折算为等效 30m 窗口 (×6) 以保持物理量纲一致
-    bp_scale = 6.0 if len(df_30m) > 40000 else 1.0
-    if np.sum(rescue_window_mask) >= 5:
-        dd_rescue_alpha_bp = float(
-            np.mean(c_sub[rescue_window_mask] * fwd_bar_ret[rescue_window_mask]) * 10000.0 * bp_scale
-        )
-    else:
-        dd_rescue_alpha_bp = 0.0
+    gap_fill_pct, dd_rescue_alpha_bp = _next_open_rescue_metrics(
+        df_30m.loc[is_mask].reset_index(drop=True), c_sub, current_portfolio_w_30m[is_mask]
+    )
 
     passed = max_corr < max_corr_threshold and gap_fill_pct >= min_gap_fill_pct and dd_rescue_alpha_bp >= 0.5
     reasons = []
@@ -830,26 +1205,12 @@ def map_tf_weight_to_5m_grid(
     df_target: pd.DataFrame,
     timeframe: str,
 ) -> np.ndarray:
-    """
-    将任意周期 (1d / 60m / 30m / 15m / 5m) 的持仓权重无未来函数、零延迟地映射到 5m 原生主时间轴上：
-    - 5m: 原生 1:1 即时生效，彻底消除旧版 30m 网格下采样导致的盘中持仓坍缩与最高 25 分钟入场延迟
-    - 15m / 30m / 60m / 1d: 严格在该周期 K 线收盘时刻 (即对应第 g 根 5m 收盘 dt) 生效，并向后阶梯保持 (Step-Hold ffill)
-    """
+    """Map closed-bar decisions by their observed timestamps, retaining prior decisions across missing bars."""
+    from examples.multi_factor_cta.data_engine import map_tf_weight_to_base_grid
+
     if timeframe not in TF_TO_5M_GROUP_SIZE:
         raise ValueError(f"Unsupported timeframe: {timeframe}")
-
-    n_target = len(df_target)
-    g = TF_TO_5M_GROUP_SIZE[timeframe]
-    if g == 1 and len(w_source) == n_target:
-        return w_source.copy()
-    if len(w_source) * g == n_target:
-        out = np.zeros(n_target, dtype=np.float64)
-        out[g - 1 : -1] = np.repeat(w_source[:-1], g)
-        out[-1] = w_source[-1]
-        return out
-
-    s_src = pd.Series(w_source, index=df_source["dt"])
-    return df_target["dt"].map(s_src).ffill().fillna(0.0).values
+    return map_tf_weight_to_base_grid(df_source, w_source, df_target)
 
 
 # 兼容旧函数名调用，自动对齐到传入的主时间轴 (5m 或 30m)
@@ -941,24 +1302,15 @@ def synthesize_atomic_units_portfolio(
 
     w_raw = w_a_gated + 1.25 * w_bcd_total
 
-    # 第三支柱：因果有效湍流波动率目标与敞口封顶调制 (缓存于 df_grid.attrs 避免重复计算)
-    vol_cap = df_grid.attrs.get("_cached_vol_cap")
-    if vol_cap is None or len(vol_cap) != n:
-        close_arr = df_grid["close"].values
-        ret_5m = pd.Series(close_arr).pct_change().fillna(0.0).values
-        vol_15d = pd.Series(ret_5m).rolling(720, min_periods=48).std().bfill().values * np.sqrt(48.0 * 242.0)
-        net_chg_5d = np.abs(pd.Series(close_arr).diff(240).fillna(0.0).values)
-        abs_path_5d = (
-            pd.Series(np.abs(np.diff(close_arr, prepend=close_arr[0])))
-            .rolling(240, min_periods=48)
-            .sum()
-            .bfill()
-            .values
-        )
-        er_5d = np.clip(net_chg_5d / np.maximum(abs_path_5d, 1e-6), 0.0, 1.0)
-        turb_vol = vol_15d * (1.0 - 0.35 * er_5d)
-        vol_cap = np.clip(0.28 / np.maximum(turb_vol, 0.28), 0.72, 1.0)
-        df_grid.attrs["_cached_vol_cap"] = vol_cap
+    # Recompute from this data prefix; DataFrame.attrs can survive same-length price edits.
+    close_arr = df_grid["close"].values
+    ret_5m = pd.Series(close_arr).pct_change().fillna(0.0)
+    vol_15d = ret_5m.rolling(720, min_periods=48).std() * np.sqrt(48.0 * 242.0)
+    net_chg_5d = np.abs(pd.Series(close_arr).diff(240).fillna(0.0).values)
+    abs_path_5d = pd.Series(np.abs(np.diff(close_arr, prepend=close_arr[0]))).rolling(240, min_periods=48).sum()
+    er_5d = np.clip(net_chg_5d / np.maximum(abs_path_5d.fillna(np.inf).values, 1e-6), 0.0, 1.0)
+    turb_vol = vol_15d.values * (1.0 - 0.35 * er_5d)
+    vol_cap = np.nan_to_num(np.clip(0.28 / np.maximum(turb_vol, 0.28), 0.72, 1.0), nan=0.0)
 
     w_multi = np.clip(w_raw * np.sqrt(vol_cap), -vol_cap, vol_cap)
     return apply_rebalance_deadzone(w_multi, deadzone=rebalance_deadzone)
@@ -992,31 +1344,57 @@ def count_round_trips(w: np.ndarray) -> tuple[int, int, int]:
 
 
 def backtest_slice(df_30m_slice: pd.DataFrame, w_slice: np.ndarray) -> dict[str, Any]:
-    dfw = pd.DataFrame(
-        {
-            "dt": df_30m_slice["dt"].astype(str),
-            "symbol": "159915",
-            "weight": w_slice,
-            "price": df_30m_slice["close"].values,
+    """Execute decisions at next open and liquidate at the final observed close."""
+    if len(df_30m_slice) != len(w_slice):
+        raise ValueError("Bar and weight lengths must agree.")
+    if df_30m_slice.empty:
+        empty = pd.Series(dtype=float, index=pd.DatetimeIndex([], name="date"))
+        return {
+            "trades": 0,
+            "long_trades": 0,
+            "short_trades": 0,
+            "active_pct": 0.0,
+            "cum_ret_pct": 0.0,
+            "ann_ret_pct": 0.0,
+            "sharpe": 0.0,
+            "mdd_pct": 0.0,
+            "calmar": 0.0,
+            "composite_score": 0.0,
+            "nav_series": empty,
+            "dd_series": empty.copy(),
+            "daily_return": pd.DataFrame({"date": pd.Series(dtype="datetime64[ns]"), "total": pd.Series(dtype=float)}),
         }
+    symbols = df_30m_slice["symbol"].unique()
+    if len(symbols) != 1:
+        raise ValueError("backtest_slice requires one asset; use the portfolio allocator for multiple assets.")
+    decision_dt = pd.to_datetime(df_30m_slice["dt"]).reset_index(drop=True)
+    if decision_dt.isna().any() or not decision_dt.is_monotonic_increasing or decision_dt.duplicated().any():
+        raise ValueError("Execution timestamps must be unique and ordered")
+    final_price = float(df_30m_slice["close"].iloc[-1])
+    ledger = decision_execution_ledger(
+        df_30m_slice["open"].to_numpy(dtype=np.float64),
+        np.asarray(w_slice, dtype=np.float64),
+        float(df_30m_slice.attrs.get("fee_rate", 0.0002)),
+        terminal_close=final_price,
     )
-    wb = WeightBacktest(data=dfw, fee_rate=0.0002, weight_type="ts")
-    st = wb.stats
-    tot_t, l_t, s_t = count_round_trips(w_slice)
-    active_pct = float((np.abs(w_slice) > 0.01).mean() * 100.0)
+    execution_dt = pd.DatetimeIndex([*decision_dt, decision_dt.iloc[-1] + pd.Timedelta(microseconds=1)])
+    ret_s = pd.Series(ledger.net_returns, index=execution_dt).groupby(execution_dt.normalize()).sum()
+    st = daily_performance(ret_s.to_numpy(dtype=np.float64), yearly_days=252)
+    executed = np.asarray(ledger.executed_weights[:-1])
+    tot_t, l_t, s_t = count_round_trips(executed)
+    active_pct = float((np.abs(executed) > 0.01).mean() * 100.0)
 
     cum_ret = float(st.get("绝对收益", 0.0) * 100.0)
-    ann_ret = float(st.get("年化收益", 0.0) * 100.0)
-    sharpe = float(st.get("夏普比率", 0.0))
+    ann_ret = float(st.get("年化", 0.0) * 100.0)
+    sharpe = float(st.get("夏普", 0.0))
     mdd = float(st.get("最大回撤", 0.0) * 100.0)
-    calmar = float(st.get("卡玛比率", 0.0))
+    calmar = float(st.get("卡玛", 0.0))
     score = sharpe + 0.35 * calmar + 0.05 * ann_ret
 
-    dr = wb.daily_return.copy()
-    dr["date"] = pd.to_datetime(dr["date"])
-    ret_s = dr.set_index("date")["total"]
-    nav_s = (1 + ret_s).cumprod()
-    dd_s = (nav_s - nav_s.cummax()) / nav_s.cummax() * 100
+    dr = ret_s.rename_axis("date").reset_index(name="total")
+    nav_s = 1 + ret_s.cumsum()
+    peak = nav_s.cummax().clip(lower=1.0)
+    dd_s = (nav_s - peak) / peak * 100
 
     return {
         "trades": tot_t,
@@ -1029,6 +1407,7 @@ def backtest_slice(df_30m_slice: pd.DataFrame, w_slice: np.ndarray) -> dict[str,
         "mdd_pct": round(mdd, 2),
         "calmar": round(calmar, 2),
         "composite_score": round(score, 4),
+        "daily_return": dr,
         "nav_series": nav_s,
         "dd_series": dd_s,
     }
