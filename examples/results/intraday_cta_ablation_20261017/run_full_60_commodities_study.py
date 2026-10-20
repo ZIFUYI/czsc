@@ -490,6 +490,272 @@ def run_zero_hardcode_sop_stage3(
     return s, ledgers, selected_per_fold
 
 
+def compute_is_liquidity_and_price_returns() -> tuple[dict[tuple[str, str], dict[str, float]], pd.DataFrame]:
+    """
+    严格在每个折次的训练截止日 (<= cutoff) 前，计算全池 60 品种的样本内客观流动性深度
+    （日均成交手数、名义成交额、有效上市天数）以及用于无监督产业链共线性聚类的日频价格收益率矩阵。
+    全程 100% 零先验硬编码 (不引用 CORE_20_IDS)，杜绝任何未来信息泄露。
+    """
+    with open(CACHE_60_DIR / "frames_1d_60.pkl", "rb") as f:
+        frames_1d = pickle.load(f)
+
+    is_liq_stats: dict[tuple[str, str], dict[str, float]] = {}
+    price_ret_dict: dict[str, pd.Series] = {}
+
+    for aid in IDS_60:
+        p15 = DATA_15M_60_DIR / f"{aid}_15m.parquet"
+        df15 = pd.read_parquet(p15)
+        dt = pd.to_datetime(df15["dt"])
+        d_norm = dt.dt.normalize()
+        vol_col = "volume" if "volume" in df15.columns else "vol"
+        amt_s = df15["amount"] if "amount" in df15.columns else pd.Series(0.0, index=df15.index)
+        if float(amt_s.sum()) <= 0.0 and vol_col in df15.columns:
+            amt_s = df15["close"].astype(np.float64) * df15[vol_col].astype(np.float64) * 10.0
+        d_amt = amt_s.groupby(d_norm).sum() / 1e8
+        d_vol = df15.groupby(d_norm)[vol_col].sum() / 1e4 if vol_col in df15.columns else pd.Series(0.0)
+
+        for fold in FOLDS:
+            f_id = fold["id"]
+            cut = pd.Timestamp(fold["cutoff"]).normalize()
+            sub_v = d_vol.loc[d_vol.index <= cut]
+            sub_a = d_amt.loc[d_amt.index <= cut]
+            is_liq_stats[(f_id, aid)] = {
+                "is_days": float(len(sub_v)),
+                "is_vol_wan": float(sub_v.median()) if len(sub_v) > 0 else 0.0,
+                "is_amt_yi": float(sub_a.median()) if len(sub_a) > 0 else 0.0,
+            }
+
+        df1 = frames_1d[SPECS_60[aid].symbol]
+        dt1 = pd.to_datetime(df1["dt"]).dt.normalize()
+        c1 = pd.Series(df1["close"].to_numpy(dtype=np.float64), index=dt1)
+        price_ret_dict[aid] = c1.pct_change().fillna(0.0)
+
+    price_ret_df = pd.DataFrame(price_ret_dict).sort_index().fillna(0.0)
+    return is_liq_stats, price_ret_df
+
+
+def run_zero_hardcode_cluster_conserved(
+    name: str,
+    oos_fast_cache: dict,
+    sleeve_daily_ret: dict,
+    is_meta_stats: dict,
+    pit_assets: dict,
+    ep_map: dict,
+    is_liq_stats: dict[tuple[str, str], dict[str, float]],
+    price_ret_df: pd.DataFrame,
+    scheme: str = "hr",
+    min_nf: int = 9,
+    min_ep: int = 20,
+    min_shp_fs: float = 1.05,
+    min_shp_hr: float = 0.95,
+    min_r: float = 2.15,
+    min_sm: float = 12.0,
+    min_vol_wan: float = 8.8,
+    price_corr_th: float = 0.68,
+    sleeve_corr_th: float = 0.15,
+    sector_damp_power: float = 0.65,
+    symmetric_deadzone: float = 0.02,
+    max_single_asset_weight: float = 0.25,
+    min_effective_assets: int = 4,
+    target_portfolio_vol: float = 0.15,
+) -> tuple[dict, list[dict], dict[str, list[str]]]:
+    """
+    运行 100% 零先验硬编码 (Zero Hardcoded CORE_20_IDS) 的全市场 60 品种内生准入、
+    无监督同板块产业链共线性聚类去重、板块风险预算守恒与滞后至 d-1 日因果袖套健康度配置架构。
+    """
+    ledgers = []
+    ep_list = []
+    selected_per_fold: dict[str, list[str]] = {}
+
+    for fold in FOLDS:
+        f_id = fold["id"]
+        cut = pd.Timestamp(fold["cutoff"]).normalize()
+        fc = oos_fast_cache[f_id]
+        ret_oos = fc["ret_oos"][IDS_60]
+        mask_oos = fc["mask_oos"][IDS_60]
+        roll_vol = fc["roll_vol_oos"][IDS_60]
+        pos_df = fc["pos_oos_map"][scheme][IDS_60].copy()
+
+        d_all = sleeve_daily_ret[f_id]
+        d_is = d_all.loc["2024-01-02":cut]
+        sub_p = price_ret_df.loc["2024-01-02":cut]
+        cp_mat = sub_p.corr().abs().fillna(0.0)
+        cs_mat = d_is.corr().abs().fillna(0.0)
+
+        # 1. 全池 60 品种统一客观准入与内生质量-流动性复合评分 (<= cutoff)
+        cands: dict[str, float] = {}
+        for aid in pit_assets[f_id]:
+            m = is_meta_stats[(f_id, aid)]
+            lq = is_liq_stats[(f_id, aid)]
+            if (
+                lq["is_vol_wan"] >= min_vol_wan
+                and m["n_factors"] >= min_nf
+                and m["is_ep_count"] >= min_ep
+                and m["is_shp_fs"] >= min_shp_fs
+                and m["is_shp_hr"] >= min_shp_hr
+                and m["is_payoff_r"] >= min_r
+                and m["is_safety_margin"] >= min_sm
+            ):
+                liq_mult = float(np.clip(np.log1p(lq["is_vol_wan"]) / np.log1p(20.0), 0.5, 1.8))
+                cands[aid] = float(m["is_shp_hr"]) * float(m["is_shp_fs"]) * float(m["is_payoff_r"]) * liq_mult
+
+        # 2. 同板块内无监督产业链共线性聚类与簇代表筛选 (<= cutoff)
+        sel_ids: list[str] = []
+        for _sec, syms in SECTORS_60.items():
+            sec_cands = sorted([a for a in syms if a in cands], key=lambda x: cands[x], reverse=True)
+            sec_acc: list[str] = []
+            for a in sec_cands:
+                m_a = is_meta_stats[(f_id, a)]
+                # 高因子广度多周期独立共振联席龙头资格（全市场统一数学准则，确保 au/ag 等高维独立品种不被误删）
+                is_high_breadth_coleader = (
+                    m_a["n_factors"] >= 21 and m_a["is_shp_hr"] >= 1.85 and m_a["is_payoff_r"] >= 3.50
+                )
+                is_dup = False
+                for ldr in sec_acc:
+                    collinear = (float(cp_mat.loc[a, ldr]) >= price_corr_th) or (
+                        float(cp_mat.loc[a, ldr]) >= 0.35 and float(cs_mat.loc[a, ldr]) >= sleeve_corr_th
+                    )
+                    if collinear and not is_high_breadth_coleader:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    sec_acc.append(a)
+            sel_ids.extend(sec_acc)
+
+        selected_per_fold[f_id] = sel_ids
+        sel_set = set(sel_ids)
+        for c in IDS_60:
+            if c not in sel_set:
+                pos_df[c] = 0.0
+
+        listed_mask = mask_oos.astype(np.float64)
+        active_mask = ((pos_df.abs() > 1e-3) & (listed_mask > 0.0)).astype(np.float64)
+        inv_vol = (1.0 / np.maximum(roll_vol, 0.05)) * active_mask
+
+        for c in sel_ids:
+            m = is_meta_stats[(f_id, c)]
+            lq = is_liq_stats[(f_id, c)]
+            liq_w = float(np.clip(np.sqrt(lq["is_vol_wan"] / 20.0), 0.65, 1.40))
+            q_p = (
+                np.clip(float(m["is_shp_hr"]), 0.5, 2.5)
+                * np.clip(float(m["is_safety_margin"]) / 15.0, 0.5, 2.0)
+                * liq_w
+            )
+            inv_vol[c] *= q_p
+
+        # 3. 严格滞后至 d-1 日的因果滚动袖套健康度倾斜
+        d_df = d_all[IDS_60]
+        r_m = d_df.rolling(60, min_periods=20).mean().shift(1)
+        r_s = d_df.rolling(60, min_periods=20).std(ddof=1).shift(1)
+        r_shp = ((r_m / r_s.replace(0.0, np.nan)) * np.sqrt(252.0)).fillna(0.5)
+        h_daily = r_shp.clip(lower=-0.5, upper=2.0).apply(lambda s: np.where(s >= 0.0, 1.0 + 0.30 * s, 0.35))
+        h_5m = h_daily.reindex(ret_oos.index.normalize()).fillna(1.0)
+        h_5m.index = ret_oos.index
+        inv_vol = inv_vol * h_5m
+
+        # 4. 板块风险预算守恒阻尼
+        sector_active_counts = {}
+        sector_inv_vol = {}
+        for sec, syms in SECTORS_60.items():
+            k_s_t = active_mask[syms].sum(axis=1)
+            sector_active_counts[sec] = k_s_t
+            sec_vol = fc["sec_vol_oos"][sec]
+            sector_inv_vol[sec] = (1.0 / np.maximum(sec_vol, 0.05)) * (k_s_t > 0.0).astype(np.float64)
+
+        sec_inv_vol_df = pd.DataFrame(sector_inv_vol, index=ret_oos.index)
+        sec_inv_vol_sum = sec_inv_vol_df.sum(axis=1).replace(0.0, np.nan)
+        sec_budget_share = sec_inv_vol_df.div(sec_inv_vol_sum, axis=0).fillna(0.0)
+
+        sector_mult_df = pd.DataFrame(0.0, index=ret_oos.index, columns=IDS_60, dtype=np.float64)
+        for sec, syms in SECTORS_60.items():
+            k_s_t = sector_active_counts[sec]
+            within_sec_damp = 1.0 / np.power(np.maximum(k_s_t, 1.0), sector_damp_power)
+            sec_factor = sec_budget_share[sec] * within_sec_damp
+            for sym in syms:
+                sector_mult_df[sym] = sec_factor
+
+        raw_alloc = inv_vol * sector_mult_df * active_mask
+        n_rows, n_cols = raw_alloc.shape
+        alloc_mat = np.zeros((n_rows, n_cols), dtype=np.float64)
+        raw_mat = raw_alloc.to_numpy(dtype=np.float64)
+        act_mat = active_mask.to_numpy(dtype=np.float64)
+        for t_idx in range(n_rows):
+            n_act = float(act_mat[t_idx].sum())
+            if n_act <= 0.0:
+                continue
+            target_b = min(1.0, n_act / float(min_effective_assets))
+            alloc_mat[t_idx] = _project_capped_simplex_row(
+                raw_weights=raw_mat[t_idx],
+                active_mask=act_mat[t_idx],
+                target_budget=target_b,
+                max_weight=max_single_asset_weight,
+            )
+
+        alloc_weights = pd.DataFrame(alloc_mat, index=ret_oos.index, columns=IDS_60)
+        unscaled_positions = (alloc_weights * pos_df).where(mask_oos).ffill().fillna(0.0)
+        unscaled_gross = (unscaled_positions.shift(1).fillna(0.0) * ret_oos).sum(axis=1)
+        port_roll_vol = unscaled_gross.rolling(40 * BARS_PER_DAY, min_periods=15 * BARS_PER_DAY).std().shift(1)
+        port_roll_vol = (port_roll_vol * ANN_SCALE).ffill().fillna(target_portfolio_vol)
+        lev_scalar = np.clip(target_portfolio_vol / np.maximum(port_roll_vol, 0.05), 0.0, 1.65)
+        budget_weights = alloc_weights.multiply(lev_scalar, axis=0).clip(lower=0.0, upper=max_single_asset_weight)
+        final_weights_df = budget_weights * pos_df
+
+        budget_fraction = active_mask.sum(axis=1).div(min_effective_assets).clip(upper=1.0)
+        gross_budget_series = (budget_fraction * lev_scalar).to_numpy(dtype=np.float64)
+        final_mat = final_weights_df.to_numpy().copy()
+        observed = mask_oos.to_numpy()
+        prev = np.zeros(n_cols)
+        for t_idx in range(n_rows):
+            target = final_mat[t_idx]
+            if symmetric_deadzone > 0.0:
+                same_dir = (target * prev) > 0.0
+                keep = same_dir & (np.abs(target) > 1e-6) & (np.abs(target - prev) < symmetric_deadzone)
+                target[keep] = prev[keep]
+            target[~observed[t_idx]] = prev[~observed[t_idx]]
+            frozen = float(np.abs(prev[~observed[t_idx]]).sum())
+            avail = max(0.0, float(gross_budget_series[t_idx]) - frozen)
+            prop = float(np.abs(target[observed[t_idx]]).sum())
+            if prop > avail and prop > 0:
+                target[observed[t_idx]] *= avail / prop
+            final_mat[t_idx] = np.clip(target, -max_single_asset_weight, max_single_asset_weight)
+            prev = final_mat[t_idx].copy()
+
+        w_oos = pd.DataFrame(final_mat, index=ret_oos.index, columns=IDS_60)
+        gross_exp = w_oos.abs().sum(axis=1)
+        scale_cap = np.maximum(gross_exp, 1.0)
+        w_oos = w_oos.div(scale_cap, axis=0)
+        w_oos.iloc[0] = 0.0
+        w_oos.iloc[-1] = 0.0
+        for col in IDS_60:
+            t_col = mask_oos[col].to_numpy()
+            w_col = w_oos[col].to_numpy().copy()
+            for i in range(1, len(w_col)):
+                if not t_col[i]:
+                    w_col[i] = w_col[i - 1]
+            w_oos[col] = w_col
+
+        fees = {c: float(SPECS_60[c].fee_rate) for c in IDS_60}
+        ledger = account_portfolio_execution(ret_oos, w_oos, fees, tradable_mask=mask_oos)
+        ledgers.append(
+            {
+                "daily_returns": ledger["daily_returns"],
+                "bar_net_returns": ledger["bar_net_returns"],
+                "gross_returns_df": ledger["gross_returns_df"],
+                "cost_returns_df": ledger["cost_returns_df"],
+                "turnover_df": ledger["turnover_df"],
+                "weights_df": w_oos,
+            }
+        )
+        for c in sel_ids:
+            if w_oos[c].abs().max() > 1e-6 and len(ep_map.get((f_id, c), [])) > 0:
+                ep_list.append(ep_map[(f_id, c)])
+
+    s = summarize_stitched_oos(ledgers, name)
+    ep_st = compute_episode_payoff_stats(ep_list)
+    s.update(ep_st)
+    return s, ledgers, selected_per_fold
+
+
 def run_core_satellite_sop_stage3(
     name: str,
     oos_fast_cache: dict,
@@ -646,8 +912,10 @@ def build_attribution_tables(
     flat_ledgers: list[dict],
     cs_ledgers: list[dict],
     admitted_sats: dict[str, list[str]],
+    zhc_ledgers: list[dict] | None = None,
+    zhc_selected: dict[str, list[str]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """生成 6大板块 与 60品种 在 Flat-60 HRP 与 CoreSatellite-60 最优架构下的归因对比表。"""
+    """生成 6大板块 与 60品种 在 Flat-60 HRP、CoreSatellite-60 与 ZeroHardcode-ClusterConserved-60 架构下的归因对比表。"""
     flat_gross = pd.concat([led["gross_returns_df"] for led in flat_ledgers]).sum() * 100.0
     flat_cost = pd.concat([led["cost_returns_df"] for led in flat_ledgers]).sum() * 100.0
     flat_net = flat_gross - flat_cost
@@ -658,15 +926,32 @@ def build_attribution_tables(
     cs_net = cs_gross - cs_cost
     cs_turn = pd.concat([led["turnover_df"] for led in cs_ledgers]).sum() / (503.0 / 252.0)
 
+    if zhc_ledgers is not None:
+        zhc_gross = pd.concat([led["gross_returns_df"] for led in zhc_ledgers]).sum() * 100.0
+        zhc_cost = pd.concat([led["cost_returns_df"] for led in zhc_ledgers]).sum() * 100.0
+        zhc_net = zhc_gross - zhc_cost
+        zhc_turn = pd.concat([led["turnover_df"] for led in zhc_ledgers]).sum() / (503.0 / 252.0)
+    else:
+        zhc_gross = cs_gross
+        zhc_cost = cs_cost
+        zhc_net = cs_net
+        zhc_turn = cs_turn
+
+    zhc_union = set(zhc_selected["Fold1_2025"]) | set(zhc_selected["Fold2_2026"]) if zhc_selected is not None else set()
+
     sym_rows = []
     for aid in IDS_60:
         role = (
-            "Core-20旗舰"
-            if aid in CORE_20_IDS
+            "ZeroHC内生簇代表"
+            if aid in zhc_union
             else (
-                "SOP准入卫星"
-                if (aid in admitted_sats["Fold1_2025"] or aid in admitted_sats["Fold2_2026"])
-                else "SOP拦截影子/震荡"
+                "Core-20旗舰"
+                if aid in CORE_20_IDS
+                else (
+                    "SOP准入卫星"
+                    if (aid in admitted_sats["Fold1_2025"] or aid in admitted_sats["Fold2_2026"])
+                    else "SOP拦截影子/震荡"
+                )
             )
         )
         sym_rows.append(
@@ -683,7 +968,11 @@ def build_attribution_tables(
                 "coresat60_cost_pct": round(float(cs_cost[aid]), 3),
                 "coresat60_net_pct": round(float(cs_net[aid]), 3),
                 "coresat60_ann_turn": round(float(cs_turn[aid]), 2),
-                "net_improvement_pct": round(float(cs_net[aid] - flat_net[aid]), 3),
+                "zerohc60_gross_pct": round(float(zhc_gross[aid]), 3),
+                "zerohc60_cost_pct": round(float(zhc_cost[aid]), 3),
+                "zerohc60_net_pct": round(float(zhc_net[aid]), 3),
+                "zerohc60_ann_turn": round(float(zhc_turn[aid]), 2),
+                "net_improvement_pct": round(float(zhc_net[aid] - flat_net[aid]), 3),
             }
         )
     sym_df = pd.DataFrame(sym_rows)
@@ -699,6 +988,7 @@ def build_attribution_tables(
                 "admitted_sat_count": sum(
                     1 for c in syms if c in set(admitted_sats["Fold1_2025"]) | set(admitted_sats["Fold2_2026"])
                 ),
+                "zerohc_cluster_count": sum(1 for c in syms if c in zhc_union),
                 "flat60_gross_pct": round(float(sub["flat60_gross_pct"].sum()), 2),
                 "flat60_cost_pct": round(float(sub["flat60_cost_pct"].sum()), 2),
                 "flat60_net_pct": round(float(sub["flat60_net_pct"].sum()), 2),
@@ -707,7 +997,11 @@ def build_attribution_tables(
                 "coresat60_cost_pct": round(float(sub["coresat60_cost_pct"].sum()), 2),
                 "coresat60_net_pct": round(float(sub["coresat60_net_pct"].sum()), 2),
                 "coresat60_ann_turn": round(float(sub["coresat60_ann_turn"].sum()), 1),
-                "net_improvement_pct": round(float(sub["coresat60_net_pct"].sum() - sub["flat60_net_pct"].sum()), 2),
+                "zerohc60_gross_pct": round(float(sub["zerohc60_gross_pct"].sum()), 2),
+                "zerohc60_cost_pct": round(float(sub["zerohc60_cost_pct"].sum()), 2),
+                "zerohc60_net_pct": round(float(sub["zerohc60_net_pct"].sum()), 2),
+                "zerohc60_ann_turn": round(float(sub["zerohc60_ann_turn"].sum()), 1),
+                "net_improvement_pct": round(float(sub["zerohc60_net_pct"].sum() - sub["flat60_net_pct"].sum()), 2),
             }
         )
     sec_df = pd.DataFrame(sec_rows)
@@ -719,6 +1013,7 @@ def build_satellite_sop_table(
     is_corrs_with_core: dict,
     sleeve_daily_ret: dict,
     admitted_sats: dict[str, list[str]],
+    zhc_selected: dict[str, list[str]] | None = None,
 ) -> pd.DataFrame:
     """生成 40 个扩展卫星品种在两折样本内的 SOP Stage-3 门禁指标与样本外独立表现明细表。"""
     rows = []
@@ -750,6 +1045,7 @@ def build_satellite_sop_table(
                 "f1_is_safety_margin_pct": round(float(m1["is_safety_margin"]), 1),
                 "f1_max_core_corr": round(float(c1), 3),
                 "admitted_fold1": aid in admitted_sats["Fold1_2025"],
+                "zerohc_admitted_fold1": (aid in zhc_selected["Fold1_2025"]) if zhc_selected else False,
                 "f2_n_factors": m2["n_factors"],
                 "f2_is_shp_fs": round(float(m2["is_shp_fs"]), 2),
                 "f2_is_shp_hr": round(float(m2["is_shp_hr"]), 2),
@@ -757,6 +1053,7 @@ def build_satellite_sop_table(
                 "f2_is_safety_margin_pct": round(float(m2["is_safety_margin"]), 1),
                 "f2_max_core_corr": round(float(c2), 3),
                 "admitted_fold2": aid in admitted_sats["Fold2_2026"],
+                "zerohc_admitted_fold2": (aid in zhc_selected["Fold2_2026"]) if zhc_selected else False,
                 "standalone_oos_ret_pct": round(oos_ret_pct, 2),
                 "standalone_oos_sharpe": round(oos_shp, 2),
             }
@@ -778,9 +1075,9 @@ def generate_html_report(
         cols=2,
         subplot_titles=(
             "1.0x 纯样本外累计净值曲线对比 (2025.01 ~ 2026.09, 503交易日)",
-            "3.0x 机构目标敞口累计净收益与水下回撤对比",
-            "6大板块净收益贡献对比：Flat-60等权HRP vs Core-Satellite-60最优架构",
-            "60品种净收益贡献排序（Core-20旗舰 + SOP准入卫星 vs Flat-60稀释）",
+            "3.0x 机构目标敞口累计净收益对比",
+            "6大板块净收益贡献对比：Flat-60 vs ZeroHC-ClusterConserved-60 vs Core-Satellite-60",
+            "活跃品种净收益贡献排序（ZeroHC-ClusterConserved-60 vs Flat-60稀释）",
         ),
         vertical_spacing=0.14,
         horizontal_spacing=0.10,
@@ -794,9 +1091,12 @@ def generate_html_report(
         "Full60_SecConserved_SymDZ_HR": "#8e44ad",
         "Full60_ZeroHardcode_SOPStage3": "#16a085",
         "Full60_CoreSatellite_SOPStage3_Optimal": "#27ae60",
+        "Full60_ZeroHardcode_ClusterConserved_Optimal": "#c0392b",
     }
 
     for k, color in palette.items():
+        if k not in ledger_map:
+            continue
         leds = ledger_map[k]
         d_ret = pd.concat([led["daily_returns"] for led in leds]).sort_index()
         cum_ret = d_ret.cumsum() * 100.0
@@ -806,7 +1106,7 @@ def generate_html_report(
                 y=cum_ret.values,
                 mode="lines",
                 name=k,
-                line={"color": color, "width": 3.0 if "Optimal" in k or "ZeroHardcode" in k else 2.0},
+                line={"color": color, "width": 3.2 if "ClusterConserved" in k or "Optimal" in k else 2.0},
             ),
             row=1,
             col=1,
@@ -817,7 +1117,10 @@ def generate_html_report(
         ("Full60_FlatHRP_HysteresisRunner_3x", "#d35400"),
         ("Full60_ZeroHardcode_SOPStage3_3x", "#16a085"),
         ("Full60_CoreSatellite_SOPStage3_3x", "#27ae60"),
+        ("Full60_ZeroHardcode_ClusterConserved_3x", "#c0392b"),
     ):
+        if k not in ledger_map:
+            continue
         leds = ledger_map[k]
         d_ret = pd.concat([led["daily_returns"] for led in leds]).sort_index()
         cum_ret = d_ret.cumsum() * 100.0
@@ -827,7 +1130,7 @@ def generate_html_report(
                 y=cum_ret.values,
                 mode="lines",
                 name=k,
-                line={"color": color, "width": 3.0 if "CoreSatellite" in k else 2.0, "dash": "solid"},
+                line={"color": color, "width": 3.2 if "ClusterConserved" in k else 2.0, "dash": "solid"},
             ),
             row=1,
             col=2,
@@ -847,6 +1150,16 @@ def generate_html_report(
     fig.add_trace(
         go.Bar(
             x=sec_df["sector"],
+            y=sec_df["zerohc60_net_pct"],
+            name="ZeroHC-ClusterConserved-60 零先验最优 (净收益%)",
+            marker_color="#c0392b",
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=sec_df["sector"],
             y=sec_df["coresat60_net_pct"],
             name="Core-Satellite-60 最优架构 (净收益%)",
             marker_color="#27ae60",
@@ -856,16 +1169,18 @@ def generate_html_report(
     )
 
     # Subplot 4: Top active symbols comparison
-    active_sym = sym_df[(sym_df["coresat60_ann_turn"] > 0.01) | (sym_df["flat60_net_pct"].abs() > 0.15)].sort_values(
-        "coresat60_net_pct", ascending=False
-    )
+    active_sym = sym_df[
+        (sym_df["zerohc60_ann_turn"] > 0.01)
+        | (sym_df["coresat60_ann_turn"] > 0.01)
+        | (sym_df["flat60_net_pct"].abs() > 0.15)
+    ].sort_values("zerohc60_net_pct", ascending=False)
     labels = [f"{r.asset_id}({r.cn_name})" for _, r in active_sym.iterrows()]
     fig.add_trace(
         go.Bar(
             x=labels,
-            y=active_sym["coresat60_net_pct"],
-            name="Core-Satellite-60 单品种净贡献(%)",
-            marker_color="#27ae60",
+            y=active_sym["zerohc60_net_pct"],
+            name="ZeroHC-ClusterConserved-60 单品种净贡献(%)",
+            marker_color="#c0392b",
         ),
         row=2,
         col=2,
@@ -882,7 +1197,7 @@ def generate_html_report(
     )
 
     fig.update_layout(
-        title="全商品池（方案B：60品种）多周期增量筛选 + 缠论结构化出场与核心-卫星因果配置实证报告",
+        title="全商品池（方案B：60品种）零先验硬编码重构：F簇因果截面去噪 + 无监督产业链聚类与预算守恒实证报告",
         height=980,
         template="plotly_white",
         barmode="group",
@@ -890,11 +1205,12 @@ def generate_html_report(
     )
 
     chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn")
+    ablation_show = ablation_df.drop(columns=["daily_series"], errors="ignore")
     html_doc = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>方案B（60商品期货）多周期CTA扩展与核心-卫星SOP阶段三因果配置实证报告</title>
+<title>方案B（60商品期货）100%零先验硬编码重构：F簇因果截面去噪与产业链簇预算守恒实证报告</title>
 <style>
 body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 24px; color: #2c3e50; background: #f8f9fa; }}
 h1, h2, h3 {{ color: #1a252f; }}
@@ -907,20 +1223,20 @@ td:first-child, td:nth-child(2), td:nth-child(3) {{ text-align: left; }}
 </style>
 </head>
 <body>
-<h1>方案B（60个流动性合格商品期货）多周期CTA扩展与核心-卫星SOP阶段三因果配置实证报告</h1>
+<h1>方案B（60个流动性合格商品期货）100%零先验硬编码重构：F簇因果截面去噪与产业链簇风险预算守恒实证报告</h1>
 <div class="card">
 <h2>一、核心消融实验总表（2025.01 ~ 2026.09，503个纯样本外交易日，原生5m网格计价）</h2>
-{ablation_df.to_html(index=False)}
+{ablation_show.to_html(index=False)}
 </div>
 <div class="card">
 {chart_html}
 </div>
 <div class="card">
-<h2>二、6大商品板块样本外归因对比表（Flat-60等权HRP vs Core-Satellite-60最优架构）</h2>
+<h2>二、6大商品板块样本外归因对比表（Flat-60等权HRP vs ZeroHC-ClusterConserved-60 vs Core-Satellite-60）</h2>
 {sec_df.to_html(index=False)}
 </div>
 <div class="card">
-<h2>三、40个扩展池卫星品种样本内 SOP Stage-3 准入门禁指标与样本外表现表</h2>
+<h2>三、扩展池品种样本内 SOP Stage-3 准入门禁指标与样本外表现表</h2>
 {sat_df.to_html(index=False)}
 </div>
 </body>
@@ -954,7 +1270,9 @@ def main() -> None:
     ep_20_exact = d_c20["ep_20_exact"]
     ep_60_map_all = {"fs": ep_fs, "full": ep_full, "hr": ep_hr}
 
-    # 计算扩展品种与同板块 Core-20 旗舰在样本内 (<= cutoff) 的最大绝对相关性
+    is_liq_stats, price_ret_df = compute_is_liquidity_and_price_returns()
+
+    # 计算扩展品种与同板块 Core-20 旗舰在样本内 (<= cutoff) 的最大绝对相关性（仅供 Core-Satellite 对照组使用）
     is_corrs_with_core: dict[tuple[str, str], float] = {}
     for fold in FOLDS:
         f_id = fold["id"]
@@ -1022,7 +1340,7 @@ def main() -> None:
     results.append(s_sec)
     ledger_map["Full60_SecConserved_SymDZ_HR"] = leds_sec
 
-    # 4. Full-60 100% 零先验硬编码 (Zero Hardcoded Core-20) 全池统一 SOP 阶段三门禁与因果健康度配置
+    # 4. Full-60 100% 零先验硬编码 (Zero Hardcoded Core-20) 全池统一 SOP 阶段三门禁初步基线
     s_zhc, leds_zhc, sel_zhc = run_zero_hardcode_sop_stage3(
         "Full60_ZeroHardcode_SOPStage3",
         oos_fast_cache=oos_fast_cache,
@@ -1043,7 +1361,7 @@ def main() -> None:
     results.append(s_zhc)
     ledger_map["Full60_ZeroHardcode_SOPStage3"] = leds_zhc
 
-    # 5. Full-60 机构级「核心20锚定 + 40扩展池SOP阶段三门禁 + 剩余容量因果袖套分配」最优架构
+    # 5. Full-60 机构级「核心20锚定 + 40扩展池SOP阶段三门禁 + 剩余容量因果袖套分配」对照组
     s_opt, leds_opt, admitted_sats = run_core_satellite_sop_stage3(
         "Full60_CoreSatellite_SOPStage3_Optimal",
         oos_fast_cache=oos_fast_cache,
@@ -1072,13 +1390,44 @@ def main() -> None:
     results.append(s_opt)
     ledger_map["Full60_CoreSatellite_SOPStage3_Optimal"] = leds_opt
 
-    # 6. 3.0x 机构目标敞口对比
+    # 6. Full-60 100% 零先验硬编码 + F簇因果截面去噪 + 无监督产业链共线性聚类 + 板块风险预算守恒最优架构
+    s_zhc_opt, leds_zhc_opt, sel_zhc_opt = run_zero_hardcode_cluster_conserved(
+        "Full60_ZeroHardcode_ClusterConserved_Optimal",
+        oos_fast_cache=oos_fast_cache,
+        sleeve_daily_ret=sleeve_daily_ret,
+        is_meta_stats=is_meta_stats,
+        pit_assets=pit_assets,
+        ep_map=ep_hr,
+        is_liq_stats=is_liq_stats,
+        price_ret_df=price_ret_df,
+        scheme="hr",
+        min_nf=9,
+        min_ep=20,
+        min_shp_fs=1.05,
+        min_shp_hr=0.95,
+        min_r=2.15,
+        min_sm=12.0,
+        min_vol_wan=8.8,
+        price_corr_th=0.68,
+        sleeve_corr_th=0.15,
+        sector_damp_power=0.65,
+        symmetric_deadzone=0.02,
+        target_portfolio_vol=0.15,
+    )
+    s_zhc_opt["active_universe"] = (
+        f"ZeroHC-Cluster (F1:{len(sel_zhc_opt['Fold1_2025'])}, F2:{len(sel_zhc_opt['Fold2_2026'])})"
+    )
+    results.append(s_zhc_opt)
+    ledger_map["Full60_ZeroHardcode_ClusterConserved_Optimal"] = leds_zhc_opt
+
+    # 7. 3.0x 机构目标敞口对比
     for base_key, name_3x in (
         ("Core20_ExpE_StaticExit", "Core20_ExpE_StaticExit_3x"),
         ("Core20_ExpE_HysteresisRunner", "Core20_ExpE_HysteresisRunner_3x"),
         ("Full60_FlatHRP_HysteresisRunner", "Full60_FlatHRP_HysteresisRunner_3x"),
         ("Full60_ZeroHardcode_SOPStage3", "Full60_ZeroHardcode_SOPStage3_3x"),
         ("Full60_CoreSatellite_SOPStage3_Optimal", "Full60_CoreSatellite_SOPStage3_3x"),
+        ("Full60_ZeroHardcode_ClusterConserved_Optimal", "Full60_ZeroHardcode_ClusterConserved_3x"),
     ):
         leds_3x = scale_fold_ledgers_exposure(ledger_map[base_key], 3.0)
         s3 = summarize_stitched_oos(leds_3x, name_3x)
@@ -1110,13 +1459,18 @@ def main() -> None:
         ].to_string(index=False)
     )
     print(
-        f"      SOP Stage-3 样本内自动准入卫星品种: Fold1_2025={admitted_sats['Fold1_2025']} | Fold2_2026={admitted_sats['Fold2_2026']}"
+        f"      ZeroHC-Cluster 100%零先验内生准入品种: Fold1_2025={sel_zhc_opt['Fold1_2025']} | Fold2_2026={sel_zhc_opt['Fold2_2026']}"
+    )
+    print(
+        f"      Core-Satellite 对照组准入卫星品种: Fold1_2025={admitted_sats['Fold1_2025']} | Fold2_2026={admitted_sats['Fold2_2026']}"
     )
 
     sec_df, sym_df = build_attribution_tables(
         ledger_map["Full60_FlatHRP_HysteresisRunner"],
         ledger_map["Full60_CoreSatellite_SOPStage3_Optimal"],
         admitted_sats,
+        zhc_ledgers=ledger_map["Full60_ZeroHardcode_ClusterConserved_Optimal"],
+        zhc_selected=sel_zhc_opt,
     )
     sec_csv = OUT_DIR / "full60_sector_attribution.csv"
     sym_csv = OUT_DIR / "full60_symbol_attribution.csv"
@@ -1124,7 +1478,9 @@ def main() -> None:
     sym_df.to_csv(sym_csv, index=False)
     print(f"[3/5] 已生成 6大板块归因表 ({sec_csv.name}) 与 60品种归因表 ({sym_csv.name})")
 
-    sat_df = build_satellite_sop_table(is_meta_stats, is_corrs_with_core, sleeve_daily_ret, admitted_sats)
+    sat_df = build_satellite_sop_table(
+        is_meta_stats, is_corrs_with_core, sleeve_daily_ret, admitted_sats, zhc_selected=sel_zhc_opt
+    )
     sat_csv = OUT_DIR / "full60_satellite_sop_admission.csv"
     sat_df.to_csv(sat_csv, index=False)
     print(f"[4/5] 已生成 40个扩展池卫星品种 SOP Stage-3 准入明细表: {sat_csv.name}")

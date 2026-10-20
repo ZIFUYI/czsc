@@ -34,6 +34,7 @@ from examples.multi_factor_cta.atomic_factors import (
 
 
 class AssetClass(str, Enum):
+    EQUITY_REFERENCE = "EQUITY_REFERENCE"  # 权益指数/ETF参考行情；不宣称可直接执行双向期货交易
     INDEX_FUTURES = "INDEX_FUTURES"  # 股指期货 (IF / IH / IC / IM)
     ETF_T0 = "ETF_T0"  # 可日内 T+0 交易的宽基/行业 ETF
     COMMODITY_FUTURES = "COMMODITY_FUTURES"  # 商品期货主力连续 (含夜盘)
@@ -53,13 +54,14 @@ class AssetSpec:
     name: str
     asset_class: AssetClass
     sector: str  # 板块归属 (用于跨品种 Sector HRP 风险预算)
-    base_tf: str  # 该品种底层基准执行周期 ("5m" | "15m" | "30m")
+    base_tf: str  # 底层已收盘周期 ("5m" | "15m" | "30m" | "60m" | "1d")
     eligible_tfs: tuple[str, ...]  # 该品种参与合成的多周期列表
     fee_rate: float  # 单边综合交易成本 (手续费 + 冲击滑点)
     has_night_session: bool = False  # 是否包含夜盘 (21:00 起归属下一交易日)
     roll_gap_threshold_atr: float = 3.5  # 主力换月异常跳空后复权识别阈值
     execution_mode: ExecutionMode = ExecutionMode.LONG_SHORT
     data_path: Path | None = None
+    adjust_rolls: bool = True  # 连续合约无换月标识时，研究可显式禁用启发式跳空调整
 
 
 def assign_trading_date(dt_series: pd.Series, has_night_session: bool, calendar_path: Path | None = None) -> pd.Series:
@@ -103,6 +105,8 @@ def adjust_continuous_roll_gaps(df: pd.DataFrame, gap_atr_mult: float = 4.0) -> 
     计算累积比例复权因子 `adj_factor` 并对 OHLC 序列执行平滑复权，消除假突破失真。
     """
     out = df.copy()
+    if out.empty:
+        return out
     c = out["close"].values.astype(np.float64)
     o = out["open"].values.astype(np.float64)
     h = out["high"].values.astype(np.float64)
@@ -110,7 +114,8 @@ def adjust_continuous_roll_gaps(df: pd.DataFrame, gap_atr_mult: float = 4.0) -> 
 
     tr = np.maximum(h - low_arr, np.abs(c - np.roll(c, 1)))
     tr[0] = h[0] - low_arr[0]
-    atr = pd.Series(tr).rolling(20, min_periods=5).mean().bfill().values
+    # Gap identification uses only completed history; cold starts remain unadjusted.
+    atr = pd.Series(tr).rolling(20, min_periods=1).mean().shift(1).values
 
     dates = out["date"].values
     day_switch = np.zeros(len(out), dtype=bool)
@@ -119,10 +124,10 @@ def adjust_continuous_roll_gaps(df: pd.DataFrame, gap_atr_mult: float = 4.0) -> 
     overnight_gap = np.zeros(len(out), dtype=np.float64)
     overnight_gap[1:] = np.abs(o[1:] - c[:-1])
 
-    if "underlying_symbol" in out.columns and out["underlying_symbol"].dropna().nunique() > 1:
-        usym = out["underlying_symbol"].ffill().bfill().astype(str).values
-        roll_mask = np.zeros(len(out), dtype=bool)
-        roll_mask[1:] = usym[1:] != usym[:-1]
+    if "underlying_symbol" in out.columns:
+        usym = out["underlying_symbol"].ffill()
+        known_pair = usym.notna() & usym.shift(1).notna()
+        roll_mask = (known_pair & usym.ne(usym.shift(1))).to_numpy(dtype=bool)
     else:
         roll_mask = day_switch & (overnight_gap > gap_atr_mult * np.maximum(atr, 1e-6))
     ratios = np.ones(len(out), dtype=np.float64)
@@ -145,26 +150,36 @@ def map_tf_weight_to_base_grid(
     w_source: np.ndarray,
     df_target: pd.DataFrame,
 ) -> np.ndarray:
-    """
-    将任意高周期 (15m / 30m / 60m / 1d) 的规则持仓权重无未来函数、零延迟地映射到品种基准网格 (5m / 15m / 30m) 上：
-    - 当源周期与目标网格相同时，1:1 原样返回；
-    - 当源周期高于目标网格时，严格在源周期 K 线收盘时刻 `dt` 生效，并向后阶梯保持 (Step-Hold ffill)。
-    """
-    if len(df_source) == len(df_target) and np.array_equal(df_source["dt"].values, df_target["dt"].values):
-        return w_source.astype(np.float64).copy()
+    """Hold the most recent source target whose timestamp is no later than the target bar.
 
-    n_src = len(df_source)
-    n_tgt = len(df_target)
-    if n_src > 0 and n_tgt % n_src == 0:
-        g = n_tgt // n_src
-        if g > 1:
-            out = np.zeros(n_tgt, dtype=np.float64)
-            out[g - 1 : -1] = np.repeat(w_source[:-1], g)
-            out[-1] = w_source[-1]
-            return out
-
-    s_src = pd.Series(w_source.astype(np.float64), index=df_source["dt"])
-    return df_target["dt"].map(s_src).ffill().fillna(0.0).values
+    Both clocks must be unique and increasing. Source timestamps represent closed
+    bars; missing target bars do not discard a previously observed source decision.
+    """
+    weights = np.asarray(w_source, dtype=np.float64)
+    if weights.shape != (len(df_source),) or not np.isfinite(weights).all():
+        raise ValueError("Source weights must be finite and aligned with source timestamps")
+    target_dt = pd.DatetimeIndex(pd.to_datetime(df_target["dt"]))
+    if target_dt.hasnans or target_dt.has_duplicates or not target_dt.is_monotonic_increasing:
+        raise ValueError("Target timestamps must be valid, unique and increasing")
+    if df_source.empty:
+        return np.zeros(len(df_target), dtype=np.float64)
+    source_dt = pd.DatetimeIndex(pd.to_datetime(df_source["dt"]))
+    if source_dt.hasnans or source_dt.has_duplicates or not source_dt.is_monotonic_increasing:
+        raise ValueError("Source timestamps must be valid, unique and increasing")
+    if source_dt.tz != target_dt.tz:
+        raise ValueError("Source and target timestamps must use the same timezone")
+    if df_target.empty:
+        return np.zeros(0, dtype=np.float64)
+    if source_dt.equals(target_dt):
+        return weights.copy()
+    aligned = pd.merge_asof(
+        pd.DataFrame({"dt": target_dt}),
+        pd.DataFrame({"dt": source_dt, "weight": weights}),
+        on="dt",
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    return aligned["weight"].fillna(0.0).to_numpy(dtype=np.float64)
 
 
 class CrossAssetDataEngine:
@@ -176,6 +191,11 @@ class CrossAssetDataEngine:
 
     def load_asset_multi_timeframes(self, spec: AssetSpec, attach_czsc: bool = True) -> dict[str, pd.DataFrame]:
         """加载单个品种的底层数据并合成其 eligible_tfs 多周期 K 线与特征"""
+        tf_mins = {"5m": 5, "15m": 15, "30m": 30, "60m": 60, "1d": 240}
+        if spec.base_tf not in tf_mins or any(tf not in tf_mins for tf in spec.eligible_tfs):
+            raise ValueError("Unsupported base or research timeframe")
+        if any(tf_mins[tf] < tf_mins[spec.base_tf] for tf in spec.eligible_tfs):
+            raise ValueError("Research timeframes cannot be finer than the source bars")
         if spec.data_path is None or not spec.data_path.exists():
             raise FileNotFoundError(f"Data file not found for {spec.symbol}: {spec.data_path}")
 
@@ -184,11 +204,10 @@ class CrossAssetDataEngine:
         df_base["date"] = assign_trading_date(df_base["dt"], spec.has_night_session, cal_path)
         df_base["bar_in_day"] = df_base.groupby("date", sort=False).cumcount()
 
-        if spec.asset_class in (AssetClass.INDEX_FUTURES, AssetClass.COMMODITY_FUTURES):
+        if spec.adjust_rolls and spec.asset_class in (AssetClass.INDEX_FUTURES, AssetClass.COMMODITY_FUTURES):
             df_base = adjust_continuous_roll_gaps(df_base, gap_atr_mult=spec.roll_gap_threshold_atr)
 
-        base_mins = {"5m": 5, "15m": 15, "30m": 30, "60m": 60}[spec.base_tf]
-        tf_mins = {"5m": 5, "15m": 15, "30m": 30, "60m": 60, "1d": 240}
+        base_mins = tf_mins[spec.base_tf]
 
         sym_cache_dir = (
             self.cache_dir
@@ -324,6 +343,8 @@ class CrossAssetDataEngine:
         spread_window: int = 20,
         lag_window: int = 5,
         attach_to_dfs: bool = True,
+        max_quote_age: str | pd.Timedelta | None = None,
+        membership_masks: Mapping[str, pd.Series] | None = None,
     ) -> dict[str, pd.DataFrame]:
         """
         零前视因果截面特征引擎 (Causal Cross-Sectional Feature Engine)：
@@ -332,16 +353,21 @@ class CrossAssetDataEngine:
         1. `cs_slope_rank` (R_{i,t} ∈ [0, 1]) 与中心化强度 `cs_strength` (X_{i,t} = 2 R_{i,t} - 1 ∈ [-1, 1])；
         2. `sector_leader_dir` (∈ [-1, 1]) 与相对龙头短期滞涨/滞跌差 `leader_lag_gap`；
         3. `sector_spread_zscore` (本品种相对于所属板块等权均值的滚动超额残差 Z-score)。
+        `max_quote_age` 默认一个 tf，过期报价不进入截面；`membership_masks` 是以生效时间为索引的
+        历史成员布尔序列。缺少板块元数据的品种独立分组，不假定它们属于同一板块。
+        `cs_available` 表示当前有新鲜本品种报价及至少一个同板块成员，`cs_active_count` 报告有效资产数。
         """
         return CrossSectionalFeatureEngine(
             slope_window=slope_window,
             spread_window=spread_window,
             lag_window=lag_window,
+            max_quote_age=max_quote_age,
         ).compute_and_attach(
             asset_tf_dfs=asset_tf_dfs,
             specs=specs,
             tf=tf,
             attach_to_dfs=attach_to_dfs,
+            membership_masks=membership_masks,
         )
 
 
@@ -359,10 +385,12 @@ class CrossSectionalFeatureEngine:
         slope_window: int = 20,
         spread_window: int = 20,
         lag_window: int = 5,
+        max_quote_age: str | pd.Timedelta | None = None,
     ) -> None:
         self.slope_window = int(max(2, slope_window))
         self.spread_window = int(max(3, spread_window))
         self.lag_window = int(max(1, lag_window))
+        self.max_quote_age = pd.Timedelta(max_quote_age) if max_quote_age is not None else None
 
     @staticmethod
     def _resolve_sector_map(
@@ -386,7 +414,7 @@ class CrossSectionalFeatureEngine:
                 elif "sector" in df_s.attrs:
                     sector_map[sym] = str(df_s.attrs["sector"])
                 else:
-                    sector_map[sym] = "DEFAULT_SECTOR"
+                    sector_map[sym] = f"unknown:{sym}"
         return sector_map
 
     @staticmethod
@@ -411,8 +439,12 @@ class CrossSectionalFeatureEngine:
     def _compute_single_asset_primitives(self, df: pd.DataFrame) -> pd.DataFrame:
         n = len(df)
         if n == 0:
-            return pd.DataFrame(columns=["dt", "norm_slope", "short_slope", "cum_norm_price"])
+            return pd.DataFrame(
+                columns=["dt", "norm_slope", "short_slope", "cum_norm_price", "causal_vol", "causal_snr"]
+            )
         c = df["close"].to_numpy(dtype=np.float64)
+        h = df["high"].to_numpy(dtype=np.float64)
+        low_arr = df["low"].to_numpy(dtype=np.float64)
         atr = self._causal_atr(df, period=14)
         idx = np.arange(n, dtype=int)
 
@@ -437,12 +469,57 @@ class CrossSectionalFeatureEngine:
             step_norm[1:] = (c[1:] - c[:-1]) / atr[1:]
         cum_norm_price = np.cumsum(step_norm)
 
+        # 4. 严格因果 (<= t-1) 的成交活跃度与趋势信噪比 (Efficiency Ratio × 波动稳健度)，镜像翻转完全不变量
+        vol_col = "volume" if "volume" in df.columns else ("vol" if "vol" in df.columns else None)
+        if vol_col is not None:
+            raw_v = np.maximum(np.nan_to_num(df[vol_col].to_numpy(dtype=np.float64), nan=1.0), 0.0)
+        else:
+            raw_v = np.ones(n, dtype=np.float64)
+        vol_win = max(20, 2 * self.slope_window)
+        s_vol = pd.Series(raw_v)
+        vol_short = (
+            s_vol.rolling(self.slope_window, min_periods=1).mean().shift(1).fillna(1.0).to_numpy(dtype=np.float64)
+        )
+        vol_long = s_vol.rolling(2 * vol_win, min_periods=1).mean().shift(1).fillna(1.0).to_numpy(dtype=np.float64)
+        vol_act = np.clip(vol_short / np.maximum(vol_long, 1e-6), 0.50, 2.00)
+        causal_vol = np.maximum(vol_long, 1e-6) * vol_act
+
+        abs_diff = np.zeros(n, dtype=np.float64)
+        if n > 1:
+            abs_diff[1:] = np.abs(c[1:] - c[:-1])
+        path_w = pd.Series(abs_diff).rolling(self.slope_window, min_periods=1).sum().to_numpy(dtype=np.float64)
+        net_w = np.abs(c - c[w_idx])
+        er_curr = np.where(path_w > 1e-9, np.clip(net_w / np.maximum(path_w, 1e-9), 0.0, 1.0), 0.5)
+        er_prev = pd.Series(er_curr).shift(1).fillna(0.5).to_numpy(dtype=np.float64)
+
+        tr = np.empty(n, dtype=np.float64)
+        tr[0] = max(h[0] - low_arr[0], 1e-9)
+        if n > 1:
+            prev_c = c[:-1]
+            tr[1:] = np.maximum(
+                h[1:] - low_arr[1:],
+                np.maximum(np.abs(h[1:] - prev_c), np.abs(low_arr[1:] - prev_c)),
+            )
+        tr_std = (
+            pd.Series(tr).rolling(self.slope_window, min_periods=2).std(ddof=0).fillna(0.0).to_numpy(dtype=np.float64)
+        )
+        cv_tr_prev = pd.Series(tr_std / np.maximum(atr, 1e-9)).shift(1).fillna(0.0).to_numpy(dtype=np.float64)
+        spike_prev = pd.Series(tr / np.maximum(atr, 1e-9)).shift(1).fillna(1.0).to_numpy(dtype=np.float64)
+        stab_prev = np.clip(
+            (1.0 / (1.0 + 0.5 * cv_tr_prev)) * np.minimum(1.0, 2.0 / np.maximum(spike_prev, 1.0)),
+            0.25,
+            1.0,
+        )
+        causal_snr = np.clip((0.35 + 0.65 * er_prev) * stab_prev * vol_act, 0.15, 2.0)
+
         out = pd.DataFrame(
             {
                 "dt": pd.to_datetime(df["dt"]).to_numpy(),
                 "norm_slope": norm_slope,
                 "short_slope": short_slope,
                 "cum_norm_price": cum_norm_price,
+                "causal_vol": causal_vol,
+                "causal_snr": causal_snr,
             }
         )
         return out.sort_values("dt").drop_duplicates(subset=["dt"], keep="last").reset_index(drop=True)
@@ -454,6 +531,8 @@ class CrossSectionalFeatureEngine:
         tf: str = "60m",
         *,
         attach_to_dfs: bool = True,
+        max_quote_age: str | pd.Timedelta | None = None,
+        membership_masks: Mapping[str, pd.Series] | None = None,
     ) -> dict[str, pd.DataFrame]:
         # 提取各品种在目标周期 tf 上的 DataFrame
         target_dfs: dict[str, pd.DataFrame] = {}
@@ -465,11 +544,13 @@ class CrossSectionalFeatureEngine:
                 is_nested = True
                 if tf in val and isinstance(val[tf], pd.DataFrame):
                     target_dfs[sym] = val[tf]
-                elif len(val) > 0:
-                    first_df = next(iter(val.values()))
-                    if isinstance(first_df, pd.DataFrame):
-                        target_dfs[sym] = first_df
 
+        durations = {"5m": "5min", "15m": "15min", "30m": "30min", "60m": "60min", "1d": "1D"}
+        quote_age = (
+            pd.Timedelta(max_quote_age)
+            if max_quote_age is not None
+            else (self.max_quote_age or pd.Timedelta(durations.get(tf, "60min")))
+        )
         symbols = list(target_dfs.keys())
         if not symbols:
             return {}
@@ -492,6 +573,8 @@ class CrossSectionalFeatureEngine:
         ns_mat = np.full((t_len, m_syms), np.nan, dtype=np.float64)
         ss_mat = np.full((t_len, m_syms), np.nan, dtype=np.float64)
         pn_mat = np.full((t_len, m_syms), np.nan, dtype=np.float64)
+        vol_mat = np.full((t_len, m_syms), np.nan, dtype=np.float64)
+        snr_mat = np.full((t_len, m_syms), np.nan, dtype=np.float64)
 
         for j, sym in enumerate(symbols):
             p_df = primitives[sym]
@@ -501,51 +584,128 @@ class CrossSectionalFeatureEngine:
                 ns_mat[:, j] = p_df["norm_slope"].to_numpy(dtype=np.float64)
                 ss_mat[:, j] = p_df["short_slope"].to_numpy(dtype=np.float64)
                 pn_mat[:, j] = p_df["cum_norm_price"].to_numpy(dtype=np.float64)
+                vol_mat[:, j] = p_df["causal_vol"].to_numpy(dtype=np.float64)
+                snr_mat[:, j] = p_df["causal_snr"].to_numpy(dtype=np.float64)
             else:
-                merged = pd.merge_asof(grid_frame, p_df, on="dt", direction="backward")
+                merged = pd.merge_asof(grid_frame, p_df, on="dt", direction="backward", tolerance=quote_age)
                 ns_mat[:, j] = merged["norm_slope"].to_numpy(dtype=np.float64)
                 ss_mat[:, j] = merged["short_slope"].to_numpy(dtype=np.float64)
                 pn_mat[:, j] = merged["cum_norm_price"].to_numpy(dtype=np.float64)
+                vol_mat[:, j] = merged["causal_vol"].to_numpy(dtype=np.float64)
+                snr_mat[:, j] = merged["causal_snr"].to_numpy(dtype=np.float64)
 
-        # 1. 全市场横截面百分位排名 cs_slope_rank ∈ [0, 1] 与中心化强度 cs_strength ∈ [-1, 1]
-        rk_mat = pd.DataFrame(ns_mat).rank(axis=1, method="average", na_option="keep").to_numpy(dtype=np.float64)
-        valid_cnt = np.sum(np.isfinite(ns_mat), axis=1, keepdims=True)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            cs_rank_mat = np.where(valid_cnt > 1, (rk_mat - 1.0) / np.maximum(valid_cnt - 1.0, 1.0), 0.5)
-        cs_rank_mat = np.clip(np.nan_to_num(cs_rank_mat, nan=0.5), 0.0, 1.0)
-        cs_strength_mat = np.clip(2.0 * cs_rank_mat - 1.0, -1.0, 1.0)
+        # Historical membership is an as-of event series. Before its first observation the asset is inactive.
+        for j, sym in enumerate(symbols):
+            member = (membership_masks or {}).get(sym)
+            if member is not None:
+                membership = pd.DataFrame({"dt": pd.to_datetime(member.index), "active": member.to_numpy(dtype=bool)})
+                membership = membership.sort_values("dt").drop_duplicates("dt", keep="last")
+                active = pd.merge_asof(grid_frame, membership, on="dt", direction="backward")["active"]
+                inactive = ~active.fillna(False).to_numpy(dtype=bool)
+                ns_mat[inactive, j] = np.nan
+                ss_mat[inactive, j] = np.nan
+                pn_mat[inactive, j] = np.nan
+                vol_mat[inactive, j] = np.nan
+                snr_mat[inactive, j] = np.nan
 
-        # 2. 按板块分组计算龙头趋势方向 sector_leader_dir ∈ [-1, 1]、滞涨差 leader_lag_gap 与板块等权均值路径
+        valid_mask = np.isfinite(ns_mat)
+        valid_cnt = np.sum(valid_mask, axis=1, keepdims=True)
+
+        # 构造全市场与板块内严格因果 (<= t-1) 的连续报价覆盖率 × 成交活跃度 × 趋势信噪比 (ER × 波动稳健度) 权重矩阵 W_{k, t-1}
         sector_to_indices: dict[str, list[int]] = {}
         for j, sym in enumerate(symbols):
             sector_to_indices.setdefault(sector_map[sym], []).append(j)
 
+        cov_win = max(20, 2 * self.slope_window)
+        cov_mat = (
+            pd.DataFrame(valid_mask.astype(np.float64))
+            .rolling(cov_win, min_periods=1)
+            .mean()
+            .shift(1)
+            .fillna(1.0)
+            .to_numpy(dtype=np.float64)
+        )
+        cov_factor = np.power(np.clip(cov_mat, 0.15, 1.0), 2.5)
+
+        cs_weight_mat = np.zeros((t_len, m_syms), dtype=np.float64)
+        for _sec, col_idxs in sector_to_indices.items():
+            sec_vol = np.where(valid_mask[:, col_idxs], np.maximum(vol_mat[:, col_idxs], 1e-6), np.nan)
+            any_sec_valid = np.any(valid_mask[:, col_idxs], axis=1)
+            sec_med_vol = np.ones((t_len, 1), dtype=np.float64)
+            if np.any(any_sec_valid):
+                sec_med_vol[any_sec_valid] = np.nanmedian(sec_vol[any_sec_valid], axis=1, keepdims=True)
+            sec_med_vol = np.where(np.isfinite(sec_med_vol) & (sec_med_vol > 1e-9), sec_med_vol, 1.0)
+            liq_ratio = np.clip(np.power(np.nan_to_num(sec_vol / sec_med_vol, nan=1.0), 0.45), 0.15, 3.00)
+            sec_snr = np.clip(np.nan_to_num(snr_mat[:, col_idxs], nan=0.5), 0.15, 2.0)
+            sec_cov = cov_factor[:, col_idxs]
+            cs_weight_mat[:, col_idxs] = np.where(valid_mask[:, col_idxs], sec_cov * liq_ratio * sec_snr, 0.0)
+
+        # 1. 全市场因果加权横截面百分位排名 cs_slope_rank ∈ [0, 1] 与中心化强度 cs_strength ∈ [-1, 1]
+        cs_rank_mat = np.full((t_len, m_syms), 0.5, dtype=np.float64)
+        if m_syms > 1:
+            for j in range(m_syms):
+                v_j = valid_mask[:, j]
+                ns_j = ns_mat[:, j : j + 1]
+                other_mask = valid_mask.copy()
+                other_mask[:, j] = False
+                w_other = np.where(other_mask, cs_weight_mat, 0.0)
+                w_sum = np.sum(w_other, axis=1)
+                less = other_mask & (ns_mat < ns_j - 1e-12)
+                tie = other_mask & (np.abs(ns_mat - ns_j) <= 1e-12)
+                w_less = np.sum(np.where(less, w_other, 0.0) + 0.5 * np.where(tie, w_other, 0.0), axis=1)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    rk_j = np.where(v_j & (w_sum > 1e-12), w_less / np.maximum(w_sum, 1e-12), 0.5)
+                cs_rank_mat[:, j] = np.clip(np.nan_to_num(rk_j, nan=0.5), 0.0, 1.0)
+        cs_strength_mat = np.clip(2.0 * cs_rank_mat - 1.0, -1.0, 1.0)
+
+        # 2. 按板块分组计算因果去噪龙头方向 sector_leader_dir ∈ [-1, 1]、滞涨差 leader_lag_gap 与链式无跳变板块基准路径
         leader_dir_mat = np.zeros((t_len, m_syms), dtype=np.float64)
         lag_gap_mat = np.zeros((t_len, m_syms), dtype=np.float64)
         sector_mean_pn_mat = np.zeros((t_len, m_syms), dtype=np.float64)
+        peer_available_mat = np.zeros((t_len, m_syms), dtype=bool)
 
         for _sec, col_idxs in sector_to_indices.items():
             sec_pn = pn_mat[:, col_idxs]
-            with np.errstate(invalid="ignore"):
-                sec_mean_pn = np.nanmean(sec_pn, axis=1)
-            sec_mean_pn = np.nan_to_num(sec_mean_pn, nan=0.0)
+            sec_valid_pn = np.isfinite(sec_pn)
+            sec_w_pn = np.where(sec_valid_pn, cs_weight_mat[:, col_idxs], 0.0)
+            sec_w_sum = np.sum(sec_w_pn, axis=1)
+            sec_pn_ffill = pd.DataFrame(sec_pn).ffill().fillna(0.0).to_numpy(dtype=np.float64)
+            sec_dpn = np.zeros_like(sec_pn_ffill)
+            if t_len > 1:
+                sec_dpn[1:] = sec_pn_ffill[1:] - sec_pn_ffill[:-1]
+            sec_dpn = np.where(sec_valid_pn, sec_dpn, 0.0)
+            sec_mean_dpn = np.sum(sec_dpn * sec_w_pn, axis=1) / np.maximum(sec_w_sum, 1e-12)
+            sec_mean_pn = np.cumsum(sec_mean_dpn)
 
             for j in col_idxs:
                 sector_mean_pn_mat[:, j] = sec_mean_pn
-                peer_idxs = [k for k in col_idxs if k != j] if len(col_idxs) > 1 else [j]
+                peer_idxs = [k for k in col_idxs if k != j]
+                if not peer_idxs:
+                    continue
                 peer_ns = ns_mat[:, peer_idxs]
                 peer_ss = ss_mat[:, peer_idxs]
+                peer_w = cs_weight_mat[:, peer_idxs]
                 abs_ns = np.abs(peer_ns)
-                valid_peer = np.isfinite(abs_ns)
-                any_valid = np.any(valid_peer, axis=1)
+                valid_peer = np.isfinite(abs_ns) & (peer_w > 0.0)
+                any_valid = np.any(valid_peer, axis=1) & np.isfinite(ns_mat[:, j])
+                peer_available_mat[:, j] = any_valid
 
-                safe_abs = np.where(valid_peer, abs_ns, -1.0)
-                max_abs = np.max(safe_abs, axis=1, keepdims=True)
-                is_top = valid_peer & (abs_ns >= max_abs - 1e-12)
-                top_cnt = np.maximum(np.sum(is_top, axis=1), 1).astype(np.float64)
+                # 采用因果活跃度 × 信噪比加权的 Top-K 龙头评分替代单 Bar 裸 max_abs，消除边缘小品种毛刺篡权
+                leader_score = np.where(valid_peer, peer_w * abs_ns, -1.0)
+                n_peers = len(peer_idxs)
+                k_top = min(n_peers, max(1, min(2, len(col_idxs) // 4)))
+                if k_top == 1 or n_peers == 1:
+                    thresh = np.max(leader_score, axis=1, keepdims=True)
+                else:
+                    part = np.partition(leader_score, n_peers - k_top, axis=1)
+                    thresh = np.maximum(part[:, n_peers - k_top : n_peers - k_top + 1], 0.0)
+                is_top = valid_peer & (leader_score >= thresh - 1e-12)
 
-                leader_ns = np.sum(np.where(is_top, peer_ns, 0.0), axis=1) / top_cnt
-                leader_ss = np.sum(np.where(is_top, peer_ss, 0.0), axis=1) / top_cnt
+                top_w = np.where(is_top, peer_w * (0.25 + abs_ns), 0.0)
+                top_w_sum = np.maximum(np.sum(top_w, axis=1), 1e-12)
+
+                leader_ns = np.sum(np.where(is_top, top_w * peer_ns, 0.0), axis=1) / top_w_sum
+                leader_ss = np.sum(np.where(is_top, top_w * peer_ss, 0.0), axis=1) / top_w_sum
 
                 leader_dir_j = np.where(any_valid, np.tanh(2.5 * leader_ns), 0.0)
                 self_ss = np.nan_to_num(ss_mat[:, j], nan=0.0)
@@ -567,6 +727,8 @@ class CrossSectionalFeatureEngine:
                     "sector_leader_dir": leader_dir_mat[:, j],
                     "leader_lag_gap": lag_gap_mat[:, j],
                     "_sec_mean_pn": sector_mean_pn_mat[:, j],
+                    "cs_available": peer_available_mat[:, j] & (valid_cnt[:, 0] > 1),
+                    "cs_active_count": valid_cnt[:, 0],
                 }
             )
             if len(p_df) == t_len and np.array_equal(p_df["dt"].to_numpy(), grid_dt):
@@ -600,10 +762,12 @@ class CrossSectionalFeatureEngine:
                     "leader_lag_gap": np.clip(
                         np.nan_to_num(aligned_j["leader_lag_gap"].to_numpy(dtype=np.float64), nan=0.0), -2.0, 2.0
                     ),
-                    "sector_spread_zscore": spread_z,
+                    "sector_spread_zscore": np.where(aligned_j["cs_available"], spread_z, 0.0),
+                    "cs_available": aligned_j["cs_available"].to_numpy(dtype=bool),
+                    "cs_active_count": aligned_j["cs_active_count"].to_numpy(dtype=np.int64),
                 }
             )
-            provider = DataFrameCrossSectionProvider(cs_only_df, default_tf=tf)
+            provider = DataFrameCrossSectionProvider(cs_only_df, default_tf=tf, max_quote_age=quote_age)
 
             if attach_to_dfs:
                 if is_nested and isinstance(asset_tf_dfs[sym], Mapping):
@@ -636,6 +800,8 @@ def compute_causal_cross_sectional_features(
     spread_window: int = 20,
     lag_window: int = 5,
     attach_to_dfs: bool = True,
+    max_quote_age: str | pd.Timedelta | None = None,
+    membership_masks: Mapping[str, pd.Series] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """模块级便捷函数：计算并挂载跨品种零前视因果截面特征。"""
     return CrossAssetDataEngine.compute_causal_cross_sectional_features(
@@ -646,4 +812,6 @@ def compute_causal_cross_sectional_features(
         spread_window=spread_window,
         lag_window=lag_window,
         attach_to_dfs=attach_to_dfs,
+        max_quote_age=max_quote_age,
+        membership_masks=membership_masks,
     )
