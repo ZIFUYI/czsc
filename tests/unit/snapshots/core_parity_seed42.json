@@ -4,12 +4,30 @@
   "freq": "30分钟",
   "sdt": "20240101",
   "edt": "20240301",
+  "analysis_config": {
+    "min_bi_len": 6,
+    "max_bi_num": 50
+  },
+  "provenance": {
+    "original_source": "rs-czsc 47ef6efa (recorded by the original migration test)",
+    "imported_in_commit": "66a7432",
+    "original_config_evidence": "At import, check_bi fixed min_bi_len=6 and CZSC.new_py defaulted max_bi_num=50."
+  },
+  "revisions": [
+    {
+      "date": "2026-10-17",
+      "reason": "remove_include now requires both extrema to establish direction; nested initial ranges no longer invent an upward trend from highs alone.",
+      "initial_high_low": [[100.26, 99.16], [100.82, 99.09], [101.2, 98.68]],
+      "fx_list_count": {"before": 175, "after": 173},
+      "fx_marks": "Two fewer alternating marks; the remaining mark sequence is unchanged.",
+      "bi_lengths": {"index": 0, "before": 8, "after": 6},
+      "unchanged": "610 input bars, all 43 BI directions and the other 42 BI lengths."
+    }
+  ],
   "bars_count": 610,
-  "fx_list_count": 175,
+  "fx_list_count": 173,
   "bi_list_count": 43,
   "fx_marks": [
-    "底分型",
-    "顶分型",
     "底分型",
     "顶分型",
     "底分型",
@@ -230,7 +248,7 @@
     "向下"
   ],
   "bi_lengths": [
-    8,
+    6,
     8,
     7,
     15,

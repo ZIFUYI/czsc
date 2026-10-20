@@ -87,6 +87,8 @@ default = true
 test = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    # 独立成交/费用核对必须在测试环境执行，不能缺依赖后静默跳过。
+    "backtrader==1.9.78.123",
     "talib-rs; python_version == '3.12' and ((sys_platform == 'darwin' and platform_machine == 'arm64') or sys_platform == 'win32')",
 ]
 

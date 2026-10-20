@@ -11,15 +11,28 @@
 
 ### Added
 
+- Rust/Python 共享 `ExecutionLedger` 及价格、收益率、下一开盘决策入口；支持缺报价冻结、杠杆、显式清仓和闭区间费用归因。双引擎回放明确区分外部 WeightBacktest 原始零费用毛收益与共享费用标准化结果。
+- 测试依赖固定 `backtrader==1.9.78.123`，双引擎回归不再因缺依赖而整组跳过。
+- 真实行情重跑工具：保存源数据指纹、时间修正、固定候选清单与准入证据；支持原生日线输入，并用实际 Backtrader 成交与 WeightBacktest 核对最终仓位、末笔平仓及数量再平衡成本。研究缓存只在一次冻结数据池中复用，不改变准入门槛。
+- 共享 Rust/Python 结构研究 API：`structure_snapshots`、`structure_stop_anchors`、`evaluate_structure_factor`、`evaluate_structure_decay`、`two_stage_trigger`；Setup 冻结结构证伪点，返回完成笔事件与退出原因。
+- `Position.evaluate_signals` 批量运行原生事件状态机；`execution_episodes` / `execution_net_returns` 提供下一根开盘的实际调仓成本账本。
+- `format_research_kline_bytes` 将研究 OHLCV 的格式处理与校验统一到 Rust，支持缺失成交额与连续回放编号。
+- 顶层纯透传 `rsi`、`macd`、`obv`，分别采用 Wilder RSI、完整预热且不倍增的 MACD、收盘价变动 OBV。
+
 - **新增 `strength` 信号模块（6 个 `strength_*_V260601`）**：首批真正写入 `Signal.score`（`round(100·Q)`，`Q ∈ (0, 1]`）的 K 线信号——`strength_fx`（分型强度）、`strength_bi_div`（笔背驰强度 `Q_div = clip(1 − min(R_slope, R_area), 0.1, 1)`）、`strength_zs_revert`（中枢偏离回归）、`strength_zs_break`（三买/三卖脱离安全边际）、`strength_flow`（量价资金流）、`strength_squeeze`（波动率压缩后扩张）。公式只使用价差/ATR 比值，价格镜像后多空严格对称；Rust 端自带截断因果与镜像对称单测。
 - `czsc._native.signals` 子模块由 7 个扩为 17 个（新增 `ang / byi / clv / coo / jcc / kcatr / ntmdk / xl / zdy / strength`），分类映射表 `KLINE_CATEGORY_PREFIXES` 位于 `crates/czsc-signals/src/registry.rs`。
 
 ### Changed
 
+- **研究收益与费用口径变化**：统一固定初始资金、每个可交易时点恢复目标数量，按实际成交数量计费；不再使用单纯权重差估算费用。价格漂移再平衡、缩放、反手及退出均受影响，历史准入统计与净收益需要重新计算。
+- 六个 `strength_*` 新默认函数名去除日期后缀，旧名称保持同参数、同信号键与同输出兼容；信号反解析稳定选择新名称。
+- **研究结果需重算**：研究特征改为共享 Rust 指标；正式准入区分固定 ATR 诊断与实际结构退出净收益。旧 20/32 商品和 Plan A/B 等入口复用共同准入与最终成交账本，历史冠军收益不再作为新结果复用。
+
 - **（Breaking）`list_signal_names(category)` / `get_signal_category(name)` 改按 Rust 信号模块分类**：此前按名字前缀，`ang` 模块内的 `amv_* / adtm_* / ...` 无法通过 `category="ang"` 发现，`cci_*` 不属于 `tas`、`obvm_*` 不属于 `obv`。现在 `category` 取值为 17 个模块名；trader 状态信号（`pos_* / cat_*`）仍回退为名字前缀。不传 `category` 的行为不变。
 
 ### Fixed
 
+- 修正包含 K 线的镜像不对称：方向未确定的初始包含或并列极值不再仅按最高价定向；十字星合并后保持无实体。相关结构、分型强度和因子触发结果可能变化，需重新研究验证。
 - `czsc-signals` 单测中 `CZSC::new` 缺少 `min_bi_len` 参数导致 `cargo test -p czsc-signals` 无法编译（`cxt.rs` / `tas.rs` 测试夹具）。
 
 ## [1.0.1] — 2026-08-09

@@ -423,3 +423,37 @@ df = generate_symbol_kines("000001", "30分钟", "20240101", "20240601")
 | `ResearchResult` | 研究/回测结果容器（含 Arrow 字节流，提供 `signals_df()` / `pairs_df()` / `holds_df()` 方法） | `czsc/models.py:52` |
 | `ReplayResult` | 单标的回放结果容器（结构同 `ResearchResult`） | `czsc/models.py:96` |
 | `OptimizeResult` | 参数优化结果容器（含 `message` 字段） | `czsc/models.py:109` |
+
+## 因子研究共享接口（2026-10-17）
+
+以下接口在 Python 顶层直接导出，算法、参数验证和边界行为在 Rust 中实现。研究脚本仅转换 DataFrame/RawBar/数组。
+
+| Python API | Rust 实现 | 契约 |
+| --- | --- | --- |
+| `rsi(close, timeperiod)` | `czsc::ta::rsi` | Wilder 平滑；未就绪输出 NaN |
+| `macd(close, fastperiod, slowperiod, signalperiod)` | `czsc::ta::macd` | 返回 DIF/DEA/HIST；完整预热，HIST 不乘 2 |
+| `obv(close, volume)` | `czsc::ta::obv` | 按相邻收盘价方向累计成交量，首项为首根成交量；不同于历史实体方向资金量信号 |
+| `format_research_kline_bytes(data, freq)` | `czsc::format_research_kline` | Arrow IPC 边界；支持 volume/vol，缺失成交额显式置 0 表示未知；保留已有成交额，验证 OHLCV 并生成连续编号 |
+| `StructureSnapshot` / `structure_snapshots(bars, ...)` | `czsc::structure_snapshots` | 每个已收盘时刻的 FX、完成 BI 和 ZS 锚点；结构 ID 指向结构终点，事件所在输入行才是可知时刻 |
+| `structure_stop_anchors(bars, snapshots, stop_plugin, ...)` | 同名 Rust 函数 | 分派 FX、BI、中枢外沿、Setup 资金流 K 线、20 根箱体和已对齐 HTF MA 锚点；缺结构保持 NaN |
+| `evaluate_structure_factor(...)` | 同名 Rust 函数 | 先 Setup 冻结锚点，后 Confirmation；结构破位、反向完成 BI、1.3% 跟踪止盈、耗尽与超时均返回退出原因 |
+| `two_stage_trigger` / `evaluate_structure_decay` | 同名 Rust 函数 | 低层共享算子；后者为兼容用途默认关闭跟踪止盈，正式结构状态机默认开启 |
+| `Position.evaluate_signals(bars, rows)` | `czsc::Position::evaluate_signals` | 从独立空仓副本回放原生 Event/Position，保留 T+1；返回收盘目标与开仓脉冲，不改变模板状态 |
+| `ExecutionEpisode` / `execution_episodes(...)` | 同名 Rust 函数 | 仅返回完整实际持仓区间；计入连续缩放、反转双腿和退出费用；右边界未完成交易不作为统计样本 |
+| `execution_net_returns(open, weights, fee_rate)` | 同名 Rust 函数 | 前一收盘决策在当前开盘成交；不凭空补末尾清仓，可直接按日求和统计 |
+| `ExecutionLedger` / `execution_ledger(prices, weights, fee_rate, initial_capital, tradable)` | 同名 Rust 函数 | 已执行目标；固定初始资本，每个有报价时点恢复目标数量；返回毛收益、实际成交换手、费用、净收益及数量账本 |
+| `executed_weight_ledger(price_returns, weights, fee_rate, tradable)` | 同名 Rust 函数 | 相同固定资本口径的收益率输入；缺报价必须零收益且目标不变，恢复报价时累计价格变动 |
+| `decision_execution_ledger(open, weights, fee_rate, terminal_close)` | 同名 Rust 函数 | 收盘目标移至下一开盘；仅显式传入末尾收盘价时追加清仓行 |
+| `decision_interval_ledger(interval_returns, weights, fee_rate)` | 同名 Rust 函数 | 预计算的下一开盘到下一开盘区间及末尾收盘收益，首区间为零；返回含末尾清仓的完整账本 |
+| `ClosedExecutionIntervals` / `closed_execution_intervals(ledger)` | 同名 Rust 函数 | 将完整账本归因到前向区间，末区间包含退出费用；拒绝未清仓账本 |
+| `standardize_execution_returns(gross_returns, cost_returns)` | 同名 Rust 函数 | 外部引擎毛收益扣除共享费用；检查长度、有限值和非负费用 |
+
+执行账本使用固定初始资金 `N`：目标数量 `q = w*N/P`，单边成交费用为 `abs(q-q_prev)*P/N*fee_rate`。即使目标权重不变，价格变化后的再平衡也计费；累计资金曲线为 `1 + sum(net_returns)`。通用已执行目标允许杠杆，信号决策入口仍要求 `[-1, 1]`。`tradable=False` 专指缺报价冻结，不表示有价格变动却无法成交的停牌模型。
+
+`WeightBacktest` 继续原样导出外部 `wbt` 实现。双引擎核对中，`wbt_raw` 是外部引擎独立计算的零费用毛收益，`wbt_standardized` 使用共享 Rust 成交费用和净收益扣减；Backtrader 独立按订单数量计算费用。研究代码不再把外部 `abs(Δw)` 费用当作实际成交费用，旧费用下的准入统计须重新计算。
+
+`evaluate_structure_factor` 的输出是收盘决策，结构证伪和跟踪止盈由收盘确认后在下一开盘执行，不保证盘中止损成交价。`setup_index`、`stop` 和 `position_direction` 在退出行保留原持仓锚点，`direction`/`quality` 则描述新接受的触发；`strength` 是最终目标。
+
+`structure_snapshots` 的结构参数与信号生成器共用环境变量解析；省略参数时遵循 `CZSC_MIN_BI_LEN` / `CZSC_MAX_BI_NUM` 及其小写别名。`Position.evaluate_signals` 按严格递增时间回放并生成本批次局部编号，不依赖输入对象的历史编号；结构与超时行为在 Rust 和 Python 入口一致。
+
+迁移注意：研究中的 RSI、MACD 口径已变，旧特征、准入结果与曲线须重新生成。六个 `strength_*` 函数的新名称去除日期后缀；旧名称仍是同参数、同输出的兼容入口，已有信号键和 Event 字符串不变。固定 ATR 屏障保留为诊断，正式准入使用实际结构执行事件。F 簇缺少已收盘 HTF 均线时不武装，不能用本周期三根极值代替。

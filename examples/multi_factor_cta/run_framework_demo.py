@@ -29,6 +29,13 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from examples.alpha_mining_agent.forensic_pipeline import IS_END_DT  # noqa: E402
+from examples.alpha_mining_agent.run_evolution_loop import (  # noqa: E402
+    ResearchAuditContext,
+    audit_research_candidate,
+    compute_research_signal,
+    prepare_research_pool,
+)
 from examples.multi_factor_cta.data_engine import (  # noqa: E402
     AssetClass,
     AssetSpec,
@@ -38,15 +45,15 @@ from examples.multi_factor_cta.data_engine import (  # noqa: E402
 )
 from examples.multi_factor_cta.factor_engine import RuleFactorRegistry  # noqa: E402
 from examples.multi_factor_cta.forensic_validator import (  # noqa: E402
-    RuleFactorForensicValidator,
     compute_cross_sectional_concurrency,
-    compute_signed_jaccard,
 )
 from examples.multi_factor_cta.synthesis_engine import (  # noqa: E402
+    ContinuousSignalStateMachine,
     CrossAssetHRPSynthesizer,
     IntraAssetThreePillarSynthesizer,
+    RollingEmpiricalBayesWeighter,
+    build_asset_execution_inputs,
     evaluate_single_asset_backtest,
-    joint_is_coordinate_reweight,
 )
 
 WORKSPACE_DIR = ROOT_DIR / "examples" / "results" / "alpha_agent_workspace"
@@ -181,6 +188,82 @@ def export_multi_asset_cta_dashboard(
     fig.write_html(str(out_html), include_plotlyjs="cdn")
 
 
+def load_research_universe(
+    data_engine: CrossAssetDataEngine, specs: list[AssetSpec]
+) -> dict[str, dict[str, pd.DataFrame]]:
+    """Load the complete declared universe before attaching any cross-sectional gate."""
+    frames = {spec.symbol: data_engine.load_asset_multi_timeframes(spec, attach_czsc=True) for spec in specs}
+    metadata = {
+        spec.symbol: {
+            "asset_group": "commodity" if spec.asset_class == AssetClass.COMMODITY_FUTURES else "equity",
+            "sector": spec.sector,
+            "fee_rate": spec.fee_rate,
+        }
+        for spec in specs
+    }
+    # No liquidity/session regime is guessed: Tier 3 rejects missing microstructure metadata.
+    return prepare_research_pool(frames, metadata=metadata)
+
+
+def synthesize_admitted_asset(
+    spec: AssetSpec,
+    frames: dict[str, dict[str, pd.DataFrame]],
+    candidate_ids: list[str],
+    synthesizer: IntraAssetThreePillarSynthesizer,
+    *,
+    is_end_dt: pd.Timestamp = IS_END_DT,
+    audit_context: ResearchAuditContext | None = None,
+) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, float], dict[str, dict]]:
+    """Re-audit every seed/champion, fit through the cutoff and trade only afterwards.
+
+    Historical IS-selected membership/priors are never backfilled into tradable IS
+    positions. Candidate IDs are configuration; saved optimized coefficients are
+    not treated as historical priors. Defaults anchor strictly rolling estimates.
+    """
+    registry = RuleFactorRegistry()
+    tf_dfs = frames[spec.symbol]
+    grid = tf_dfs[spec.base_tf]
+    weights, priors, audits = {}, {}, {}
+    for uid in candidate_ids:
+        sid, tf = uid.split("@")
+        if tf not in spec.eligible_tfs or tf not in tf_dfs:
+            continue
+        factor = registry.get(sid)
+        if tf not in factor.eligible_tfs:
+            continue
+        audit_kwargs = {"is_end_dt": is_end_dt}
+        if audit_context is not None:
+            audit_kwargs["audit_context"] = audit_context
+        audit = audit_research_candidate(sid, tf, spec.symbol, frames, **audit_kwargs)
+        audits[uid] = audit
+        if not audit["passed"]:
+            continue
+        _, unit = compute_research_signal(tf_dfs[tf], sid, tf)
+        weights[uid] = map_tf_weight_to_base_grid(tf_dfs[tf], unit, grid)
+        priors[uid] = float(factor.default_weight)
+    if not weights:
+        return np.zeros(len(grid)), weights, priors, audits
+    eb = RollingEmpiricalBayesWeighter().compute_weights(
+        cross_asset_prior=priors,
+        df_grid=grid,
+        unit_weights_on_grid=weights,
+        fee_rate=spec.fee_rate,
+    )
+    target = synthesizer.synthesize(
+        grid,
+        weights,
+        eb,
+        spec,
+        soft_gate=False,
+        state_machine=False,
+        rebalance_deadzone=0.0,
+    )
+    target[pd.to_datetime(grid["dt"]).to_numpy() <= pd.Timestamp(is_end_dt).to_datetime64()] = 0.0
+    target = ContinuousSignalStateMachine().transform(target)
+    target = synthesizer._apply_execution_mode_adapter(grid, target, spec.execution_mode)
+    return target, weights, {uid: float(eb[uid][-1]) for uid in priors}, audits
+
+
 def main() -> None:
     CTA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print("=" * 125)
@@ -191,8 +274,6 @@ def main() -> None:
     print("=" * 125)
 
     data_engine = CrossAssetDataEngine(cache_dir=WORKSPACE_DIR)
-    registry = RuleFactorRegistry()
-    validator = RuleFactorForensicValidator()
     intra_synth = IntraAssetThreePillarSynthesizer()
     hrp_synth = CrossAssetHRPSynthesizer(target_portfolio_vol=0.14)
 
@@ -201,8 +282,10 @@ def main() -> None:
     champ_alloc: dict[str, float] = json.loads(champ_path.read_text(encoding="utf-8"))["alloc_map"]
 
     universe = build_default_cross_asset_universe()
+    pool_frames = load_research_universe(data_engine, universe)
     asset_results: dict[str, dict] = {}
     asset_daily_returns: dict[str, pd.Series] = {}
+    execution_returns, execution_positions, execution_strengths, execution_fees = {}, {}, {}, {}
     asset_sectors: dict[str, str] = {}
     cross_asset_30m_weights: dict[str, pd.Series] = {}
 
@@ -214,145 +297,38 @@ def main() -> None:
         print(
             f"\n[1. 加载与多周期对齐] {spec.name} ({spec.symbol}) | 基准网格={spec.base_tf} | 夜盘={spec.has_night_session}"
         )
-        tf_dfs = data_engine.load_asset_multi_timeframes(spec, attach_czsc=(spec.symbol == "SZSE.159915"))
+        tf_dfs = pool_frames[spec.symbol]
         df_grid = tf_dfs[spec.base_tf]
-
-        w_on_grid: dict[str, np.ndarray] = {}
-        active_alloc: dict[str, float] = {}
-        unit_forensic_meta: dict[str, dict] = {}
-
-        # 先对跨品种核心审计池中的因子做全资产 Gate 1A 法医登记
+        w_synth, w_on_grid, active_alloc, audits = synthesize_admitted_asset(
+            spec,
+            pool_frames,
+            sorted(champ_alloc),
+            intra_synth,
+        )
         for uid in core_universal_factors:
-            sid, tf = uid.split("@")
-            if tf in spec.eligible_tfs and not (sid.startswith("CZ") and spec.symbol != "SZSE.159915"):
-                f_spec = registry.get(sid)
-                trig_arr, _ = registry.evaluate_factor_on_tf(tf_dfs[tf], sid, tf)
-                universal_audit_book[uid][spec.symbol] = validator.run_gate1_single_asset_audit(
-                    tf_dfs[tf],
-                    trig_arr,
-                    direction=f_spec.direction,
-                    archetype=f_spec.archetype,
-                    timeframe=tf,
-                    fee_rate=spec.fee_rate,
-                )
-
-        if spec.symbol == "SZSE.159915":
-            # 159915 直接加载已完成三级法医门禁与双半场联合配权的 44 个冠军单元
-            for uid, w_val in champ_alloc.items():
-                sid, tf = uid.split("@")
-                if tf not in spec.eligible_tfs:
-                    continue
-                _, w_arr = registry.evaluate_factor_on_tf(tf_dfs[tf], sid, tf)
-                w_on_grid[uid] = map_tf_weight_to_base_grid(tf_dfs[tf], w_arr, df_grid)
-                active_alloc[uid] = w_val
-        else:
-            # 对股指与商品期货执行：1. 核心顺势骨架 (A_顺势突破簇) 锚定 + 2. 严格样本内 (2020-2023) Gate 1A 法医筛选 -> Gate 2 交并比去重 -> IS 联合坐标配权
-            candidates_g1: list[tuple[str, float, np.ndarray, dict]] = []
-            is_mask = (df_grid["dt"] <= validator.is_end_dt).values
-            same_dir_pool: dict[int, dict[str, np.ndarray]] = {1: {}, -1: {}}
-            init_alloc: dict[str, float] = {}
-
-            for f_spec in registry.list_all():
-                sid = f_spec.factor_id
-                if sid.startswith("CZ") or sid.startswith("M5"):
-                    continue
-                for tf in spec.eligible_tfs:
-                    if tf not in f_spec.eligible_tfs:
-                        continue
-                    uid = f"{sid}@{tf}"
-                    trig_arr, w_arr = registry.evaluate_factor_on_tf(tf_dfs[tf], sid, tf)
-                    g1 = validator.run_gate1_single_asset_audit(
-                        tf_dfs[tf],
-                        trig_arr,
-                        direction=f_spec.direction,
-                        archetype=f_spec.archetype,
-                        timeframe=tf,
-                        fee_rate=spec.fee_rate,
-                    )
-                    norm_res = validator.run_vol_and_regime_normalized_audit(
-                        tf_dfs[tf],
-                        trig_arr,
-                        direction=f_spec.direction,
-                        archetype=f_spec.archetype,
-                        timeframe=tf,
-                        fee_rate=spec.fee_rate,
-                    )
-                    g1.update(norm_res)
-                    w_mapped = map_tf_weight_to_base_grid(tf_dfs[tf], w_arr, df_grid)
-                    # 核心顺势突破骨架种子 (S1L/S2L/S3L/A01L/A02L) 作为 CTA 趋势底仓优先挂载
-                    if (
-                        f_spec.archetype == "A_顺势突破簇"
-                        and f_spec.direction == 1
-                        and g1.get("is_n_purged", 0) >= 3
-                        and (g1.get("is_mean_pct", -1.0) > -0.15 or g1.get("ipw_safety_pct", -1.0) > 0.0)
-                    ):
-                        same_dir_pool[f_spec.direction][uid] = w_mapped
-                        w_on_grid[uid] = w_mapped
-                        init_alloc[uid] = f_spec.default_weight
-                        g1["is_base_seed"] = True
-                        unit_forensic_meta[uid] = g1
-                    elif (
-                        g1.get("is_n_purged", 0) >= 6
-                        and g1.get("is_mean_pct", -1.0) > 0.01
-                        and (
-                            (g1.get("is_safety_margin_pct", -1.0) > 1.0 and g1.get("is_excess_alpha_pct", -1.0) > 0.01)
-                            or (g1.get("home_r_atr", -1.0) >= 0.06 and g1.get("home_safety_pct", -1.0) >= 3.0)
-                        )
-                    ):
-                        eff_saf = max(float(g1.get("is_safety_margin_pct", 0.0)), float(g1.get("home_safety_pct", 0.0)))
-                        score = eff_saf * np.log(max(int(g1["is_n_purged"]), 5))
-                        candidates_g1.append((uid, score, w_mapped, g1))
-
-            # 按样本内法医安全边际得分降序通过 Gate 2 (Signed Jaccard < 0.30, |corr| < 0.32)
-            candidates_g1.sort(key=lambda x: x[1], reverse=True)
-            from examples.multi_factor_cta.forensic_validator import compute_empirical_bayes_shrinkage_weight
-
-            for uid, _, w_mapped, g1 in candidates_g1:
-                sid, _ = uid.split("@")
-                f_spec = registry.get(sid)
-                d = f_spec.direction
-                cw_is = w_mapped[is_mask]
-                redundant = False
-                for _, pw in same_dir_pool[d].items():
-                    pw_is = pw[is_mask]
-                    corr = (
-                        float(abs(np.corrcoef(cw_is, pw_is)[0, 1]))
-                        if (np.std(cw_is) > 1e-6 and np.std(pw_is) > 1e-6)
-                        else 0.0
-                    )
-                    jac = compute_signed_jaccard(cw_is, pw_is)
-                    if corr >= 0.32 or jac >= 0.30:
-                        redundant = True
-                        break
-                if not redundant:
-                    same_dir_pool[d][uid] = w_mapped
-                    w_on_grid[uid] = w_mapped
-                    prior_w = float(champ_alloc.get(uid, f_spec.default_weight))
-                    local_w = float(
-                        np.clip(
-                            f_spec.default_weight * (1.0 + 0.04 * float(g1.get("home_safety_pct", 2.0))),
-                            0.15,
-                            0.48,
-                        )
-                    )
-                    w_eb, _ = compute_empirical_bayes_shrinkage_weight(
-                        local_w, prior_w, int(g1.get("is_n_purged", 20)), shrink_k=60
-                    )
-                    init_alloc[uid] = w_eb
-                    unit_forensic_meta[uid] = g1
-
-            # 样本内 (2020-2023) 法医先验锚定 + 双半场联合坐标重配权
-            active_alloc = joint_is_coordinate_reweight(
-                df_grid,
-                w_on_grid,
-                init_alloc,
-                unit_forensic_meta,
-                spec,
-                intra_synth,
+            if uid in audits:
+                universal_audit_book[uid][spec.symbol] = audits[uid]["gate1b"]
+        failures = {uid: value["reason"] for uid, value in audits.items() if not value["passed"]}
+        print(f"  -> 统一准入: 通过 {len(active_alloc)} / 审核 {len(audits)}；不足证据的资产池拒绝准入")
+        if failures:
+            (CTA_OUTPUT_DIR / (spec.symbol.replace("/", "_") + "_admission.json")).write_text(
+                json.dumps(
+                    {uid: audit for uid, audit in audits.items() if not audit["passed"]}, ensure_ascii=False, indent=2
+                ),
+                encoding="utf-8",
             )
-
-        # 单品种三支柱分层合成
-        w_synth = intra_synth.synthesize(df_grid, w_on_grid, active_alloc, spec)
+        execution_returns[spec.symbol], execution_positions[spec.symbol] = build_asset_execution_inputs(
+            df_grid, w_synth
+        )
+        execution_fees[spec.symbol] = spec.fee_rate
+        if "cs_strength" in df_grid:
+            execution_strengths[spec.symbol] = (
+                pd.Series(df_grid["cs_strength"].to_numpy(), index=pd.DatetimeIndex(pd.to_datetime(df_grid["dt"])))
+                .shift(1)
+                .reindex(execution_returns[spec.symbol].index)
+                .ffill()
+                .fillna(0.0)
+            )
         ev = evaluate_single_asset_backtest(df_grid, w_synth, spec.symbol, fee_rate=spec.fee_rate)
         ev["name"] = spec.name
         ev["n_units"] = len(active_alloc)
@@ -370,49 +346,48 @@ def main() -> None:
             f"全周期: 收益={ev['full']['cum_ret_pct']:+.2f}%, 夏普={ev['full']['sharpe']:.2f}, 回撤={ev['full']['mdd_pct']:.2f}%, 卡玛={ev['full']['calmar']:.2f}"
         )
 
-        # 针对 ETF 额外展示【纯多头现货轨 LONG_ONLY_SPOT】与【日内 14:55 强平轨 INTRADAY_FLAT_1455】对比
-        if spec.asset_class == AssetClass.ETF_T0:
-            w_long_only = intra_synth.synthesize(
-                df_grid, w_on_grid, active_alloc, spec, execution_mode_override=ExecutionMode.LONG_ONLY_SPOT
-            )
-            ev_lo = evaluate_single_asset_backtest(df_grid, w_long_only, spec.symbol, fee_rate=spec.fee_rate)
-            w_intraday = intra_synth.synthesize(
-                df_grid, w_on_grid, active_alloc, spec, execution_mode_override=ExecutionMode.INTRADAY_FLAT_1455
-            )
-            ev_id = evaluate_single_asset_backtest(df_grid, w_intraday, spec.symbol, fee_rate=spec.fee_rate)
-            print(
-                f"  -> [ETF 制度适配器双轨对照] "
-                f"纯多头现货轨 [0,+1]: 全周期={ev_lo['full']['cum_ret_pct']:+.2f}% (夏普 {ev_lo['full']['sharpe']:.2f}, 回撤 {ev_lo['full']['mdd_pct']:.2f}%, 卡玛 {ev_lo['full']['calmar']:.2f}) | "
-                f"14:55日内强平轨: 全周期={ev_id['full']['cum_ret_pct']:+.2f}% (夏普 {ev_id['full']['sharpe']:.2f}, 回撤 {ev_id['full']['mdd_pct']:.2f}%)"
-            )
-
     # 2. 打印跨品种 Gate 1B 普适率与 Gate 2C 横截面并发度 CSC 审计
     print("\n" + "=" * 125)
     print("  【二、规则型因子跨品种普适率 (Gate 1B) 与横截面并发拥挤度 (Gate 2C · CSC) 审计】")
     print("=" * 125)
     u_rows = []
     for uid, sym_map in universal_audit_book.items():
-        uni = validator.run_gate1_cross_asset_universality_audit(sym_map, min_positive_ratio=0.60)
-        u_rows.append(
-            {
-                "规则因子单元": uid,
-                "跨品种总独立样本(IS)": uni["total_pool_is_n"],
-                "跨品种平均安全垫": f"{uni['mean_pool_safety_pct']:+.2f}%",
-                "正期望品种占比": f"{uni['universal_ratio_pct']:.1f}%",
-                "正期望覆盖标的": ", ".join(uni["positive_assets"]),
-                "普适性门禁": "PASS" if uni["passed"] else "WARN",
-            }
-        )
+        for primary_symbol, pooled in sym_map.items():
+            # These are the exact pre-admission results; re-pooling summaries would
+            # lose event timestamps and mix the candidate's sector/trading regime.
+            u_rows.append(
+                {
+                    "规则因子单元": uid,
+                    "目标资产": primary_symbol,
+                    "检验池": pooled["pool_tier"],
+                    "资产数": pooled["pool_size"],
+                    "跨品种总事件(IS)": pooled["total_pool_is_n"],
+                    "独立时间块": pooled["independent_time_blocks"],
+                    "时间块t统计": pooled["pooled_t_stat"],
+                    "正期望品种占比": f"{pooled['universal_ratio_pct']:.1f}%",
+                    "正期望覆盖标的": ", ".join(pooled["positive_assets"]),
+                    "普适性门禁": "PASS" if pooled["passed"] else "REJECT",
+                }
+            )
     print(pd.DataFrame(u_rows).to_string(index=False))
 
     csc_stats = compute_cross_sectional_concurrency(cross_asset_30m_weights)
     print(
         f"\n  [横截面并发拥挤度 CSC 审计] 三大资产族日均同向激活并发率={csc_stats['mean_csc_pct']:.1f}%, "
-        f"P95分位={csc_stats['p95_csc_pct']:.1f}% (跨资产相关性低，具备优异截面分散度)"
+        f"P95分位={csc_stats['p95_csc_pct']:.1f}%（并发率为诊断指标，不单独证明分散化收益）"
     )
 
     # 3. 跨品种逆波动率 + 板块分层风险平价 (Sector-HRP) 组合构建
-    hrp_res = hrp_synth.build_multi_asset_portfolio(asset_daily_returns, asset_sectors)
+    hrp_res = hrp_synth.build_multi_asset_portfolio(
+        execution_returns,
+        asset_sectors,
+        asset_positions_df=execution_positions,
+        asset_cs_strength_df=execution_strengths,
+        asset_fee_rates=execution_fees,
+        returns_kind="price",
+        positions_timing="execution",
+        periods_per_year=252 * 48,
+    )
     print("\n" + "=" * 125)
     print("  【三、单品种策略 vs 跨资产 Sector-HRP 多因子 CTA 组合全周期实证汇总 (2020-2026)】")
     print("=" * 125)
@@ -437,7 +412,7 @@ def main() -> None:
     summary_rows.append(
         {
             "资产/组合名称": "★ 跨资产 Sector-HRP 多因子 CTA 总组合",
-            "挂载规则数": 44,
+            "挂载规则数": sum(res["n_units"] for res in asset_results.values()),
             "IS夏普(20-23)": hrp_res["is"]["sharpe"],
             "IS卡玛(20-23)": hrp_res["is"]["calmar"],
             "OOS净收益(24-26)": f"{hrp_res['oos']['cum_ret_pct']:+.2f}%",

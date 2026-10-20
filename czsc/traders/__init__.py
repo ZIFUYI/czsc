@@ -37,10 +37,18 @@ from czsc._native import (
     get_signals_freqs,
     get_unique_signals,
 )
+from czsc.traders.cta_allocator import (
+    ContinuousCtaAllocator,
+    ContinuousSignalStateMachine,
+    CtaAllocatorConfig,
+)
 
 # __all__ 显式声明对外公开的符号集合，限定 `from czsc.traders import *` 的行为，
 # 同时方便 IDE 与文档工具识别模块的公共 API。
 __all__ = [
+    "ContinuousCtaAllocator",
+    "ContinuousSignalStateMachine",
+    "CtaAllocatorConfig",
     "CzscSignals",
     "CzscTrader",
     "WeightBacktest",

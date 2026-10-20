@@ -6,6 +6,7 @@
 pub mod analyze;
 pub mod error_chain;
 pub mod objects;
+pub mod research_execution;
 pub mod structure_exit;
 pub mod utils;
 

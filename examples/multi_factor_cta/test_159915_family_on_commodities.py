@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 将 159915 规则型策略族推广至五大商品期货主力连续 (ag 沪银 / au 沪金 / sc 原油 / lc 碳酸锂 / ps 多晶硅) 全景实证
-1. 零样本直接迁移测试：不重新挖掘、不改参数、直接使用 champion_portfolio.json 的策略族与权重；
+1. champion_portfolio.json 只提供候选ID；统一准入重审、滚动配权，IS结束后才交易；
 2. 对比单品种表现与五大商品跨板块 Sector-HRP 风险平价组合表现；
 3. 导出交互式 Plotly 大屏、每日净值 CSV 与内嵌 Generative UI 净值看板。
 """
@@ -29,19 +29,19 @@ from examples.multi_factor_cta.data_engine import (  # noqa: E402
     AssetSpec,
     CrossAssetDataEngine,
     ExecutionMode,
-    map_tf_weight_to_base_grid,
 )
-from examples.multi_factor_cta.factor_engine import RuleFactorRegistry  # noqa: E402
+from examples.multi_factor_cta.run_framework_demo import load_research_universe, synthesize_admitted_asset  # noqa: E402
 from examples.multi_factor_cta.synthesis_engine import (  # noqa: E402
     CrossAssetHRPSynthesizer,
     IntraAssetThreePillarSynthesizer,
+    build_asset_execution_inputs,
     evaluate_single_asset_backtest,
 )
 
 WORKSPACE_DIR = ROOT_DIR / "examples" / "results" / "alpha_agent_workspace"
 COMMODITY_DATA_DIR = ROOT_DIR / "examples" / "results" / "commodities_5m"
 CTA_OUTPUT_DIR = ROOT_DIR / "examples" / "results" / "multi_factor_cta"
-ARTIFACT_DIR = Path(r"C:\Users\zifuy\.gemini\antigravity\brain\011f8ba6-910e-487c-8bed-d60ee4ca1112")
+ARTIFACT_DIR = CTA_OUTPUT_DIR
 
 
 def build_five_commodities_universe() -> list[AssetSpec]:
@@ -143,11 +143,12 @@ def main() -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=" * 125)
-    print("  【159915 规则型策略族 -> 五大商品期货 (ag 沪银 / au 沪金 / sc 原油 / lc 碳酸锂 / ps 多晶硅) 零样本迁移实证】")
+    print(
+        "  【159915 规则型策略族 -> 五大商品期货 (ag 沪银 / au 沪金 / sc 原油 / lc 碳酸锂 / ps 多晶硅) 样本内重审后的迁移研究】"
+    )
     print("=" * 125)
 
     data_engine = CrossAssetDataEngine(cache_dir=WORKSPACE_DIR)
-    registry = RuleFactorRegistry()
     intra_synth = IntraAssetThreePillarSynthesizer()
     hrp_synth = CrossAssetHRPSynthesizer(target_portfolio_vol=0.14)
 
@@ -157,9 +158,11 @@ def main() -> None:
     specs = build_five_commodities_universe()
     asset_results: dict[str, dict] = {}
     asset_daily_returns: dict[str, pd.Series] = {}
+    price_returns, signed_positions, execution_fees = {}, {}, {}
     asset_sectors: dict[str, str] = {}
     summary_rows = []
 
+    prepared_specs = []
     for orig_spec in specs:
         short_id = orig_spec.name.split("_")[0]
         p15 = COMMODITY_DATA_DIR / f"{short_id}_15m_2020_2026.parquet"
@@ -179,33 +182,21 @@ def main() -> None:
             data_path=p15,
         )
 
-        print(f"\n>>> [加载与映射] {spec.name} ({spec.symbol}) | 板块={spec.sector} | 夜盘={spec.has_night_session}")
-        # 使用非 CZ 原生两阶段状态机单元 + TD 序列单元 (共 33 个跨周期 15m~1d 规则单元，零样本直接套用)
-        tf_dfs = data_engine.load_asset_multi_timeframes(spec, attach_czsc=False)
+        prepared_specs.append(spec)
+
+    pool_frames = load_research_universe(data_engine, prepared_specs)
+    for spec in prepared_specs:
+        short_id = spec.name.split("_")[0]
+        tf_dfs = pool_frames[spec.symbol]
         df_grid = tf_dfs[spec.base_tf]
-
-        w_on_grid: dict[str, np.ndarray] = {}
-        active_alloc: dict[str, float] = {}
-        for uid, w_val in champ_alloc.items():
-            sid, tf = uid.split("@")
-            if tf not in spec.eligible_tfs or sid.startswith("CZ") or sid.startswith("M5"):
-                continue
-            # 去掉 B_背驰反转簇，仅保留 A_顺势突破簇 与 C_震荡回归簇
-            sig_spec = registry._factors.get(sid)
-            if sig_spec is not None and sig_spec.archetype == "B_背驰反转簇":
-                continue
-            _, w_arr = registry.evaluate_factor_on_tf(tf_dfs[tf], sid, tf)
-            w_on_grid[uid] = map_tf_weight_to_base_grid(tf_dfs[tf], w_arr, df_grid)
-            active_alloc[uid] = w_val
-
-        # 直接使用 159915 原始权重进行双支柱合成 (去掉 B_背驰反转簇 + 开启跨品种因果主场状态门控)
-        w_synth = intra_synth.synthesize(
-            df_grid,
-            w_on_grid,
-            active_alloc,
+        w_synth, _, active_alloc, audits = synthesize_admitted_asset(
             spec,
-            enable_regime_gating=True,
+            pool_frames,
+            sorted(champ_alloc),
+            intra_synth,
         )
+        price_returns[short_id], signed_positions[short_id] = build_asset_execution_inputs(df_grid, w_synth)
+        execution_fees[short_id] = spec.fee_rate
         ev = evaluate_single_asset_backtest(df_grid, w_synth, spec.symbol, fee_rate=spec.fee_rate)
         ev["name"] = spec.name
         ev["short_id"] = short_id
@@ -218,7 +209,7 @@ def main() -> None:
         asset_sectors[short_id] = spec.sector
 
         print(
-            f"    区间: {ev['start_dt']} ~ {ev['end_dt']} | 挂载单元(去背驰反转): {len(active_alloc)} | "
+            f"    区间: {ev['start_dt']} ~ {ev['end_dt']} | 通过统一准入单元: {len(active_alloc)} | "
             f"OOS(24-26): 净收益={ev['oos']['cum_ret_pct']:+.2f}%, 夏普={ev['oos']['sharpe']:.2f}, 卡玛={ev['oos']['calmar']:.2f} | "
             f"全周期: 净收益={ev['full']['cum_ret_pct']:+.2f}%, 年化={ev['full']['ann_ret_pct']:+.2f}%, "
             f"夏普={ev['full']['sharpe']:.2f}, 最大回撤={ev['full']['mdd_pct']:.2f}%, 卡玛={ev['full']['calmar']:.2f}"
@@ -243,7 +234,15 @@ def main() -> None:
         )
 
     # 构建五大商品跨品种组合 (在市等权 1/N_t vs 跨板块 Sector-HRP)
-    hrp_res = hrp_synth.build_multi_asset_portfolio(asset_daily_returns, asset_sectors)
+    hrp_res = hrp_synth.build_multi_asset_portfolio(
+        price_returns,
+        asset_sectors,
+        asset_positions_df=signed_positions,
+        asset_fee_rates=execution_fees,
+        returns_kind="price",
+        positions_timing="execution",
+        periods_per_year=252 * 16,
+    )
     summary_rows.append(
         {
             "品种代码": "EQ_1/N",
@@ -287,14 +286,14 @@ def main() -> None:
     # 分年度明细表 (各品种 + 等权组合 + HRP组合年度收益率)
     port_dr: pd.Series = hrp_res["daily_returns"]
     eq_dr: pd.Series = hrp_res["equal_weight_returns"]
-    years = sorted(list(set(port_dr.index.year)))
+    years = sorted(set(port_dr.index.year))
     yr_rows = []
     for y in years:
         row: dict[str, int | float | str] = {"年份": int(y)}
         for sid in ["ag", "au", "sc", "lc", "ps"]:
             s_dr = asset_daily_returns[sid]
             sub = s_dr[s_dr.index.year == y]
-            row[f"{sid.upper()}_收益"] = f"{sub.sum()*100:+.2f}%" if len(sub) > 5 else "—"
+            row[f"{sid.upper()}_收益"] = f"{sub.sum() * 100:+.2f}%" if len(sub) > 5 else "—"
         sub_eq = eq_dr[eq_dr.index.year == y]
         eq_ret = float(sub_eq.sum() * 100.0)
         eq_sh = float(sub_eq.mean() / (sub_eq.std() + 1e-8) * np.sqrt(252))
@@ -325,21 +324,18 @@ def main() -> None:
     print("=" * 125)
     for label, msk in [
         ("阶段1 (2020.01~2023.07: 仅 AG/AU/SC 3品种在市)", eq_w_df.index < "2023-07-24"),
-        ("阶段2 (2023.07~2024.12: AG/AU/SC/LC 4品种在市)", (eq_w_df.index >= "2023-07-24") & (eq_w_df.index < "2024-12-27")),
+        (
+            "阶段2 (2023.07~2024.12: AG/AU/SC/LC 4品种在市)",
+            (eq_w_df.index >= "2023-07-24") & (eq_w_df.index < "2024-12-27"),
+        ),
         ("阶段3 (2024.12~2026.10: AG/AU/SC/LC/PS 5品种全在市)", eq_w_df.index >= "2024-12-27"),
     ]:
         print(f"  * {label}:")
         eq_m = eq_w_df.loc[msk].mean() * 100
         hrp_m = hrp_w_df.loc[msk].mean() * 100
         eff_m = eff_w_df.loc[msk].mean() * 100
-        print(
-            "    - 在市等权 (1/N_t)      : "
-            + ", ".join([f"{k.upper()}={v:.1f}%" for k, v in eq_m.items()])
-        )
-        print(
-            "    - Sector-HRP 风险预算权重: "
-            + ", ".join([f"{k.upper()}={v:.1f}%" for k, v in hrp_m.items()])
-        )
+        print("    - 在市等权 (1/N_t)      : " + ", ".join([f"{k.upper()}={v:.1f}%" for k, v in eq_m.items()]))
+        print("    - Sector-HRP 风险预算权重: " + ", ".join([f"{k.upper()}={v:.1f}%" for k, v in hrp_m.items()]))
         print(
             "    - 目标波动率缩放后实际权重: "
             + ", ".join([f"{k.upper()}={v:.1f}%" for k, v in eff_m.items()])
@@ -435,7 +431,7 @@ def main() -> None:
         height=820,
         hovermode="x unified",
         title={
-            "text": "159915 规则型策略族 (已去掉背驰反转簇) 推广至五大商品期货 (ag/au/sc/lc/ps) 零样本迁移实证大屏",
+            "text": "159915 规则型策略族 (已去掉背驰反转簇) 推广至五大商品期货 (ag/au/sc/lc/ps) 样本内重审后的迁移研究大屏",
             "font": {"size": 18, "color": "#FFFFFF"},
         },
     )
@@ -481,15 +477,15 @@ def main() -> None:
       <div class="flex gap-2 text-right">
         <div class="px-3 py-1.5 rounded-lg bg-[var(--background)] border border-[var(--border)]">
           <div class="text-xs text-[var(--muted-foreground)]">Sector-HRP总收益</div>
-          <div class="text-base font-bold text-emerald-400">+{hrp_res['full']['cum_ret_pct']:.2f}% (Sh {hrp_res['full']['sharpe']:.2f})</div>
+          <div class="text-base font-bold text-emerald-400">+{hrp_res["full"]["cum_ret_pct"]:.2f}% (Sh {hrp_res["full"]["sharpe"]:.2f})</div>
         </div>
         <div class="px-3 py-1.5 rounded-lg bg-[var(--background)] border border-[var(--border)]">
           <div class="text-xs text-[var(--muted-foreground)]">在市等权(1/N)总收益</div>
-          <div class="text-base font-bold text-sky-400">+{hrp_res['eq_full']['cum_ret_pct']:.2f}% (Sh {hrp_res['eq_full']['sharpe']:.2f})</div>
+          <div class="text-base font-bold text-sky-400">+{hrp_res["eq_full"]["cum_ret_pct"]:.2f}% (Sh {hrp_res["eq_full"]["sharpe"]:.2f})</div>
         </div>
         <div class="px-3 py-1.5 rounded-lg bg-[var(--background)] border border-[var(--border)]">
           <div class="text-xs text-[var(--muted-foreground)]">HRP最大回撤</div>
-          <div class="text-base font-bold text-rose-400">-{hrp_res['full']['mdd_pct']:.2f}%</div>
+          <div class="text-base font-bold text-rose-400">-{hrp_res["full"]["mdd_pct"]:.2f}%</div>
         </div>
       </div>
     </div>
@@ -498,28 +494,28 @@ def main() -> None:
     <div class="grid grid-cols-2 sm:grid-cols-5 gap-2.5 my-4">
       <div class="p-2.5 rounded-xl bg-[var(--background)] border border-[var(--border)]">
         <div class="text-xs font-semibold text-purple-400">AG 沪银主力</div>
-        <div class="text-base font-bold text-[var(--foreground)] mt-0.5">{asset_results['ag']['full']['cum_ret_pct']:+.1f}%</div>
-        <div class="text-xs text-[var(--muted-foreground)]">Sh {asset_results['ag']['full']['sharpe']:.2f} | OOS {asset_results['ag']['oos']['cum_ret_pct']:+.1f}%</div>
+        <div class="text-base font-bold text-[var(--foreground)] mt-0.5">{asset_results["ag"]["full"]["cum_ret_pct"]:+.1f}%</div>
+        <div class="text-xs text-[var(--muted-foreground)]">Sh {asset_results["ag"]["full"]["sharpe"]:.2f} | OOS {asset_results["ag"]["oos"]["cum_ret_pct"]:+.1f}%</div>
       </div>
       <div class="p-2.5 rounded-xl bg-[var(--background)] border border-[var(--border)]">
         <div class="text-xs font-semibold text-amber-400">AU 沪金主力</div>
-        <div class="text-base font-bold text-[var(--foreground)] mt-0.5">{asset_results['au']['full']['cum_ret_pct']:+.1f}%</div>
-        <div class="text-xs text-[var(--muted-foreground)]">Sh {asset_results['au']['full']['sharpe']:.2f} | OOS {asset_results['au']['oos']['cum_ret_pct']:+.1f}%</div>
+        <div class="text-base font-bold text-[var(--foreground)] mt-0.5">{asset_results["au"]["full"]["cum_ret_pct"]:+.1f}%</div>
+        <div class="text-xs text-[var(--muted-foreground)]">Sh {asset_results["au"]["full"]["sharpe"]:.2f} | OOS {asset_results["au"]["oos"]["cum_ret_pct"]:+.1f}%</div>
       </div>
       <div class="p-2.5 rounded-xl bg-[var(--background)] border border-[var(--border)]">
         <div class="text-xs font-semibold text-orange-400">SC 原油主力</div>
-        <div class="text-base font-bold text-[var(--foreground)] mt-0.5">{asset_results['sc']['full']['cum_ret_pct']:+.1f}%</div>
-        <div class="text-xs text-[var(--muted-foreground)]">Sh {asset_results['sc']['full']['sharpe']:.2f} | MDD {asset_results['sc']['full']['mdd_pct']:.1f}%</div>
+        <div class="text-base font-bold text-[var(--foreground)] mt-0.5">{asset_results["sc"]["full"]["cum_ret_pct"]:+.1f}%</div>
+        <div class="text-xs text-[var(--muted-foreground)]">Sh {asset_results["sc"]["full"]["sharpe"]:.2f} | MDD {asset_results["sc"]["full"]["mdd_pct"]:.1f}%</div>
       </div>
       <div class="p-2.5 rounded-xl bg-[var(--background)] border border-[var(--border)]">
         <div class="text-xs font-semibold text-cyan-400">LC 碳酸锂(23.07+)</div>
-        <div class="text-base font-bold text-[var(--foreground)] mt-0.5">{asset_results['lc']['full']['cum_ret_pct']:+.1f}%</div>
-        <div class="text-xs text-[var(--muted-foreground)]">Sh {asset_results['lc']['full']['sharpe']:.2f} | MDD {asset_results['lc']['full']['mdd_pct']:.1f}%</div>
+        <div class="text-base font-bold text-[var(--foreground)] mt-0.5">{asset_results["lc"]["full"]["cum_ret_pct"]:+.1f}%</div>
+        <div class="text-xs text-[var(--muted-foreground)]">Sh {asset_results["lc"]["full"]["sharpe"]:.2f} | MDD {asset_results["lc"]["full"]["mdd_pct"]:.1f}%</div>
       </div>
       <div class="p-2.5 rounded-xl bg-[var(--background)] border border-[var(--border)]">
         <div class="text-xs font-semibold text-green-400">PS 多晶硅(24.12+)</div>
-        <div class="text-base font-bold text-[var(--foreground)] mt-0.5">{asset_results['ps']['full']['cum_ret_pct']:+.1f}%</div>
-        <div class="text-xs text-[var(--muted-foreground)]">Sh {asset_results['ps']['full']['sharpe']:.2f} | MDD {asset_results['ps']['full']['mdd_pct']:.1f}%</div>
+        <div class="text-base font-bold text-[var(--foreground)] mt-0.5">{asset_results["ps"]["full"]["cum_ret_pct"]:+.1f}%</div>
+        <div class="text-xs text-[var(--muted-foreground)]">Sh {asset_results["ps"]["full"]["sharpe"]:.2f} | MDD {asset_results["ps"]["full"]["mdd_pct"]:.1f}%</div>
       </div>
     </div>
 
@@ -527,8 +523,8 @@ def main() -> None:
     <div class="relative bg-[var(--background)] rounded-xl border border-[var(--border)] p-4 select-none">
       <div class="flex flex-wrap items-center justify-between mb-2 gap-2 text-xs">
         <div class="flex flex-wrap items-center gap-3">
-          <span class="flex items-center gap-1"><span class="w-3 h-1 bg-emerald-400 rounded"></span><span class="text-emerald-400 font-bold">★ Sector-HRP组合 ({hrp_res['full']['cum_ret_pct']:+.1f}%)</span></span>
-          <span class="flex items-center gap-1"><span class="w-3 h-0.5 bg-sky-400 border-b border-dashed"></span><span class="text-sky-400 font-semibold">◇ 在市等权1/N ({hrp_res['eq_full']['cum_ret_pct']:+.1f}%)</span></span>
+          <span class="flex items-center gap-1"><span class="w-3 h-1 bg-emerald-400 rounded"></span><span class="text-emerald-400 font-bold">★ Sector-HRP组合 ({hrp_res["full"]["cum_ret_pct"]:+.1f}%)</span></span>
+          <span class="flex items-center gap-1"><span class="w-3 h-0.5 bg-sky-400 border-b border-dashed"></span><span class="text-sky-400 font-semibold">◇ 在市等权1/N ({hrp_res["eq_full"]["cum_ret_pct"]:+.1f}%)</span></span>
           <span class="flex items-center gap-1"><span class="w-2.5 h-0.5 bg-purple-400"></span><span class="text-purple-400">AG沪银</span></span>
           <span class="flex items-center gap-1"><span class="w-2.5 h-0.5 bg-amber-400"></span><span class="text-amber-400">AU沪金</span></span>
           <span class="flex items-center gap-1"><span class="w-2.5 h-0.5 bg-orange-400"></span><span class="text-orange-400">SC原油</span></span>

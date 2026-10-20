@@ -15,6 +15,26 @@ fn nth_arg_type(f: &ItemFn, idx: usize) -> Option<Type> {
     })
 }
 
+/// Canonical signal names equal their Rust function; dated names remain legacy aliases.
+fn signal_name_error(fn_ident: &str, name: &str, template: &str) -> Option<&'static str> {
+    if let Some((head, version)) = fn_ident.rsplit_once("_v")
+        && !version.is_empty()
+        && version.chars().all(|c| c.is_ascii_digit())
+    {
+        if name != format!("{head}_V{version}") {
+            return Some(
+                "#[signal] 旧版 name 必须与函数名版本后缀一致，例如 foo_v230101 <-> foo_V230101",
+            );
+        }
+        if !template.contains(version) {
+            return Some("#[signal] 旧版 template 必须包含版本数字（如 230101）");
+        }
+    } else if name != fn_ident {
+        return Some("#[signal] canonical name 必须与 Rust 函数名一致，且不需要日期后缀");
+    }
+    None
+}
+
 #[proc_macro_attribute]
 pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
     let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
@@ -74,32 +94,8 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let fn_ident = f.sig.ident.to_string();
-    if !fn_ident.contains("_v") {
-        errors.push(quote! { compile_error!("#[signal] 函数名必须包含 _v<版本号>"); });
-    } else {
-        let expected = if let Some((head, tail)) = fn_ident.rsplit_once("_v") {
-            if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
-                format!("{head}_V{tail}")
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-        if expected.is_empty() || (!name.is_empty() && expected != name) {
-            errors.push(quote! { compile_error!("#[signal] name 必须与函数名版本后缀一致，例如 foo_v230101 <-> foo_V230101"); });
-        }
-        if !template.is_empty() {
-            let ver = expected
-                .rsplit_once("_V")
-                .map(|(_, v)| v.to_string())
-                .unwrap_or_default();
-            if !ver.is_empty() && !template.contains(ver.as_str()) {
-                errors.push(
-                    quote! { compile_error!("#[signal] template 必须包含版本数字（如 230101）"); },
-                );
-            }
-        }
+    if let Some(error) = signal_name_error(&fn_ident, &name, &template) {
+        errors.push(quote! { compile_error!(#error); });
     }
 
     let argc = f.sig.inputs.len();
@@ -399,8 +395,10 @@ pub fn signal_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     for it in items {
         if let Item::Fn(f) = it {
             let name = f.sig.ident.to_string();
-            if f.vis.to_token_stream().to_string() == "pub" && name.contains("_v") {
-                let signal_attr = f.attrs.iter().find(|a| a.path().is_ident("signal"));
+            let signal_attr = f.attrs.iter().find(|a| a.path().is_ident("signal"));
+            if f.vis.to_token_stream().to_string() == "pub"
+                && (name.contains("_v") || signal_attr.is_some())
+            {
                 if signal_attr.is_none() {
                     return quote! {
                         compile_error!("signal_module: pub fn *_v* 必须显式添加 #[signal(...)] 标注");
@@ -467,4 +465,46 @@ pub fn signal_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     quote! { #m }.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signal_name_error;
+
+    #[test]
+    fn canonical_name_needs_no_date_but_must_match_rust_function() {
+        assert_eq!(
+            signal_name_error("strength_fx", "strength_fx", "{freq}_FX强度"),
+            None
+        );
+        assert!(signal_name_error("strength_fx", "strength_other", "{freq}_FX强度").is_some());
+    }
+
+    #[test]
+    fn legacy_alias_keeps_version_name_and_template_validation() {
+        assert_eq!(
+            signal_name_error(
+                "strength_fx_v260601",
+                "strength_fx_V260601",
+                "{freq}_FX强度V260601"
+            ),
+            None
+        );
+        assert!(
+            signal_name_error(
+                "strength_fx_v260601",
+                "strength_fx_V260602",
+                "{freq}_FX强度V260601"
+            )
+            .is_some()
+        );
+        assert!(
+            signal_name_error(
+                "strength_fx_v260601",
+                "strength_fx_V260601",
+                "{freq}_FX强度"
+            )
+            .is_some()
+        );
+    }
 }

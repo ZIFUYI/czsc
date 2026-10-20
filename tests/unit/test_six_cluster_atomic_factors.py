@@ -50,6 +50,7 @@ from examples.multi_factor_cta.atomic_factors import (
     link_higher_timeframes,
     two_stage_trigger,
 )
+from examples.multi_factor_cta.data_engine import compute_causal_cross_sectional_features
 from examples.multi_factor_cta.factor_engine import RuleFactorRegistry
 
 PRICE_COLS = ["open", "high", "low", "close"]
@@ -75,6 +76,7 @@ def _mirror(raw: pd.DataFrame) -> pd.DataFrame:
     out = raw.copy()
     out["open"], out["close"] = m - raw["open"], m - raw["close"]
     out["high"], out["low"] = m - raw["low"], m - raw["high"]
+    out.attrs["market_mirrored"] = True
     return out
 
 
@@ -106,6 +108,16 @@ def _prepare(raw: pd.DataFrame, tf: str, cache_dir) -> pd.DataFrame:
 def _build_ctx(raw: pd.DataFrame, cache_dir) -> tuple[pd.DataFrame, FactorContext]:
     base = _prepare(raw, "30m", cache_dir)
     htf = _prepare(_make_htf(raw), "60m", cache_dir)
+    # Cross-asset factors require a genuine simultaneous peer pool, including in mirror/prefix checks.
+    pool = {"000001": base}
+    for seed in (6, 7, 8):
+        peer = _mock_raw(seed).iloc[: len(raw)].copy()
+        if raw.attrs.get("market_mirrored", False):
+            peer = _mirror(peer)
+        pool[f"PEER{seed}"] = peer
+    compute_causal_cross_sectional_features(
+        pool, specs=dict.fromkeys(pool, "test_sector"), tf="30m", attach_to_dfs=True
+    )
     return base, FactorContext.from_df(base, htf)
 
 
@@ -272,16 +284,26 @@ def test_rust_strength_signals_are_mirror_symmetric(built, mirrored):
 
 @pytest.mark.parametrize("family", FAMILIES)
 def test_long_short_mirror_symmetry(family, built, mirrored):
-    """镜像价格序列上的因子 = 原序列因子的相反数：多头判据与空头判据 100% 对称。"""
-    _, _, sig_a = built
-    _, _, sig_b = mirrored
-    a, b = sig_a[family], sig_b[family]
-    active = (a != 0.0) | (b != 0.0)
-    assert active.sum() > 50
-    diff = np.abs(a + b)
-    # score 以整数 1/100 量化，容差 0.03；个别并列 (价格相等的平局) 允许极少数偏离
-    assert np.mean(diff[active] <= 0.03) >= 0.995, f"{family} 镜像对称率 {np.mean(diff[active] <= 0.03):.4f}"
-    assert np.mean(np.sign(a) == -np.sign(b)) >= 0.995
+    """仿射镜像保持结构/两阶段规则，百分比回撤不具仿射不变性，另测其多空1.3%边界。"""
+    _, ctx_a, _ = built
+    _, ctx_b, _ = mirrored
+    definition = ATOMIC_FACTOR_DEFS[family]
+    mirror_sum = ctx_a.c[0] + ctx_b.c[0]
+    for side in (1, -1):
+        setup_a, sq_a, confirm_a, cq_a, window_a = definition.build(ctx_a, side)
+        setup_b, sq_b, confirm_b, cq_b, window_b = definition.build(ctx_b, -side)
+        assert window_a == window_b
+        np.testing.assert_array_equal(setup_a, setup_b)
+        np.testing.assert_array_equal(confirm_a, confirm_b)
+        np.testing.assert_allclose(sq_a[setup_a], sq_b[setup_b], atol=0.011, rtol=0)
+        np.testing.assert_allclose(cq_a[confirm_a], cq_b[confirm_b], atol=0.011, rtol=0)
+        fire_a, q_a = two_stage_trigger(setup_a, sq_a, confirm_a, cq_a, window_a)
+        fire_b, q_b = two_stage_trigger(setup_b, sq_b, confirm_b, cq_b, window_b)
+        np.testing.assert_array_equal(fire_a, fire_b)
+        np.testing.assert_allclose(q_a, q_b, atol=0.011, rtol=0)
+        stop_a = np.asarray(ctx_a.structure_anchors[definition.archetype]["long_stop" if side == 1 else "short_stop"])
+        stop_b = np.asarray(ctx_b.structure_anchors[definition.archetype]["short_stop" if side == 1 else "long_stop"])
+        np.testing.assert_allclose(stop_a, mirror_sum - stop_b, atol=1e-9, rtol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +370,7 @@ def test_decay_machine_stronger_trigger_refreshes_and_opposite_replaces():
     d[6], q[6] = 1, 0.9  # 更强的同向触发刷新
     d[12], q[12] = -1, 0.4  # 反向触发直接替换
     stop[:] = 95.0
+    stop[12] = 105.0  # 空头必须使用收盘价上方的有效证伪点。
     s, trig = apply_dynamic_structure_decay(d, q, c, stop, rev, af, asl)
     assert s[6] == pytest.approx(0.9)
     assert s[12] < 0.0 and trig[12]

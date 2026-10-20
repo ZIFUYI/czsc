@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -40,12 +39,13 @@ from examples.multi_factor_cta.data_engine import (  # noqa: E402
     AssetSpec,
     CrossAssetDataEngine,
     ExecutionMode,
-    map_tf_weight_to_base_grid,
 )
-from examples.multi_factor_cta.factor_engine import RuleFactorRegistry  # noqa: E402
+from examples.multi_factor_cta.run_framework_demo import load_research_universe, synthesize_admitted_asset  # noqa: E402
 from examples.multi_factor_cta.synthesis_engine import (  # noqa: E402
     CrossAssetHRPSynthesizer,
     IntraAssetThreePillarSynthesizer,
+    account_portfolio_execution,
+    build_asset_execution_inputs,
     evaluate_single_asset_backtest,
 )
 
@@ -72,9 +72,9 @@ def build_fifty_commodities_universe() -> list[tuple[str, AssetSpec]]:
         # 3. 黑色建材与铁合金 (9)
         ("rb", "RB9999.XSGE", "FERROUS", "rb_螺纹钢主力连续", 0.00015),
         ("hc", "HC9999.XSGE", "FERROUS", "hc_热卷主力连续", 0.00015),
-        ("i",  "I9999.XDCE",  "FERROUS", "i_铁矿石主力连续", 0.00015),
+        ("i", "I9999.XDCE", "FERROUS", "i_铁矿石主力连续", 0.00015),
         ("jm", "JM9999.XDCE", "FERROUS", "jm_焦煤主力连续", 0.00015),
-        ("j",  "J9999.XDCE",  "FERROUS", "j_焦炭主力连续", 0.00015),
+        ("j", "J9999.XDCE", "FERROUS", "j_焦炭主力连续", 0.00015),
         ("sa", "SA9999.XZCE", "FERROUS", "sa_纯碱主力连续", 0.00015),
         ("fg", "FG9999.XZCE", "FERROUS", "fg_玻璃主力连续", 0.00015),
         ("sm", "SM9999.XZCE", "FERROUS", "sm_锰硅主力连续", 0.00015),
@@ -89,19 +89,19 @@ def build_fifty_commodities_universe() -> list[tuple[str, AssetSpec]]:
         ("eb", "EB9999.XDCE", "ENERGY_CHEM", "eb_苯乙烯主力连续", 0.00015),
         ("eg", "EG9999.XDCE", "ENERGY_CHEM", "eg_乙二醇主力连续", 0.00015),
         ("pp", "PP9999.XDCE", "ENERGY_CHEM", "pp_聚丙烯主力连续", 0.00015),
-        ("l",  "L9999.XDCE",  "ENERGY_CHEM", "l_塑料主力连续", 0.00015),
-        ("v",  "V9999.XDCE",  "ENERGY_CHEM", "v_PVC主力连续", 0.00015),
+        ("l", "L9999.XDCE", "ENERGY_CHEM", "l_塑料主力连续", 0.00015),
+        ("v", "V9999.XDCE", "ENERGY_CHEM", "v_PVC主力连续", 0.00015),
         ("pg", "PG9999.XDCE", "ENERGY_CHEM", "pg_液化气主力连续", 0.00015),
         ("bu", "BU9999.XSGE", "ENERGY_CHEM", "bu_沥青主力连续", 0.00015),
         ("ur", "UR9999.XZCE", "ENERGY_CHEM", "ur_尿素主力连续", 0.00015),
         # 5. 农产品软商与轻工 (15)
-        ("m",  "M9999.XDCE",  "AGRICULTURE", "m_豆粕主力连续", 0.00015),
+        ("m", "M9999.XDCE", "AGRICULTURE", "m_豆粕主力连续", 0.00015),
         ("rm", "RM9999.XZCE", "AGRICULTURE", "rm_菜粕主力连续", 0.00015),
-        ("p",  "P9999.XDCE",  "AGRICULTURE", "p_棕榈油主力连续", 0.00015),
-        ("y",  "Y9999.XDCE",  "AGRICULTURE", "y_豆油主力连续", 0.00015),
+        ("p", "P9999.XDCE", "AGRICULTURE", "p_棕榈油主力连续", 0.00015),
+        ("y", "Y9999.XDCE", "AGRICULTURE", "y_豆油主力连续", 0.00015),
         ("oi", "OI9999.XZCE", "AGRICULTURE", "oi_菜油主力连续", 0.00015),
-        ("a",  "A9999.XDCE",  "AGRICULTURE", "a_豆一主力连续", 0.00015),
-        ("c",  "C9999.XDCE",  "AGRICULTURE", "c_玉米主力连续", 0.00015),
+        ("a", "A9999.XDCE", "AGRICULTURE", "a_豆一主力连续", 0.00015),
+        ("c", "C9999.XDCE", "AGRICULTURE", "c_玉米主力连续", 0.00015),
         ("lh", "LH9999.XDCE", "AGRICULTURE", "lh_生猪主力连续", 0.00015),
         ("jd", "JD9999.XDCE", "AGRICULTURE", "jd_鸡蛋主力连续", 0.00015),
         ("sr", "SR9999.XZCE", "AGRICULTURE", "sr_白糖主力连续", 0.00015),
@@ -142,14 +142,31 @@ def evaluate_50_weighting_schemes(
     asset_daily_returns: dict[str, pd.Series],
     asset_sectors: dict[str, str],
     target_vol: float = 0.14,
+    *,
+    asset_positions: dict[str, pd.Series],
+    asset_fee_rates: dict[str, float],
+    periods_per_year: float = 252 * 16,
 ) -> dict[str, dict]:
+    """Compare causal budgets on one raw-price execution ledger, including reallocation fees."""
     raw_df = pd.DataFrame(asset_daily_returns).sort_index()
     raw_df.index = pd.to_datetime(raw_df.index)
-    active_mask = raw_df.notna().astype(float)
     ret_df = raw_df.fillna(0.0)
+    positions = pd.DataFrame(asset_positions).reindex(index=raw_df.index, columns=raw_df.columns).fillna(0.0)
+    active_mask = (raw_df.notna() & positions.abs().gt(1e-3)).astype(float)
+    bars_per_day = max(int(round(periods_per_year / 252)), 1)
+
+    def gross_reference(targets):
+        return account_portfolio_execution(
+            ret_df,
+            targets.where(raw_df.notna()).ffill().fillna(0.0),
+            dict.fromkeys(ret_df.columns, 0.0),
+            tradable_mask=raw_df.notna(),
+        )["bar_net_returns"]
 
     # 因果滚动 60 日波动率
-    roll_vol = raw_df.rolling(60, min_periods=10).std().shift(1).bfill() * np.sqrt(252.0)
+    roll_vol = raw_df.rolling(60 * bars_per_day, min_periods=10 * bars_per_day).std().shift(1) * np.sqrt(
+        periods_per_year
+    )
     inv_vol = (1.0 / np.maximum(roll_vol.fillna(0.15), 0.05)) * active_mask
 
     # 1. 在市简单等权 (1/N_t, 100%)
@@ -176,31 +193,35 @@ def evaluate_50_weighting_schemes(
     w_hrp_unscaled = raw_hrp.div(raw_hrp.sum(axis=1).replace(0.0, np.nan), axis=0).fillna(w_eq)
 
     # 5. 因果动量倾斜风险平价·无杠杆 (Mom-HRP, 100%)
-    roll_mean = raw_df.rolling(60, min_periods=15).mean().shift(1).fillna(0.0)
-    roll_std = raw_df.rolling(60, min_periods=15).std().shift(1).fillna(0.01)
-    causal_ir = (roll_mean / np.maximum(roll_std, 1e-4)) * np.sqrt(252.0)
+    roll_mean = raw_df.rolling(60 * bars_per_day, min_periods=15 * bars_per_day).mean().shift(1).fillna(0.0)
+    roll_std = raw_df.rolling(60 * bars_per_day, min_periods=15 * bars_per_day).std().shift(1).fillna(0.01)
+    causal_ir = (roll_mean / np.maximum(roll_std, 1e-4)) * np.sqrt(periods_per_year)
     mom_tilt = np.clip(1.0 + 0.35 * np.tanh(causal_ir / 1.2), 0.55, 1.65) * active_mask
     raw_mom_hrp = raw_hrp * mom_tilt
     w_mom_hrp = raw_mom_hrp.div(raw_mom_hrp.sum(axis=1).replace(0.0, np.nan), axis=0).fillna(w_eq)
 
     # 6. Sector-HRP + 组合目标波动率动态缩放 (VolTarget 14%)
-    unscaled_hrp_ret = (ret_df * w_hrp_unscaled).sum(axis=1)
-    port_vol = unscaled_hrp_ret.rolling(40, min_periods=15).std().shift(1).bfill() * np.sqrt(252.0)
-    lev_scalar = np.clip(target_vol / np.maximum(port_vol, 0.05), 0.70, 1.65)
+    unscaled_hrp_ret = gross_reference(w_hrp_unscaled * positions)
+    port_vol = unscaled_hrp_ret.rolling(40 * bars_per_day, min_periods=15 * bars_per_day).std().shift(1) * np.sqrt(
+        periods_per_year
+    )
+    lev_scalar = np.clip(target_vol / np.maximum(port_vol.fillna(target_vol), 0.05), 0.70, 1.65)
     w_hrp_scaled = w_hrp_unscaled.multiply(lev_scalar, axis=0)
 
     # 7. 净值健康度×活跃槽位动态 HRP·无杠杆 (ActiveEC-HRP, 100%)
-    act_pos = (ret_df.abs().rolling(3, min_periods=1).max().shift(1).fillna(1.0) > 1e-5).astype(float) * active_mask
+    act_pos = active_mask.copy()
     cum_nav = ret_df.cumsum().shift(1).fillna(0.0)
-    nav_ma60 = cum_nav.rolling(60, min_periods=10).mean().fillna(0.0)
+    nav_ma60 = cum_nav.rolling(60 * bars_per_day, min_periods=10 * bars_per_day).mean().fillna(0.0)
     ec_health = np.where(cum_nav >= nav_ma60, 1.25, 0.30) * active_mask
     raw_comb = raw_hrp * ec_health * np.where(act_pos > 0, 1.15, 0.35)
     w_comb_norm = raw_comb.div(raw_comb.sum(axis=1).replace(0.0, np.nan), axis=0).fillna(w_eq)
 
     # 8. 净值健康度×活跃槽位动态 HRP + 目标波动率缩放 (ActiveEC-VolTgt)
-    unscaled_comb_ret = (ret_df * w_comb_norm).sum(axis=1)
-    comb_port_vol = unscaled_comb_ret.rolling(40, min_periods=15).std().shift(1).bfill() * np.sqrt(252.0)
-    comb_lev_scalar = np.clip(target_vol / np.maximum(comb_port_vol, 0.05), 0.70, 1.65)
+    unscaled_comb_ret = gross_reference(w_comb_norm * positions)
+    comb_port_vol = unscaled_comb_ret.rolling(40 * bars_per_day, min_periods=15 * bars_per_day).std().shift(
+        1
+    ) * np.sqrt(periods_per_year)
+    comb_lev_scalar = np.clip(target_vol / np.maximum(comb_port_vol.fillna(target_vol), 0.05), 0.70, 1.65)
     w_comb_scaled = w_comb_norm.multiply(comb_lev_scalar, axis=0)
 
     # 9. 智能因果优选剔除 (Causal Pruning HRP: 净值处于60日均线水下超过20日且动量为负的休眠品种权重置0，名义分配至优质在途品种)
@@ -212,9 +233,11 @@ def evaluate_50_weighting_schemes(
     w_pruned_norm = raw_pruned.div(raw_pruned.sum(axis=1).replace(0.0, np.nan), axis=0).fillna(w_eq)
 
     # 10. 智能因果优选剔除 + 目标波动率缩放 (Pruned-VolTgt)
-    unscaled_pruned_ret = (ret_df * w_pruned_norm).sum(axis=1)
-    pruned_port_vol = unscaled_pruned_ret.rolling(40, min_periods=15).std().shift(1).bfill() * np.sqrt(252.0)
-    pruned_lev_scalar = np.clip(target_vol / np.maximum(pruned_port_vol, 0.05), 0.70, 1.65)
+    unscaled_pruned_ret = gross_reference(w_pruned_norm * positions)
+    pruned_port_vol = unscaled_pruned_ret.rolling(40 * bars_per_day, min_periods=15 * bars_per_day).std().shift(
+        1
+    ) * np.sqrt(periods_per_year)
+    pruned_lev_scalar = np.clip(target_vol / np.maximum(pruned_port_vol.fillna(target_vol), 0.05), 0.70, 1.65)
     w_pruned_scaled = w_pruned_norm.multiply(pruned_lev_scalar, axis=0)
 
     schemes = {
@@ -230,20 +253,42 @@ def evaluate_50_weighting_schemes(
         "10_Pruned_VolTgt": ("★★★★⑩ 因果优选剔除 + 目标波幅缩放 (Pruned-VolTgt)", w_pruned_scaled),
     }
 
-    is_mask = ret_df.index <= pd.Timestamp(IS_END_DT.date())
-    oos_mask = ret_df.index > pd.Timestamp(IS_END_DT.date())
-
     results: dict[str, dict] = {}
     for key, (label, w_df) in schemes.items():
-        dr = (ret_df * w_df).sum(axis=1)
+        target_budget = w_df.abs().sum(axis=1)
+        final_mat = (w_df * positions).to_numpy().copy()
+        observed = raw_df.notna().to_numpy()
+        previous = np.zeros(len(raw_df.columns))
+        frozen_gross = np.zeros(len(raw_df))
+        untradable_excess = np.zeros(len(raw_df))
+        for row in range(len(raw_df)):
+            tradable = observed[row]
+            final_mat[row, ~tradable] = previous[~tradable]
+            frozen_gross[row] = float(np.abs(previous[~tradable]).sum())
+            budget = float(target_budget.iloc[row])
+            available = max(0.0, budget - frozen_gross[row])
+            desired_gross = float(np.abs(final_mat[row, tradable]).sum())
+            if desired_gross > available and desired_gross > 0.0:
+                final_mat[row, tradable] *= available / desired_gross
+            untradable_excess[row] = max(0.0, frozen_gross[row] - budget)
+            previous = final_mat[row].copy()
+        final_positions = pd.DataFrame(final_mat, index=raw_df.index, columns=raw_df.columns)
+        ledger = account_portfolio_execution(ret_df, final_positions, asset_fee_rates, tradable_mask=raw_df.notna())
+        dr = ledger["daily_returns"]
+        is_mask = dr.index <= pd.Timestamp(IS_END_DT.date())
+        oos_mask = ~is_mask
         results[key] = {
             "label": label,
-            "weights_df": w_df,
+            "weights_df": final_positions,
+            "target_gross_budget": target_budget,
+            "frozen_gross_exposure": pd.Series(frozen_gross, index=raw_df.index),
+            "untradable_budget_excess": pd.Series(untradable_excess, index=raw_df.index),
+            "ledger": ledger,
             "daily_returns": dr,
             "full": CrossAssetHRPSynthesizer._calc_return_series_stats(dr),
             "is": CrossAssetHRPSynthesizer._calc_return_series_stats(dr.loc[is_mask]),
             "oos": CrossAssetHRPSynthesizer._calc_return_series_stats(dr.loc[oos_mask]),
-            "avg_gross_exposure_pct": round(float(w_df.sum(axis=1).mean() * 100.0), 1),
+            "avg_gross_exposure_pct": round(float(final_positions.abs().sum(axis=1).mean() * 100.0), 1),
         }
     return results
 
@@ -252,21 +297,26 @@ def main() -> None:
     CTA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print("=" * 145)
     print("  【五十大大宗商品期货全天候 CTA 总组合全景实证】")
-    print("  覆盖贵金属(2)、有色特钢(8)、黑色建材铁合金(9)、能化(14)、农产软商轻工(15)、新能源材料(2) 共 50 个主力连续合约")
+    print(
+        "  覆盖贵金属(2)、有色特钢(8)、黑色建材铁合金(9)、能化(14)、农产软商轻工(15)、新能源材料(2) 共 50 个主力连续合约"
+    )
     print("=" * 145)
 
     data_engine = CrossAssetDataEngine(cache_dir=WORKSPACE_DIR)
-    registry = RuleFactorRegistry()
     intra_synth = IntraAssetThreePillarSynthesizer()
 
     champ_path = WORKSPACE_DIR / "champion_portfolio.json"
     champ_alloc: dict[str, float] = json.loads(champ_path.read_text(encoding="utf-8"))["alloc_map"]
 
-    comm_universe = build_fifty_commodities_universe()
+    comm_universe = [(sid, spec) for sid, spec in build_fifty_commodities_universe() if spec.data_path.exists()]
+    if not comm_universe:
+        raise FileNotFoundError("No real commodity data found; research cannot substitute mock prices")
+    pool_frames = load_research_universe(data_engine, [spec for _, spec in comm_universe])
 
     comm_returns: dict[str, pd.Series] = {}
     comm_sectors: dict[str, str] = {}
-    comm_daily_abs_pos: dict[str, pd.Series] = {}
+    comm_positions: dict[str, pd.Series] = {}
+    comm_fees: dict[str, float] = {}
     single_rows = []
 
     print("\n>>> 开始运行 50 大商品期货单品种信号回测...")
@@ -275,34 +325,19 @@ def main() -> None:
             print(f"[{idx:02d}/50] 警告: {spec.name} 数据文件不存在: {spec.data_path}，跳过")
             continue
 
-        tf_dfs = data_engine.load_asset_multi_timeframes(spec, attach_czsc=False)
+        tf_dfs = pool_frames[spec.symbol]
         df_grid = tf_dfs[spec.base_tf]
-
-        w_on_grid: dict[str, np.ndarray] = {}
-        active_alloc: dict[str, float] = {}
-        for uid, w_val in champ_alloc.items():
-            sid, tf = uid.split("@")
-            if tf not in spec.eligible_tfs or sid.startswith("CZ") or sid.startswith("M5"):
-                continue
-            sig_spec = registry._factors.get(sid)
-            if sig_spec is not None and sig_spec.archetype not in ("A_顺势突破簇", "C_震荡回归簇"):
-                continue
-            _, w_arr = registry.evaluate_factor_on_tf(tf_dfs[tf], sid, tf)
-            w_on_grid[uid] = map_tf_weight_to_base_grid(tf_dfs[tf], w_arr, df_grid)
-            active_alloc[uid] = w_val
-
-        w_synth = intra_synth.synthesize(df_grid, w_on_grid, active_alloc, spec, enable_regime_gating=True)
+        w_synth, _, active_alloc, audits = synthesize_admitted_asset(
+            spec,
+            pool_frames,
+            sorted(champ_alloc),
+            intra_synth,
+        )
         ev = evaluate_single_asset_backtest(df_grid, w_synth, spec.symbol, fee_rate=spec.fee_rate)
-        comm_returns[short_id] = ev["daily_return"]
+        comm_returns[short_id], comm_positions[short_id] = build_asset_execution_inputs(df_grid, w_synth)
+        comm_fees[short_id] = spec.fee_rate
         comm_sectors[short_id] = spec.sector
-
-        dts = pd.to_datetime(df_grid["dt"])
-        wd = dts.dt.weekday
-        shift_d = np.where(wd == 5, 2, np.where(wd == 6, 1, 0))
-        shifted_dts = (dts + pd.to_timedelta(shift_d, unit="D")).dt.normalize()
-        pos_s = pd.Series(w_synth, index=shifted_dts)
-        comm_daily_abs_pos[short_id] = pos_s.abs().groupby(level=0).mean()
-
+        print(f"[{idx:02d}/{len(comm_universe)}] {spec.name}: 统一准入 {len(active_alloc)}/{len(audits)}")
         active_bar_pct = (np.abs(w_synth) > 0.01).mean() * 100.0
         avg_abs = np.abs(w_synth).mean() * 100.0
 
@@ -326,13 +361,15 @@ def main() -> None:
         )
 
     print("\n" + "=" * 145)
-    print("  【单品种基准表现表：五十大大宗商品期货主力连续 (已去 B_背驰反转簇，日线宏观定锚)】")
+    print("  【单品种基准表现表：五十大大宗商品期货主力连续 (统一准入，IS 训练后才交易)】")
     print("=" * 145)
     df_single = pd.DataFrame(single_rows)
     print(df_single.to_string(index=False))
 
     # 组合多加权方案对比 (50 大商品)
-    res_50 = evaluate_50_weighting_schemes(comm_returns, comm_sectors)
+    res_50 = evaluate_50_weighting_schemes(
+        comm_returns, comm_sectors, asset_positions=comm_positions, asset_fee_rates=comm_fees
+    )
 
     port_rows = []
     for _k, v in res_50.items():
@@ -357,78 +394,8 @@ def main() -> None:
     print("=" * 145)
     print(pd.DataFrame(port_rows).to_string(index=False))
 
-    # 实际在途持仓梯度 (Vol+EC Guard) - 分别测 50 品种全入与 50 品种优选剔除
-    abs_pos_df = pd.DataFrame(comm_daily_abs_pos).sort_index()
-    ret_df = pd.DataFrame(comm_returns).sort_index().fillna(0.0)
-
-    for run_title, w_base_key in [
-        ("【50商品全入底仓 · SecHRP】", "4_SecHRP_100%"),
-        ("【50商品因果优选剔除底仓 · Pruned-HRP】", "9_Pruned_100%"),
-    ]:
-        base_w = res_50[w_base_key]["weights_df"]
-        sub_abs = abs_pos_df.reindex(base_w.index).fillna(0.0)
-
-        base_ret = (base_w * ret_df.reindex(base_w.index)).sum(axis=1)
-        port_vol20 = base_ret.rolling(20, min_periods=10).std().shift(1).bfill() * np.sqrt(252.0)
-        vol_mult = np.clip(0.025 / np.maximum(port_vol20, 0.015), 0.55, 1.45)
-
-        base_ec = base_ret.cumsum().shift(1).fillna(0.0)
-        base_ec_ma = base_ec.rolling(60, min_periods=10).mean().fillna(0.0)
-        ec_mult = pd.Series(np.where(base_ec >= base_ec_ma, 1.18, 0.72), index=base_w.index)
-
-        u_base = (base_w * sub_abs).sum(axis=1)
-        u_lag1 = u_base.shift(1).fillna(0.18)
-
-        dynamic_shape = vol_mult * ec_mult
-
-        tier_configs = [
-            ("稳健守成级 (基准 18% 实际仓位)", 0.18, 0.12),
-            ("机构平衡级 (目标 50% 实际仓位)", 0.50, 0.12),
-            ("积极进取级 (目标 80% 实际仓位)", 0.80, 0.12),
-            ("全仓释放级 (目标 100% 实际仓位)", 1.00, 0.12),
-        ]
-
-        tier_records = []
-        for tier_name, target_u, margin_rate in tier_configs:
-            k_t = (target_u / np.maximum(u_lag1, 0.02)) * dynamic_shape
-            w_scaled = base_w.multiply(k_t, axis=0)
-
-            act_gross_exposure = (w_scaled * sub_abs).sum(axis=1)
-            mean_actual_pos = act_gross_exposure.mean()
-            peak_actual_pos = act_gross_exposure.max()
-
-            mean_margin = mean_actual_pos * margin_rate
-            peak_margin = peak_actual_pos * margin_rate
-
-            dr_scaled = (ret_df.reindex(base_w.index) * w_scaled).sum(axis=1)
-            st_full = CrossAssetHRPSynthesizer._calc_return_series_stats(dr_scaled)
-            st_is = CrossAssetHRPSynthesizer._calc_return_series_stats(dr_scaled.loc[ret_df.index <= pd.Timestamp(IS_END_DT.date())])
-            st_oos = CrossAssetHRPSynthesizer._calc_return_series_stats(dr_scaled.loc[ret_df.index > pd.Timestamp(IS_END_DT.date())])
-
-            tier_records.append(
-                {
-                    "仓位级别": tier_name,
-                    "目标实际仓位": f"{target_u*100.0:.0f}%",
-                    "实际平均仓位": f"{mean_actual_pos*100.0:.1f}%",
-                    "实际峰值仓位": f"{peak_actual_pos*100.0:.1f}%",
-                    "平均保证金占用": f"{mean_margin*100.0:.1f}%",
-                    "峰值保证金占用": f"{peak_margin*100.0:.1f}%",
-                    "IS净收益": f"{st_is['cum_ret_pct']:+.2f}%",
-                    "IS夏普": st_is["sharpe"],
-                    "OOS净收益": f"{st_oos['cum_ret_pct']:+.2f}%",
-                    "OOS夏普": st_oos["sharpe"],
-                    "全期总收益": f"{st_full['cum_ret_pct']:+.2f}%",
-                    "全期年化": f"{st_full['ann_ret_pct']:+.2f}%",
-                    "全期夏普": st_full["sharpe"],
-                    "最大回撤": f"{st_full['mdd_pct']:.2f}%",
-                    "全期卡玛": st_full["calmar"],
-                }
-            )
-
-        print("\n" + "-" * 145)
-        print(f"  {run_title} —— 四档真实在途持仓 (Vol+EC Guard 动态守护)")
-        print("-" * 145)
-        print(pd.DataFrame(tier_records).to_string(index=False))
+    # Every displayed scheme uses final signed positions and a complete fee ledger.
+    # The old second-stage multiplication of fee-paid sleeve returns was removed.
 
     # 生成 Generative UI 交互式大屏
     all_dates = res_50["1_Equal_1/N"]["daily_returns"].index
@@ -468,23 +435,23 @@ def main() -> None:
     <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 my-3">
       <div class="p-2 rounded-xl bg-[var(--background)] border border-[var(--border)]">
         <div class="text-xs font-semibold text-sky-400">① 50商品在市等权 (100%)</div>
-        <div class="text-sm font-bold text-[var(--foreground)] mt-0.5">+{res_50['1_Equal_1/N']['full']['cum_ret_pct']:.2f}% (Sh {res_50['1_Equal_1/N']['full']['sharpe']:.2f})</div>
-        <div class="text-xs text-[var(--muted-foreground)]">OOS Sh: {res_50['1_Equal_1/N']['oos']['sharpe']:.2f} | MDD {res_50['1_Equal_1/N']['full']['mdd_pct']:.2f}%</div>
+        <div class="text-sm font-bold text-[var(--foreground)] mt-0.5">+{res_50["1_Equal_1/N"]["full"]["cum_ret_pct"]:.2f}% (Sh {res_50["1_Equal_1/N"]["full"]["sharpe"]:.2f})</div>
+        <div class="text-xs text-[var(--muted-foreground)]">OOS Sh: {res_50["1_Equal_1/N"]["oos"]["sharpe"]:.2f} | MDD {res_50["1_Equal_1/N"]["full"]["mdd_pct"]:.2f}%</div>
       </div>
       <div class="p-2 rounded-xl bg-[var(--background)] border border-[var(--border)]">
         <div class="text-xs font-semibold text-purple-400">④ 50商品Sector-HRP (100%)</div>
-        <div class="text-sm font-bold text-[var(--foreground)] mt-0.5">+{res_50['4_SecHRP_100%']['full']['cum_ret_pct']:.2f}% (Sh {res_50['4_SecHRP_100%']['full']['sharpe']:.2f})</div>
-        <div class="text-xs text-[var(--muted-foreground)]">OOS Sh: {res_50['4_SecHRP_100%']['oos']['sharpe']:.2f} | MDD {res_50['4_SecHRP_100%']['full']['mdd_pct']:.2f}%</div>
+        <div class="text-sm font-bold text-[var(--foreground)] mt-0.5">+{res_50["4_SecHRP_100%"]["full"]["cum_ret_pct"]:.2f}% (Sh {res_50["4_SecHRP_100%"]["full"]["sharpe"]:.2f})</div>
+        <div class="text-xs text-[var(--muted-foreground)]">OOS Sh: {res_50["4_SecHRP_100%"]["oos"]["sharpe"]:.2f} | MDD {res_50["4_SecHRP_100%"]["full"]["mdd_pct"]:.2f}%</div>
       </div>
       <div class="p-2 rounded-xl bg-[var(--background)] border border-[var(--border)]">
         <div class="text-xs font-semibold text-amber-400">★⑨ 因果优选剔除 (100%)</div>
-        <div class="text-sm font-bold text-amber-400 mt-0.5">+{res_50['9_Pruned_100%']['full']['cum_ret_pct']:.2f}% (Sh {res_50['9_Pruned_100%']['full']['sharpe']:.2f})</div>
-        <div class="text-xs text-[var(--muted-foreground)]">OOS Sh: {res_50['9_Pruned_100%']['oos']['sharpe']:.2f} | MDD {res_50['9_Pruned_100%']['full']['mdd_pct']:.2f}%</div>
+        <div class="text-sm font-bold text-amber-400 mt-0.5">+{res_50["9_Pruned_100%"]["full"]["cum_ret_pct"]:.2f}% (Sh {res_50["9_Pruned_100%"]["full"]["sharpe"]:.2f})</div>
+        <div class="text-xs text-[var(--muted-foreground)]">OOS Sh: {res_50["9_Pruned_100%"]["oos"]["sharpe"]:.2f} | MDD {res_50["9_Pruned_100%"]["full"]["mdd_pct"]:.2f}%</div>
       </div>
       <div class="p-2 rounded-xl bg-[var(--background)] border border-[var(--border)]">
         <div class="text-xs font-semibold text-emerald-400">★★⑩ 因果优选+目标波幅缩放</div>
-        <div class="text-sm font-bold text-emerald-400 mt-0.5">+{res_50['10_Pruned_VolTgt']['full']['cum_ret_pct']:.2f}% (Sh {res_50['10_Pruned_VolTgt']['full']['sharpe']:.2f})</div>
-        <div class="text-xs text-[var(--muted-foreground)]">OOS: +{res_50['10_Pruned_VolTgt']['oos']['cum_ret_pct']:.1f}% | Cal {res_50['10_Pruned_VolTgt']['full']['calmar']:.2f}</div>
+        <div class="text-sm font-bold text-emerald-400 mt-0.5">+{res_50["10_Pruned_VolTgt"]["full"]["cum_ret_pct"]:.2f}% (Sh {res_50["10_Pruned_VolTgt"]["full"]["sharpe"]:.2f})</div>
+        <div class="text-xs text-[var(--muted-foreground)]">OOS: +{res_50["10_Pruned_VolTgt"]["oos"]["cum_ret_pct"]:.1f}% | Cal {res_50["10_Pruned_VolTgt"]["full"]["calmar"]:.2f}</div>
       </div>
     </div>
 
@@ -552,11 +519,11 @@ def main() -> None:
   </div>
 
   <script>
-    const dates = {json.dumps(sample_df['date'].tolist())};
-    const p1 = {json.dumps([round(float(v), 4) for v in sample_df['1_Equal_1/N']])};
-    const p4 = {json.dumps([round(float(v), 4) for v in sample_df['4_SecHRP_100%']])};
-    const p9 = {json.dumps([round(float(v), 4) for v in sample_df['9_Pruned_100%']])};
-    const p10 = {json.dumps([round(float(v), 4) for v in sample_df['10_Pruned_VolTgt']])};
+    const dates = {json.dumps(sample_df["date"].tolist())};
+    const p1 = {json.dumps([round(float(v), 4) for v in sample_df["1_Equal_1/N"]])};
+    const p4 = {json.dumps([round(float(v), 4) for v in sample_df["4_SecHRP_100%"]])};
+    const p9 = {json.dumps([round(float(v), 4) for v in sample_df["9_Pruned_100%"]])};
+    const p10 = {json.dumps([round(float(v), 4) for v in sample_df["10_Pruned_VolTgt"]])};
     const n = dates.length;
     const xLeft = 50, xRight = 770, yTop = 15, yBottom = 185;
 

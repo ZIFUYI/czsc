@@ -503,6 +503,101 @@ pub fn load_position(path: &Path) -> anyhow::Result<Position> {
 }
 
 impl Position {
+    /// Replay ordered bars and precomputed signals from a fresh copy of this configuration.
+    ///
+    /// Full three-part keys and research `cz_` keys are accepted identically in Rust/Python.
+    /// Outputs are close-time opening pulses and signed positions; execution belongs to the
+    /// caller's next-open ledger. The template and its live runtime state are never changed.
+    pub fn evaluate_signals(
+        &self,
+        bars: &[super::bar::RawBar],
+        rows: &[HashMap<String, String>],
+    ) -> Result<(Vec<bool>, Vec<f64>), String> {
+        if bars.len() != rows.len() {
+            return Err("bars and signal rows must have equal length".into());
+        }
+        for (i, bar) in bars.iter().enumerate() {
+            if bar.symbol.as_ref() != self.symbol {
+                return Err("bar symbol must match the Position symbol".into());
+            }
+            if !bar.close.is_finite() || bar.close <= 0.0 {
+                return Err("close prices must be finite and positive".into());
+            }
+            if i > 0 && bar.dt <= bars[i - 1].dt {
+                return Err("bars must have strictly ordered timestamps".into());
+            }
+            if bar.symbol != bars[0].symbol || bar.freq != bars[0].freq {
+                return Err("bars must have one symbol and frequency".into());
+            }
+        }
+        let mut position = self.clone();
+        position.import_runtime_state(PositionRuntimeState {
+            pos: Pos::Flat,
+            pos_changed: false,
+            temp_state: None,
+            last_event: None,
+            operates: Vec::new(),
+            holds: Vec::new(),
+        });
+        position.normalize_runtime_fields();
+        let required: HashSet<_> = position
+            .all_events()
+            .flat_map(|e| {
+                e.signals_all
+                    .iter()
+                    .chain(&e.signals_any)
+                    .chain(&e.signals_not)
+            })
+            .map(Signal::key)
+            .collect();
+        let mut triggers = Vec::with_capacity(bars.len());
+        let mut weights = Vec::with_capacity(bars.len());
+        for (index, (bar, row)) in bars.iter().zip(rows).enumerate() {
+            let mut signals = HashSet::new();
+            let mut seen = HashSet::new();
+            for (key, value) in row {
+                let key = if let Some(short) = key.strip_prefix("cz_") {
+                    format!("{}_{}", bar.freq, short)
+                } else {
+                    key.clone()
+                };
+                if !required.contains(&key) {
+                    continue;
+                }
+                if !seen.insert(key.clone()) {
+                    return Err(format!("duplicate signal key: {key}"));
+                }
+                let text = if value.split('_').count() == 4 {
+                    format!("{key}_{value}")
+                } else {
+                    format!("{key}_{value}_任意_任意_0")
+                };
+                signals.insert(
+                    Signal::from_str(&text).map_err(|e| format!("invalid signal {key}: {e}"))?,
+                );
+            }
+            if seen.len() != required.len() {
+                return Err("missing required signal columns".into());
+            }
+            let before = position.operates.len();
+            position.update(
+                LiteBar {
+                    id: i32::try_from(index).map_err(|_| "too many bars for Position replay")?,
+                    dt: bar.dt.fixed_offset(),
+                    price: bar.close,
+                },
+                Rc::new(RefCell::new(signals)),
+            );
+            triggers.push(
+                position.operates[before..]
+                    .iter()
+                    .any(|r| matches!(r.op, Operate::LO | Operate::SO)),
+            );
+            weights.push(position.get_pos().to_f64());
+        }
+        Ok((triggers, weights))
+    }
+
     fn init_runtime_fields(&mut self) {
         self.normalize_event_hash_names();
         self.event_matcher = None;
@@ -1174,6 +1269,17 @@ pub struct PyPosition {
 #[cfg_attr(feature = "python", gen_stub_pymethods)]
 #[cfg_attr(feature = "python", pymethods)]
 impl PyPosition {
+    /// Replay bars and signal rows from a fresh configuration; returns opening pulses and close-time positions.
+    fn evaluate_signals(
+        &self,
+        bars: Vec<super::bar::RawBar>,
+        rows: Vec<HashMap<String, String>>,
+    ) -> PyResult<(Vec<bool>, Vec<f64>)> {
+        self.inner
+            .evaluate_signals(&bars, &rows)
+            .map_err(PyValueError::new_err)
+    }
+
     #[new]
     #[pyo3(signature = (symbol, opens, exits = vec![], interval = 0, timeout = 1000, stop_loss = 1000.0, t0 = false, name = None))]
     #[allow(clippy::too_many_arguments)]
