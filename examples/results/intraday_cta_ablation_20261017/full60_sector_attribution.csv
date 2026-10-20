@@ -1,0 +1,7 @@
+sector,total_symbols,core20_count,admitted_sat_count,flat60_gross_pct,flat60_cost_pct,flat60_net_pct,flat60_ann_turn,coresat60_gross_pct,coresat60_cost_pct,coresat60_net_pct,coresat60_ann_turn,net_improvement_pct
+PRECIOUS_METALS,2,2,0,7.2,0.72,6.48,30.0,9.39,0.82,8.57,34.6,2.09
+BASE_METALS,8,4,1,-0.46,1.53,-1.99,51.2,0.49,0.93,-0.44,31.1,1.55
+FERROUS,9,5,1,0.26,0.26,0.01,8.6,-0.2,0.39,-0.6,13.1,-0.6
+ENERGY_CHEM,22,5,1,0.35,0.3,0.05,9.8,2.43,0.43,2.0,14.5,1.95
+AGRICULTURE,16,4,3,1.11,0.92,0.19,30.8,1.78,0.43,1.35,14.2,1.16
+NEW_ENERGY,3,0,0,0.01,0.01,0.01,0.2,0.0,0.0,0.0,0.0,-0.01
