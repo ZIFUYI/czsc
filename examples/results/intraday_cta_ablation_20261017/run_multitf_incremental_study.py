@@ -255,10 +255,14 @@ def compute_hetero_15m_signals(df: pd.DataFrame) -> dict[str, tuple[str, np.ndar
     v_ma20 = pd.Series(v).rolling(20, min_periods=2).mean().replace(0, 1.0).to_numpy(dtype=np.float64)
     bias60 = (c - ma60) / np.maximum(ma60, 1e-6)
 
-    diff = np.diff(c, prepend=c[0])
-    up = pd.Series(np.maximum(diff, 0.0)).rolling(14, min_periods=2).mean().to_numpy()
-    dn = pd.Series(np.maximum(-diff, 0.0)).rolling(14, min_periods=2).mean().to_numpy()
-    rsi14 = 100.0 - 100.0 / (1.0 + up / np.maximum(dn, 1e-8))
+    import czsc
+
+    rsi14 = np.nan_to_num(
+        df["rsi14"].to_numpy(dtype=np.float64)
+        if "rsi14" in df.columns
+        else np.asarray(czsc.rsi(c, 14), dtype=np.float64),
+        nan=50.0,
+    )
 
     tot_r = np.maximum(h - low_arr, 1e-6)
     l_shd = np.minimum(o, c) - low_arr
@@ -411,6 +415,7 @@ def build_5m_micro_on_15m(df5: pd.DataFrame, df15: pd.DataFrame) -> pd.DataFrame
         feat5.sort_values("dt"),
         on="dt",
         direction="backward",
+        tolerance=pd.Timedelta("15min"),
         allow_exact_matches=True,
     ).fillna(0.0)
     return aligned
@@ -441,10 +446,14 @@ def compute_all_5m_candidates(df15: pd.DataFrame, f5: pd.DataFrame) -> dict[str,
     bias20 = (c - ma20) / np.maximum(ma20, 1e-6)
     bias60 = (c - ma60) / np.maximum(ma60, 1e-6)
 
-    diff = np.diff(c, prepend=c[0])
-    up = pd.Series(np.maximum(diff, 0.0)).rolling(14, min_periods=2).mean().to_numpy()
-    dn = pd.Series(np.maximum(-diff, 0.0)).rolling(14, min_periods=2).mean().to_numpy()
-    rsi14 = 100.0 - 100.0 / (1.0 + up / np.maximum(dn, 1e-8))
+    import czsc
+
+    rsi14 = np.nan_to_num(
+        df15["rsi14"].to_numpy(dtype=np.float64)
+        if "rsi14" in df15.columns
+        else np.asarray(czsc.rsi(c, 14), dtype=np.float64),
+        nan=50.0,
+    )
 
     oi_chg3 = f5["oi_chg3"].to_numpy(dtype=np.float64)
     oi_std = pd.Series(oi_chg3).rolling(40, min_periods=5).std().replace(0, 1.0).fillna(1.0).to_numpy()
@@ -848,47 +857,15 @@ def select_exp_b_alltf_gate1_adaptive(
     aid: str,
     allow_lowturn_hetero_15m: bool = False,
 ) -> pd.DataFrame:
-    """
-    分周期自适应 Gate 1 准入：
-    - 30m: 单品种 n >= 15, mean_net_pct > 0, is_net_sharpe > 0.15
-    - 15m: 标准候选要求 n >= 15；若启用低换手异构 15m 跨日波段因子 (H15M_*)，允许 n >= 6 且年化换手 <= 26x 且池化 total_n >= 150
-    - 60m: 单品种 n >= 10, mean_net_pct > 0, is_net_sharpe > 0.15
-    - 1d: 单品种 n >= 2, mean_net_pct > 0, is_net_sharpe > 0.10 且池化 total_n >= 25、池化均值 > 0
-    """
-    sub = f_scores[f_scores["asset"] == aid].merge(
-        f_pool[["uid", "total_n", "pooled_mean_pct", "pooled_t", "pos_asset_ratio"]],
-        on="uid",
-        how="left",
-    )
-    c_30m = (sub["tf"] == "30m") & (sub["n"] >= 15) & (sub["mean_net_pct"] > 0.0) & (sub["is_net_sharpe"] > 0.15)
-    if allow_lowturn_hetero_15m:
-        c_15m = (
-            (sub["tf"] == "15m")
-            & (
-                (sub["n"] >= 15)
-                | (
-                    sub["uid"].str.startswith("H15M_")
-                    & (sub["n"] >= 6)
-                    & (sub["ann_turnover"] <= 26.0)
-                    & (sub["total_n"] >= 150)
-                )
-            )
-            & (sub["mean_net_pct"] > 0.0)
-            & (sub["is_net_sharpe"] > 0.15)
-        )
-    else:
-        c_15m = (sub["tf"] == "15m") & (sub["n"] >= 15) & (sub["mean_net_pct"] > 0.0) & (sub["is_net_sharpe"] > 0.15)
+    """委托调用 forensic_validator 中的跨品种池化自由度多周期 Gate 1 统一准入接口。"""
+    from multi_factor_cta.forensic_validator import select_pooled_multitf_gate1_units
 
-    c_60m = (sub["tf"] == "60m") & (sub["n"] >= 10) & (sub["mean_net_pct"] > 0.0) & (sub["is_net_sharpe"] > 0.15)
-    c_1d = (
-        (sub["tf"] == "1d")
-        & (sub["n"] >= 2)
-        & (sub["mean_net_pct"] > 0.0)
-        & (sub["is_net_sharpe"] > 0.10)
-        & (sub["total_n"] >= 25)
-        & (sub["pooled_mean_pct"] > 0.0)
+    return select_pooled_multitf_gate1_units(
+        f_scores,
+        f_pool,
+        aid,
+        allow_lowturn_hetero_15m=allow_lowturn_hetero_15m,
     )
-    return sub[c_30m | c_15m | c_60m | c_1d].copy()
 
 
 def run_incremental_funnel_gate123(
@@ -1647,12 +1624,15 @@ def allocate_and_account_5m_grid(
         mask = (grid5["dt"] <= oos_end).to_numpy()
         sub_grid = grid5.loc[mask].copy().reset_index(drop=True)
         raw_target = np.asarray(asset_targets_5m[aid], dtype=np.float64)[mask].copy()
-        raw_target[sub_grid["dt"] < oos_start] = 0.0
+        oos_bar_mask = (sub_grid["dt"] >= oos_start).to_numpy()
+        first_oos_idx = int(np.argmax(oos_bar_mask)) if np.any(oos_bar_mask) else len(raw_target)
 
-        # 死区防抖状态机
+        # 死区防抖状态机（保留 IS 真实仓位供组合波动率因果预热，同时在 OOS 起点重置状态机防止跨折状态泄漏）
         target = np.zeros_like(raw_target)
         cur = 0.0
         for i, w in enumerate(raw_target):
+            if i == first_oos_idx:
+                cur = 0.0
             if abs(w - cur) >= deadzone:
                 cur = w
             target[i] = cur
@@ -1704,13 +1684,14 @@ def allocate_and_account_5m_grid(
     w_oos = w_oos.div(scale_cap, axis=0)
 
     w_oos.iloc[0] = 0.0
-    w_oos.iloc[-1] = 0.0
     for col in w_oos.columns:
         t_col = mask_oos[col].to_numpy()
         w_col = w_oos[col].to_numpy().copy()
         for i in range(1, len(w_col)):
             if not t_col[i]:
                 w_col[i] = w_col[i - 1]
+        if t_col[-1]:
+            w_col[-1] = 0.0
         w_oos[col] = w_col
 
     ledger = account_portfolio_execution(ret_oos, w_oos, fees, tradable_mask=mask_oos)

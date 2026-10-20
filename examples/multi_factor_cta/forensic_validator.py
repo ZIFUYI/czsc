@@ -8,7 +8,7 @@
 
 本模块实现专用于规则型因子的三级门禁：
 - Gate 1 (内在边缘与跨品种普适关)：
-  Purged 去重叠独立抽样 + 周期自适应样本量门槛 + 分战略簇三重屏障标尺 + 成本穿透安全垫 ΔW + 跨品种普适率 (≥60% 品种正超额)
+  正式路径使用完整实际执行交易 + Q 有效样本门槛 + 状态归一化事件池化；固定 ATR 标尺保留为显式诊断模式
 - Gate 2 (时序×截面三维互补与防拥挤关)：
   非零激活态交并比 (Signed Jaccard < 0.30) + 时序相关性 (|ρ| < 0.32) + 空仓补盲率 (≥35%) + 回撤期救援 Alpha (>0) + 横截面并发度 CSC
 - Gate 3 (双半场稳健边际与留一法新陈代谢关)：
@@ -18,19 +18,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 
 from examples.alpha_mining_agent.forensic_pipeline import (
     IS_END_DT,
-    _compute_weighted_edge_metrics,
     compute_active_union_correlation,
-    compute_forward_rank_ic_profile,
+    compute_execution_net_metrics,
     compute_single_factor_net_sharpe_and_turnover,
+    evaluate_execution_events,
     evaluate_triple_barrier,
-    purge_overlapping_triggers,
+    run_gate1_forensic_audit,
     run_parameter_smoothness_audit,
 )
 from examples.alpha_mining_agent.hypothesis_bank import (
@@ -50,8 +50,8 @@ from examples.multi_factor_cta.atomic_factors import SoftCrossSectionalGate
 
 # 周期自适应最小独立样本数门槛（解决日线/60m 低频高质量信号被固定高样本门槛误杀的问题）
 TF_MIN_PURGED_SAMPLES: dict[str, int] = {
-    "1d": 12,
-    "60m": 25,
+    "1d": 30,
+    "60m": 30,
     "30m": 35,
     "15m": 55,
     "5m": 80,
@@ -74,54 +74,22 @@ def get_stratified_pool_tier(archetype: str, timeframe: str = "30m") -> int:
     base_tier = int(getattr(ruler, "pool_tier", STRATIFIED_POOL_TIERS.get(archetype, 1)))
     if base_tier == 3 or archetype == ARCH_D:
         return 3
-    if timeframe in ("5m", "15m") and archetype not in (ARCH_A, ARCH_E, ARCH_F, ARCH_B, ARCH_C):
+    if timeframe in ("5m", "15m"):
         return 3
     return base_tier
 
 
 def infer_asset_pool_group(symbol: str, explicit_group: str | None = None) -> str:
-    """
-    识别标的所属同质资产池类别 ("equity" 宽基权益池 vs "commodity" 商品期货池)：
-    - 若传入 explicit_group，优先归一化为 "equity" 或 "commodity"；
-    - 否则按标的代码前缀/特征自动判定。
-    """
+    """Return an explicit asset/sector group, or infer only the broad asset class."""
     if explicit_group:
-        g = explicit_group.strip().lower()
-        if any(k in g for k in ("eq", "etf", "index", "stock", "if", "ic", "im", "ih")):
+        group = explicit_group.strip().lower()
+        if group in {"equity", "etf", "index", "stock"}:
             return "equity"
-        if any(k in g for k in ("comm", "cmd", "fut", "metal", "chem", "agri", "black", "energy")):
-            return "commodity"
-    s = symbol.upper()
-    if any(
-        tag in s
-        for tag in (
-            "SHFE",
-            "DCE",
-            "CZCE",
-            "INE",
-            "GFEX",
-            "CMD",
-            "COMM",
-            "KQ.M@",
-            "RB",
-            "AG",
-            "CU",
-            "AU",
-            "AL",
-            "ZN",
-            "NI",
-            "TA",
-            "MA",
-            "M0",
-            "RM",
-            "CF",
-            "SR",
-            "SC",
-            "I9",
-            "JM",
-            "J9",
-        )
-    ):
+        if group == "commodity" or group.startswith("commodity:"):
+            return group
+        return group
+    code = symbol.upper()
+    if any(tag in code for tag in ("SHFE", "DCE", "CZCE", "ZCE", "INE", "GFEX", "KQ.M@")):
         return "commodity"
     return "equity"
 
@@ -164,6 +132,38 @@ def compute_cross_sectional_concurrency(
     }
 
 
+def _pooled_time_block_t_stat(frames: list[pd.DataFrame]) -> tuple[float, int]:
+    """Test the pooled Q/IPW weighted mean with a time-block ratio-estimator HAC variance.
+
+    Each block contributes numerator A_b=sum(w*r) and mass B_b=sum(w). The target
+    is mu=sum(A_b)/sum(B_b), not the equally weighted mean of A_b/B_b. HAC uses
+    the centered ratio influence (A_b-mu*B_b)/mean(B), preserving regime weights
+    and invariance to duplicating simultaneous assets.
+    """
+    if not frames:
+        return 0.0, 0
+    events = pd.concat(frames, ignore_index=True)
+    duration = (events["exit_dt"] - events["entry_dt"]).max()
+    block_width = max(pd.Timedelta(days=1), duration + pd.Timedelta(nanoseconds=1))
+    events["block"] = (events["entry_dt"] - events["entry_dt"].min()) // block_width
+    events["weighted_return"] = events["r_atr"] * events["pool_weight"]
+    grouped = events.groupby("block")[["weighted_return", "pool_weight"]].sum()
+    grouped = grouped.loc[grouped["pool_weight"] > 0]
+    n = len(grouped)
+    if n < 3:
+        return 0.0, n
+    numerator = grouped["weighted_return"].to_numpy(dtype=float)
+    mass = grouped["pool_weight"].to_numpy(dtype=float)
+    mean = float(numerator.sum() / mass.sum())
+    influence = (numerator - mean * mass) / mass.mean()
+    lag_max = min(n - 1, max(1, int(np.ceil(n ** (1 / 3)))))
+    variance = float(influence @ influence / n)
+    for lag in range(1, lag_max + 1):
+        variance += 2 * (1 - lag / (lag_max + 1)) * float(influence[lag:] @ influence[:-lag] / n)
+    variance *= n / (n - 1)
+    return (float(mean / np.sqrt(variance / n)) if variance > 1e-12 else 0.0), n
+
+
 class RuleFactorForensicValidator:
     """规则型与连续强度因子四级法医检验器 (Gate 1A + Gate 1B 分层池化 + 参数平原 + 激活态正交 & 边际增益)"""
 
@@ -171,7 +171,7 @@ class RuleFactorForensicValidator:
         self,
         is_end_dt: pd.Timestamp = IS_END_DT,
         max_pairwise_corr: float = 0.32,
-        soft_gate: SoftCrossSectionalGate | bool | None = True,
+        soft_gate: SoftCrossSectionalGate | bool | None = False,
     ) -> None:
         self.is_end_dt = is_end_dt
         self.max_pairwise_corr = max_pairwise_corr
@@ -223,216 +223,30 @@ class RuleFactorForensicValidator:
         - 分战略簇三重屏障标尺 (Next-Bar Open + 交易成本扣除 + 连续质量分 Q 加权)
         - MFE / MAE 路径偏离比门槛 + 单因子扣费 Net Sharpe + 前向多期 Rank IC / ICIR 衰减曲线
         """
-        ruler: ArchetypeRuler = ARCHETYPE_RULERS[archetype]
-        is_mask = (df_tf["dt"] <= self.is_end_dt).values
-        if int(is_mask.sum()) < 25:
-            is_mask = np.ones(len(df_tf), dtype=bool)
-        oos_mask = (df_tf["dt"] > self.is_end_dt).values
-
-        min_samples = 8 if timeframe == "1d" else (12 if timeframe == "60m" else (20 if timeframe == "5m" else 15))
-        eff_max_bars = ruler.max_bars * 2 if timeframe == "5m" else ruler.max_bars
-        eff_tp_atr = ruler.tp_atr * 1.35 if timeframe == "5m" else ruler.tp_atr
-        eff_sl_atr = ruler.sl_atr * 1.20 if timeframe == "5m" else ruler.sl_atr
-        min_warmup = min(240 if timeframe == "5m" else 60, max(10, int(is_mask.sum()) // 4))
-
-        trig_bool, weights_tf = self._resolve_soft_gated_inputs(
+        triggers, weights = self._resolve_soft_gated_inputs(
             df_tf, raw_triggers, weights_tf, archetype, direction, soft_gate
         )
-        is_raw_idx = np.where(trig_bool & is_mask)[0]
-        is_purged_idx = purge_overlapping_triggers(is_raw_idx, cooldown_bars=eff_max_bars)
-
-        tb_is = evaluate_triple_barrier(
+        return run_gate1_forensic_audit(
             df_tf,
-            is_purged_idx,
-            direction=direction,
-            max_bars=eff_max_bars,
-            tp_atr=eff_tp_atr,
-            sl_atr=eff_sl_atr,
+            triggers,
+            direction,
+            ARCHETYPE_RULERS[archetype],
+            timeframe,
+            weights_tf=weights,
             fee_rate=fee_rate,
-            weights_tf=weights_tf,
+            is_end_dt=self.is_end_dt,
         )
-        n_purged = len(tb_is)
-        if n_purged < min_samples:
-            return {
-                "passed": False,
-                "reason": f"样本内去重独立触发仅 {n_purged} 次 (< {min_samples} 次周期下限)",
-                "is_n_purged": n_purged,
-            }
-
-        rets_is = tb_is["net_ret"].values
-        q_w = tb_is["quality_w"].values if "quality_w" in tb_is.columns else np.ones(n_purged, dtype=np.float64)
-
-        eq_stats = _compute_weighted_edge_metrics(rets_is, np.ones(n_purged, dtype=np.float64))
-        qw_stats = _compute_weighted_edge_metrics(rets_is, q_w)
-
-        use_q_weight = weights_tf is not None and (np.std(q_w) > 1e-4)
-        active_stats = qw_stats if use_q_weight else eq_stats
-        f_mean = active_stats["mean"]
-        f_win = active_stats["win_rate"]
-        pl_ratio = active_stats["pl_ratio"]
-        safety_margin = active_stats["safety_margin"]
-
-        mfe_arr = tb_is["mfe_atr"].values
-        mae_arr = tb_is["mae_atr"].values
-        q_norm = q_w / max(float(np.sum(q_w)), 1e-12)
-        mean_mfe_atr = float(np.sum(q_norm * mfe_arr))
-        mean_mae_atr = float(np.sum(q_norm * mae_arr))
-        excursion_ratio = float(mean_mfe_atr / max(mean_mae_atr, 1e-6))
-
-        valid_pool = np.where(
-            is_mask & (np.arange(len(df_tf)) >= min_warmup) & (np.arange(len(df_tf)) < len(df_tf) - eff_max_bars - 2)
-        )[0]
-        if len(valid_pool) > 10:
-            rand_pool_idx = self.rng.choice(valid_pool, size=min(800, len(valid_pool)), replace=False)
-            rand_tb = evaluate_triple_barrier(
-                df_tf,
-                rand_pool_idx,
-                direction=direction,
-                max_bars=eff_max_bars,
-                tp_atr=eff_tp_atr,
-                sl_atr=eff_sl_atr,
-                fee_rate=fee_rate,
-            )
-            rand_rets = rand_tb["net_ret"].values if not rand_tb.empty else np.zeros(50)
-        else:
-            rand_rets = np.zeros(50)
-
-        bench_drift = float(np.mean(rand_rets))
-        excess_alpha = f_mean - bench_drift
-        boot_means = np.array([np.mean(self.rng.choice(rand_rets, size=n_purged, replace=True)) for _ in range(500)])
-        boot_pval = float(np.mean(boot_means >= f_mean))
-
-        if weights_tf is not None:
-            net_sh_pack = compute_single_factor_net_sharpe_and_turnover(
-                df_tf, weights_tf, timeframe, fee_rate=fee_rate, is_end_dt=self.is_end_dt
-            )
-            ic_pack = compute_forward_rank_ic_profile(df_tf, weights_tf, is_end_dt=self.is_end_dt)
-        else:
-            synth_w = np.zeros(len(df_tf), dtype=np.float64)
-            for _, r_row in tb_is.iterrows():
-                st_i = int(r_row["trigger_idx"]) + 1
-                ed_i = min(st_i + max(1, int(r_row["bars_held"])), len(df_tf))
-                synth_w[st_i:ed_i] = float(direction)
-            net_sh_pack = compute_single_factor_net_sharpe_and_turnover(
-                df_tf, synth_w, timeframe, fee_rate=fee_rate, is_end_dt=self.is_end_dt
-            )
-            ic_pack = compute_forward_rank_ic_profile(df_tf, synth_w, is_end_dt=self.is_end_dt)
-
-        is_net_sharpe = float(net_sh_pack["is_net_sharpe"])
-        ann_turnover = float(net_sh_pack["ann_turnover"])
-
-        oos_raw_idx = np.where(trig_bool & oos_mask)[0]
-        oos_purged_idx = purge_overlapping_triggers(oos_raw_idx, cooldown_bars=eff_max_bars)
-        tb_oos = evaluate_triple_barrier(
-            df_tf,
-            oos_purged_idx,
-            direction=direction,
-            max_bars=eff_max_bars,
-            tp_atr=eff_tp_atr,
-            sl_atr=eff_sl_atr,
-            fee_rate=fee_rate,
-            weights_tf=weights_tf,
-        )
-        oos_mean = float(np.mean(tb_oos["net_ret"].values)) * 100.0 if len(tb_oos) >= 1 else 0.0
-
-        tf_alpha_scale = {"1d": 1.2, "60m": 1.0, "30m": 0.85, "15m": 0.55, "5m": 0.40}.get(timeframe, 1.0)
-        min_alpha_dec = (ruler.min_alpha_bp * tf_alpha_scale) / 10000.0
-        min_safety_dec = ruler.min_safety_pct / 100.0
-        max_pval = ruler.max_boot_pval + (0.02 if timeframe in ("60m", "1d") else 0.0)
-        min_exc_ratio = float(getattr(ruler, "min_excursion_ratio", 0.90))
-        min_net_sh = float(getattr(ruler, "min_net_sharpe", 0.0))
-
-        passed = (
-            excess_alpha >= min_alpha_dec
-            and safety_margin >= min_safety_dec
-            and boot_pval <= max_pval
-            and excursion_ratio >= min_exc_ratio
-            and (weights_tf is None or is_net_sharpe > min_net_sh)
-        )
-        reasons = []
-        if excess_alpha < min_alpha_dec:
-            reasons.append(f"超额Alpha={excess_alpha * 100:+.2f}%<+{min_alpha_dec * 100:.2f}%")
-        if safety_margin < min_safety_dec:
-            reasons.append(f"安全垫={safety_margin * 100:+.1f}%<+{ruler.min_safety_pct:.1f}%")
-        if boot_pval > max_pval:
-            reasons.append(f"p={boot_pval:.3f}>{max_pval:.2f}")
-        if excursion_ratio < min_exc_ratio:
-            reasons.append(f"MFE/MAE偏离比={excursion_ratio:.2f}<{min_exc_ratio:.2f}")
-        if weights_tf is not None and is_net_sharpe <= min_net_sh:
-            reasons.append(f"扣费Net Sharpe={is_net_sharpe:.2f}<={min_net_sh:.2f}")
-
-        return {
-            "passed": bool(passed),
-            "reason": "通过" if passed else "; ".join(reasons),
-            "ruler_name": ruler.archetype,
-            "is_n_purged": int(n_purged),
-            "is_mean_pct": round(f_mean * 100.0, 3),
-            "is_unweighted_mean_pct": round(eq_stats["mean"] * 100.0, 3),
-            "is_q_weighted_mean_pct": round(qw_stats["mean"] * 100.0, 3),
-            "is_excess_alpha_pct": round(excess_alpha * 100.0, 3),
-            "is_win_rate_pct": round(f_win * 100.0, 1),
-            "is_unweighted_win_rate_pct": round(eq_stats["win_rate"] * 100.0, 1),
-            "is_q_weighted_win_rate_pct": round(qw_stats["win_rate"] * 100.0, 1),
-            "is_pl_ratio": round(pl_ratio, 2),
-            "is_safety_margin_pct": round(safety_margin * 100.0, 1),
-            "is_unweighted_safety_margin_pct": round(eq_stats["safety_margin"] * 100.0, 1),
-            "is_q_weighted_safety_margin_pct": round(qw_stats["safety_margin"] * 100.0, 1),
-            "is_boot_pval": round(boot_pval, 4),
-            "mfe_atr_mean": round(mean_mfe_atr, 3),
-            "mae_atr_mean": round(mean_mae_atr, 3),
-            "excursion_ratio": round(excursion_ratio, 3),
-            "is_net_sharpe": round(is_net_sharpe, 3),
-            "ann_turnover": round(ann_turnover, 2),
-            "rank_ic_curve": ic_pack["rank_ic_curve"],
-            "icir_curve": ic_pack["icir_curve"],
-            "peak_rank_ic": ic_pack["peak_rank_ic"],
-            "mean_rank_ic": ic_pack["mean_rank_ic"],
-            "autocorr_lag1": ic_pack["autocorr_lag1"],
-            "half_life_bars": ic_pack["half_life_bars"],
-            "bar_turnover": ic_pack["bar_turnover"],
-            "oos_n_purged": int(len(tb_oos)),
-            "oos_mean_pct": round(oos_mean, 3),
-        }
 
     def run_gate1_cross_asset_universality_audit(
         self,
         asset_audits: dict[str, dict[str, Any]],
         min_positive_ratio: float = 0.60,
     ) -> dict[str, Any]:
-        """
-        Gate 1B（基础兼容接口）：跨品种普适性检验 (Cross-Asset Universality Audit)
-        检验某一规则因子在多品种池中是否具备普适正期望（≥60% 有效品种取得正超额收益），
-        严防针对单一品种特定历史噪声的过拟合。
-        """
-        valid = {sym: res for sym, res in asset_audits.items() if int(res.get("is_n_purged", 0)) >= 5}
-        if not valid:
-            return {"passed": False, "universal_ratio_pct": 0.0, "positive_assets": []}
-
-        pos_syms = [
-            sym
-            for sym, res in valid.items()
-            if (
-                float(res.get("is_mean_pct", res.get("raw_mean_pct", 0.0))) > 0.0
-                or float(res.get("norm_r_atr", 0.0)) > 0.0
-            )
-            and float(res.get("is_safety_margin_pct", res.get("uncond_safety_pct", 1.0))) > 0.0
-        ]
-        ratio = len(pos_syms) / len(valid)
-        total_is_n = sum(int(res.get("is_n_purged", 0)) for res in valid.values())
-        avg_safety = float(
-            np.mean(
-                [float(res.get("is_safety_margin_pct", res.get("uncond_safety_pct", 0.0))) for res in valid.values()]
-            )
-        )
-
-        return {
-            "passed": bool(ratio >= min_positive_ratio and avg_safety > 1.5),
-            "universal_ratio_pct": round(ratio * 100.0, 1),
-            "total_pool_is_n": total_is_n,
-            "mean_pool_safety_pct": round(avg_safety, 2),
-            "positive_assets": pos_syms,
-            "evaluated_assets": list(valid.keys()),
-        }
+        """Compatibility entry point using the same strict, real-event Tier 1 admission contract."""
+        result = self.run_stratified_pooled_gate1b_audit(archetype=ARCH_A, asset_audits=asset_audits)
+        if result["universal_ratio"] < max(0.60, min_positive_ratio):
+            result["passed"] = False
+        return result
 
     def run_stratified_pooled_gate1b_audit(
         self,
@@ -449,223 +263,182 @@ class RuleFactorForensicValidator:
         per_symbol_gate1: dict[str, dict[str, Any]] | None = None,
         asset_groups: dict[str, str] | None = None,
         target_pool_group: str = "equity",
+        microstructure_groups: dict[str, str] | None = None,
+        target_microstructure_group: str | None = None,
+        min_pool_assets: int | None = None,
         fee_rate: float = 0.0002,
         allow_single_asset_fallback: bool = False,
         allow_single_asset_degrade: bool | None = None,
         soft_gate: SoftCrossSectionalGate | bool | None = None,
+        allow_pooled_effective_n: bool = False,
     ) -> dict[str, Any]:
-        """
-        Gate 1B（三级多标的分层池化检验协议 · Stratified Multi-Asset Pooling）：
-        统一通过 `run_vol_and_regime_normalized_audit` 做 ATR 无量纲标准化 + IPW 状态逆概率重加权：
-        - Tier 1 (跨资产普适簇: A_趋势突破 / E_波动率压缩 / F_多周期共振):
-          检验全市场跨资产大池（宽基权益 + 商品期货），要求跨标的池正期望占比 `universal_ratio >= 0.60`，
-          且池化合并 Purged `t-stat >= 2.5` (当池规模 >= 5 时，否則 >= 2.0)。
-        - Tier 2 (同质资产类别特征簇: B_背驰衰竭 / C_中枢震荡):
-          检验所属同质大类资产池（`equity` 宽基权益池 vs `commodity` 商品板块池），
-          要求同质池内正期望占比 `universal_ratio >= 0.75` (权益池) 或 `>= 0.65` (商品池)，
-          严禁只在单标的赚钱而在同池其余标的上亏损。
-        - Tier 3 (交易制度与微结构簇: D_量价筹码 及高频微结构):
-          检验同交易制度高流动性池，要求正期望占比 `universal_ratio >= 0.70` 且扣费后池化平均 `is_net_sharpe > 0`。
-        """
-        if per_symbol_gate1 is not None and asset_audits is None:
-            asset_audits = per_symbol_gate1
-        if allow_single_asset_degrade is not None:
-            allow_single_asset_fallback = allow_single_asset_degrade
+        """Admit only real, training-only event evidence from the required asset universe.
 
-        tier = get_stratified_pool_tier(archetype, timeframe)
-        pool_tier_name = {
-            1: "Tier1_CrossAsset",
-            2: "Tier2_AssetClass",
-            3: "Tier3_Microstructure",
-        }.get(tier, "Tier1_CrossAsset")
-        norm_target_group = infer_asset_pool_group(target_pool_group, target_pool_group)
-
-        raw_audits: dict[str, dict[str, Any]] = {}
-        if asset_audits is not None:
-            raw_audits = dict(asset_audits)
-        elif pool_tf_dfs is not None:
-            for sym, df_sym in pool_tf_dfs.items():
-                if triggers_by_symbol is not None and sym in triggers_by_symbol:
-                    t_arr = triggers_by_symbol[sym]
-                    w_arr = weights_by_symbol.get(sym) if weights_by_symbol is not None else None
+        Tier 1 requires at least 15 assets and both equity and commodity classes.
+        Tier 2 requires five assets from the exact equity or commodity:<sector> group.
+        Tier 3 additionally requires an explicitly identical trading/liquidity regime.
+        Legacy single-asset flags preserve diagnostics, never admission permission.
+        """
+        raw_audits = dict(asset_audits or per_symbol_gate1 or {})
+        if not raw_audits and pool_tf_dfs is not None:
+            for symbol, df_symbol in pool_tf_dfs.items():
+                if triggers_by_symbol is not None and symbol in triggers_by_symbol:
+                    triggers = triggers_by_symbol[symbol]
+                    weights = (weights_by_symbol or {}).get(symbol)
                 elif eval_fn is not None:
-                    t_arr, w_arr = eval_fn(df_sym)
-                elif sig_id is not None and sig_id in ALL_SIGNAL_SPECS:
+                    triggers, weights = eval_fn(df_symbol)
+                elif sig_id in ALL_SIGNAL_SPECS:
                     spec = ALL_SIGNAL_SPECS[sig_id]
                     direction = spec.direction
-                    t_arr, w_arr = compute_signal_triggers_and_weights(
-                        df_sym, sig_id, scale=TF_SCALE_MAP.get(timeframe, 1.0)
+                    triggers, weights = compute_signal_triggers_and_weights(
+                        df_symbol, sig_id, scale=TF_SCALE_MAP.get(timeframe, 1.0)
                     )
                 else:
-                    raise ValueError(f"Missing triggers/eval_fn/sig_id for symbol {sym} in pooled Gate 1B audit.")
-
-                raw_audits[sym] = self.run_vol_and_regime_normalized_audit(
-                    df_sym,
-                    t_arr,
-                    direction=direction,
-                    archetype=archetype,
-                    timeframe=timeframe,
+                    raise ValueError(f"Missing triggers/eval_fn/sig_id for {symbol}.")
+                raw_audits[symbol] = self.run_vol_and_regime_normalized_audit(
+                    df_symbol,
+                    triggers,
+                    direction,
+                    archetype,
+                    timeframe,
                     fee_rate=fee_rate,
-                    weights_tf=w_arr,
+                    weights_tf=weights,
                     soft_gate=soft_gate,
                 )
-        else:
-            raise ValueError("Must provide either pool_tf_dfs or asset_audits to run_stratified_pooled_gate1b_audit.")
-
-        if not raw_audits:
-            return {
-                "passed": False,
-                "tier": tier,
-                "pool_tier": pool_tier_name,
-                "pool_size": 0,
-                "reason": "标的池为空，无法执行分层池化检验",
-                "universal_ratio": 0.0,
-                "universal_ratio_pct": 0.0,
-                "pooled_t_stat": 0.0,
-                "mean_pool_net_sharpe": 0.0,
-                "positive_assets": [],
-                "evaluated_assets": [],
-            }
-
-        # 按 Tier 筛选目标检验池：Tier 1 取全市场跨资产池；Tier 2 / Tier 3 优先取目标同质池
-        if tier in (2, 3) and len(raw_audits) > 1:
-            matched_syms = [
-                sym
-                for sym in raw_audits
-                if infer_asset_pool_group(sym, (asset_groups or {}).get(sym)) == norm_target_group
-            ]
-            selected_syms = matched_syms if len(matched_syms) >= 2 else list(raw_audits.keys())
-        else:
-            selected_syms = list(raw_audits.keys())
-
-        valid_audits = {
-            sym: raw_audits[sym] for sym in selected_syms if int(raw_audits[sym].get("is_n_purged", 0)) >= 3
-        }
-        if not valid_audits:
-            return {
-                "passed": False,
-                "tier": tier,
-                "pool_tier": pool_tier_name,
-                "pool_size": 0,
-                "reason": "池内所有标的独立触发样本均不足 (< 3)",
-                "universal_ratio": 0.0,
-                "universal_ratio_pct": 0.0,
-                "pooled_t_stat": 0.0,
-                "mean_pool_net_sharpe": 0.0,
-                "positive_assets": [],
-                "evaluated_assets": [],
-            }
-
-        n_assets = len(valid_audits)
-        pos_assets: list[str] = []
-        pooled_r_atr_samples: list[float] = []
-        net_sharpes: list[float] = []
-        ipw_r_atrs: list[float] = []
-
-        for sym, aud in valid_audits.items():
-            norm_r = float(aud.get("norm_r_atr", aud.get("is_mean_pct", 0.0)))
-            ipw_r = float(aud.get("ipw_r_atr", norm_r))
-            raw_m = float(aud.get("raw_mean_pct", aud.get("is_mean_pct", 0.0)))
-            net_sh = float(aud.get("is_net_sharpe", 0.0))
-            net_sharpes.append(net_sh)
-            ipw_r_atrs.append(ipw_r)
-
-            if (norm_r > 0.0 or ipw_r > 0.0) and raw_m > 0.0:
-                pos_assets.append(sym)
-
-            if (
-                "r_atr_values" in aud
-                and isinstance(aud["r_atr_values"], list | np.ndarray)
-                and len(aud["r_atr_values"]) > 0
-            ):
-                pooled_r_atr_samples.extend(float(x) for x in aud["r_atr_values"])
+        tier = get_stratified_pool_tier(archetype, timeframe)
+        names = {1: "Tier1_CrossAsset", 2: "Tier2_AssetClass", 3: "Tier3_Microstructure"}
+        groups = {symbol: infer_asset_pool_group(symbol, (asset_groups or {}).get(symbol)) for symbol in raw_audits}
+        target = infer_asset_pool_group(target_pool_group, target_pool_group)
+        selected = list(raw_audits) if tier == 1 else [s for s in raw_audits if groups[s] == target]
+        reasons = []
+        if tier == 3:
+            if not target_microstructure_group:
+                reasons.append("Tier3缺少明确的交易制度/流动性组")
+                selected = []
             else:
-                n_p = max(1, int(aud.get("is_n_purged", 10)))
-                std_r = max(float(aud.get("std_r_atr", 0.5)), 0.1)
-                synth = np.linspace(norm_r - std_r * 0.5, norm_r + std_r * 0.5, num=n_p)
-                pooled_r_atr_samples.extend(float(x) for x in synth)
+                selected = [s for s in selected if (microstructure_groups or {}).get(s) == target_microstructure_group]
+        if tier == 2 and target == "commodity":
+            reasons.append("Tier2商品池必须指定commodity:<sector>，不能混合所有商品")
+        floor = 15 if tier == 1 else 5
+        required_assets = max(floor, min_pool_assets or floor)
+        if len(selected) < required_assets:
+            reasons.append(f"目标池规模={len(selected)} < {required_assets}，不得降级准入")
+        if tier == 1 and {groups[s].split(":", 1)[0] for s in selected} != {"equity", "commodity"}:
+            reasons.append("Tier1必须同时包含权益和商品资产")
 
-        universal_ratio = float(len(pos_assets) / n_assets)
-        mean_net_sharpe = float(np.mean(net_sharpes)) if net_sharpes else 0.0
-        mean_ipw_r_atr = float(np.mean(ipw_r_atrs)) if ipw_r_atrs else 0.0
-
-        r_pool_arr = np.asarray(pooled_r_atr_samples, dtype=np.float64)
-        total_n_purged = len(r_pool_arr)
-        if total_n_purged >= 2 and float(r_pool_arr.std(ddof=1)) > 1e-9:
-            pooled_t_stat = float(r_pool_arr.mean() / (r_pool_arr.std(ddof=1) / np.sqrt(total_n_purged)))
-        else:
-            pooled_t_stat = 0.0
-
-        # 单标的平滑降级模式 (仅当本地只有单标的数据且显式允许 fallback 时生效)
-        if n_assets == 1 and allow_single_asset_fallback:
-            passed = (universal_ratio >= 1.0) and (mean_ipw_r_atr > 0.0) and (pooled_t_stat >= 1.2)
-            return {
-                "passed": bool(passed),
-                "tier": tier,
-                "pool_tier": pool_tier_name,
-                "pool_size": n_assets,
-                "degraded_single_asset": True,
-                "reason": "单标的降级检验通过 (建议补充同质池数据)"
-                if passed
-                else f"单标的池化t={pooled_t_stat:.2f}或IPW期望不足",
-                "universal_ratio": round(universal_ratio, 4),
-                "universal_ratio_pct": round(universal_ratio * 100.0, 1),
-                "pooled_t_stat": round(pooled_t_stat, 3),
-                "mean_pool_net_sharpe": round(mean_net_sharpe, 3),
-                "mean_ipw_r_atr": round(mean_ipw_r_atr, 3),
-                "total_pool_is_n": total_n_purged,
-                "positive_assets": pos_assets,
-                "evaluated_assets": list(valid_audits.keys()),
-            }
-
-        reasons: list[str] = []
-        pool_label = "Equity-Pool" if norm_target_group == "equity" else "Commodity-Sector-Pool"
-        if tier == 1:
-            min_ratio = 0.60
-            min_t_stat = 2.5 if n_assets >= 5 else 2.0
-            if universal_ratio < min_ratio:
-                reasons.append(f"Tier1跨资产普适率={universal_ratio * 100:.1f}% < {min_ratio * 100:.0f}%")
-            if pooled_t_stat < min_t_stat:
-                reasons.append(f"Tier1池化Purged t-stat={pooled_t_stat:.2f} < {min_t_stat:.2f}")
-            if mean_ipw_r_atr <= 0.0:
-                reasons.append(f"Tier1状态均衡IPW r_atr={mean_ipw_r_atr:+.3f} <= 0")
-        elif tier == 2:
-            min_ratio = 0.75 if norm_target_group == "equity" else 0.65
-            min_t_stat = 1.96
-            if universal_ratio < min_ratio:
-                reasons.append(
-                    f"Tier2({pool_label})未达标: 同质池({norm_target_group})普适率={universal_ratio * 100:.1f}% < {min_ratio * 100:.0f}% (单品种过拟合拦截)"
+        positive, event_frames, net_sharpes, ipw_means = [], [], [], []
+        valid_audits = {}
+        for symbol in selected:
+            audit = raw_audits[symbol]
+            records = audit.get("events")
+            if not isinstance(records, list) or not records:
+                reasons.append(f"{symbol}: 缺少真实events，不得用摘要生成样本")
+                continue
+            events = pd.DataFrame(records)
+            required = {"trigger_dt", "entry_dt", "exit_dt", "r_atr", "net_ret", "quality_w", "regime"}
+            if not required.issubset(events.columns):
+                reasons.append(f"{symbol}: events字段不完整")
+                continue
+            for col in ("trigger_dt", "entry_dt", "exit_dt"):
+                events[col] = pd.to_datetime(events[col], errors="coerce")
+            finite = np.isfinite(events[["r_atr", "net_ret", "quality_w"]].to_numpy(dtype=float)).all()
+            ordered = (events["trigger_dt"] < events["entry_dt"]) & (events["entry_dt"] <= events["exit_dt"])
+            in_sample = events["exit_dt"] <= self.is_end_dt
+            if (
+                not finite
+                or not ordered.all()
+                or not in_sample.all()
+                or (events["quality_w"] <= 0).any()
+                or (events["quality_w"] > 1).any()
+            ):
+                reasons.append(f"{symbol}: events含无效值或跨训练边界标签")
+                continue
+            events = events.sort_values("entry_dt").reset_index(drop=True)
+            starts = events["entry_dt"].iloc[1:].to_numpy()
+            previous_exits = events["exit_dt"].iloc[:-1].to_numpy()
+            # A real next-open reversal closes before opening its opposite leg.
+            # Diagnostic intrabar exits do not establish that ordering.
+            overlaps = starts < previous_exits if audit.get("event_source") == "execution" else starts <= previous_exits
+            if overlaps.any():
+                reasons.append(f"{symbol}: events持有期重叠，尚未purge")
+                continue
+            q = events["quality_w"].to_numpy(dtype=float)
+            effective_n = float(q.sum() ** 2 / (q @ q))
+            min_asset_eff_n = (
+                float({"1d": 2, "60m": 10, "30m": 15, "15m": 6, "5m": 15}.get(timeframe, 10))
+                if allow_pooled_effective_n
+                else 30.0
+            )
+            if effective_n < min_asset_eff_n - 1e-9:
+                reasons.append(f"{symbol}: 有效独立样本={effective_n:.2f} < {min_asset_eff_n:.0f}")
+            # Recompute all moments from the immutable event table; summaries are display-only.
+            norm_r = float(np.average(events["r_atr"], weights=q))
+            raw_mean = float(np.average(events["net_ret"], weights=q))
+            regime_means = []
+            events["pool_weight"] = 0.0
+            for regime in (-1, 0, 1):
+                mask = events["regime"] == regime
+                if int(mask.sum()) < (1 if allow_pooled_effective_n else 2):
+                    continue
+                regime_q = events.loc[mask, "quality_w"]
+                regime_means.append(float(np.average(events.loc[mask, "r_atr"], weights=regime_q)))
+                events.loc[mask, "pool_weight"] = regime_q / regime_q.sum() / 3.0
+            if len(regime_means) != 3 and not allow_pooled_effective_n:
+                reasons.append(f"{symbol}: 三态IPW缺少事件支持，不能声称状态均衡")
+                ipw_mean = 0.0
+            elif regime_means:
+                ipw_mean = float(np.mean(regime_means))
+                if len(regime_means) != 3:
+                    events["pool_weight"] = q / max(float(q.sum()), 1e-12)
+            else:
+                ipw_mean = 0.0
+            if effective_n >= min_asset_eff_n - 1e-9 and norm_r > 0 and raw_mean > 0 and ipw_mean > 0:
+                positive.append(symbol)
+            events["symbol"] = symbol
+            event_frames.append(events)
+            ipw_means.append(ipw_mean)
+            net_sharpes.append(float(audit.get("is_net_sharpe", 0.0)))
+            valid_audits[symbol] = audit
+        if allow_pooled_effective_n:
+            pooled_eff_n = sum(
+                float(
+                    (df["quality_w"].sum() ** 2)
+                    / (df["quality_w"].to_numpy(dtype=float) @ df["quality_w"].to_numpy(dtype=float))
                 )
-            if pooled_t_stat < min_t_stat:
-                reasons.append(f"Tier2同质池Purged t-stat={pooled_t_stat:.2f} < {min_t_stat:.2f}")
-            if mean_ipw_r_atr <= 0.0:
-                reasons.append(f"Tier2状态均衡IPW r_atr={mean_ipw_r_atr:+.3f} <= 0")
-        else:
-            min_ratio = 0.70
-            min_t_stat = 1.80
-            if universal_ratio < min_ratio:
-                reasons.append(f"Tier3同制度池普适率={universal_ratio * 100:.1f}% < {min_ratio * 100:.0f}%")
-            if mean_net_sharpe <= 0.0:
-                reasons.append(f"Tier3扣费后池化平均Net Sharpe={mean_net_sharpe:+.2f} <= 0.00")
-            if pooled_t_stat < min_t_stat:
-                reasons.append(f"Tier3池化Purged t-stat={pooled_t_stat:.2f} < {min_t_stat:.2f}")
-
-        passed = len(reasons) == 0
+                for df in event_frames
+                if len(df) > 0
+            )
+            min_pool_eff_n = float(TF_MIN_PURGED_SAMPLES.get(timeframe, 30))
+            if pooled_eff_n < min_pool_eff_n - 1e-9:
+                reasons.append(f"跨品种池化有效样本={pooled_eff_n:.1f} < {min_pool_eff_n:.0f}")
+        ratio = len(positive) / len(selected) if selected else 0.0
+        pooled_t, block_count = _pooled_time_block_t_stat(event_frames)
+        min_ratio = 0.60 if tier == 1 else (0.70 if tier == 3 else (0.75 if target == "equity" else 0.65))
+        min_t = 2.5 if tier == 1 else 1.96
+        if ratio < min_ratio:
+            reasons.append(f"Tier{tier}同质池普适率={ratio:.1%} < {min_ratio:.0%}")
+        if pooled_t < min_t:
+            reasons.append(f"同步时间块t={pooled_t:.3f} < {min_t:.2f}")
+        mean_sharpe = float(np.mean(net_sharpes)) if net_sharpes else 0.0
+        if tier == 3 and mean_sharpe <= 0:
+            reasons.append("Tier3扣费净Sharpe不大于0")
         return {
-            "passed": bool(passed),
+            "passed": not reasons,
+            "reason": "; ".join(reasons) if reasons else f"通过Tier{tier}真实事件池化检验",
             "tier": tier,
-            "pool_tier": pool_tier_name,
-            "pool_size": n_assets,
-            "degraded_single_asset": False,
-            "reason": f"通过 Tier {tier} 多标的分层池化检验" if passed else "; ".join(reasons),
-            "universal_ratio": round(universal_ratio, 4),
-            "universal_ratio_pct": round(universal_ratio * 100.0, 1),
-            "pooled_t_stat": round(pooled_t_stat, 3),
-            "mean_pool_net_sharpe": round(mean_net_sharpe, 3),
-            "mean_ipw_r_atr": round(mean_ipw_r_atr, 3),
-            "total_pool_is_n": total_n_purged,
-            "positive_assets": pos_assets,
-            "evaluated_assets": list(valid_audits.keys()),
+            "pool_tier": names[tier],
+            "pool_size": len(selected),
+            "required_pool_size": required_assets,
+            "degraded_single_asset": len(selected) == 1,
+            "universal_ratio": round(ratio, 4),
+            "universal_ratio_pct": round(ratio * 100, 1),
+            "pooled_t_stat": round(pooled_t, 3),
+            "independent_time_blocks": block_count,
+            "mean_pool_net_sharpe": round(mean_sharpe, 3),
+            "mean_ipw_r_atr": float(np.mean(ipw_means)) if ipw_means else 0.0,
+            "total_pool_is_n": sum(len(frame) for frame in event_frames),
+            "positive_assets": positive,
+            "evaluated_assets": selected,
             "per_asset_audits": valid_audits,
         }
 
@@ -713,7 +486,7 @@ class RuleFactorForensicValidator:
 
         is_mask = (df_grid["dt"] <= self.is_end_dt).values
         if int(is_mask.sum()) < 25:
-            is_mask = np.ones(len(df_grid), dtype=bool)
+            return {"passed": False, "reason": "样本内历史不足"}
         cw_is = cand_w_on_grid[is_mask]
         port_w_is = current_portfolio_w[is_mask]
 
@@ -745,21 +518,11 @@ class RuleFactorForensicValidator:
         if int(cand_active.sum()) == 0:
             return {"passed": False, "reason": "样本内无有效持仓激活"}
 
-        port_flat_or_light = np.abs(port_w_is) <= 0.25
-        gap_fill_ratio = float((cand_active & port_flat_or_light).sum() / cand_active.sum() * 100.0)
+        from examples.alpha_mining_agent.forensic_pipeline import _next_open_rescue_metrics
 
-        bar_ret = df_grid["close"].pct_change().fillna(0.0).values[is_mask]
-        port_cum_nav = np.cumprod(1.0 + port_w_is * bar_ret)
-        port_peak = np.maximum.accumulate(port_cum_nav)
-        port_dd_state = (port_cum_nav - port_peak) / port_peak
-
-        fwd_bar_ret = df_grid["close"].pct_change().shift(-1).fillna(0.0).values[is_mask]
-        rescue_mask = ((np.abs(port_w_is) <= 0.20) | (port_dd_state <= -0.015)) & cand_active
-        bp_scale = 6.0 if len(df_grid) > 40000 else 1.0
-        if int(rescue_mask.sum()) >= 5:
-            dd_rescue_alpha_bp = float(np.mean(cw_is[rescue_mask] * fwd_bar_ret[rescue_mask]) * 10000.0 * bp_scale)
-        else:
-            dd_rescue_alpha_bp = 0.0
+        gap_fill_ratio, dd_rescue_alpha_bp = _next_open_rescue_metrics(
+            df_grid.loc[is_mask].reset_index(drop=True), cw_is, port_w_is
+        )
 
         passed = (
             (max_corr < max_corr_threshold)
@@ -789,9 +552,15 @@ class RuleFactorForensicValidator:
         fee_rate: float = 0.0002,
         weights_tf: np.ndarray | None = None,
         soft_gate: SoftCrossSectionalGate | bool | None = None,
+        *,
+        event_source: Literal["diagnostic", "execution"] = "diagnostic",
     ) -> dict[str, Any]:
         """
-        解决【跨标的波动率不同 + 市场状态构成不同】的法医归一化检验：
+        解决【跨标的波动率不同 + 市场状态构成不同】的法医归一化检验。
+        `event_source="execution"` uses completed actual Rust execution episodes;
+        the default keeps fixed ATR ruler diagnostics for existing analysis callers.
+        Execution mode consumes final weights unchanged and requires weights_tf.
+        诊断步骤：
         1. 波动率无量纲化 (R-Multiple / ATR-Unit Edge)：
            将每笔交易净收益除以入场时刻因果相对波动率 `atr_pct = atr14 / close`，
            转化为“每承担 1 单位 ATR 波动捕获的净 ATR 倍数 (r_atr)”，消除高波/低波标的名义收益率不可比问题；
@@ -801,10 +570,20 @@ class RuleFactorForensicValidator:
            按标准均衡状态配比 (Bull:Bear:Range = 1/3:1/3:1/3) 计算状态重加权后的期望与安全边际，
            剥离“某标的恰巧在样本内走了三年震荡或三年熊市”的状态构成偏差 (Regime Compositional Bias)。
         """
+        if event_source not in ("diagnostic", "execution"):
+            raise ValueError("event_source must be diagnostic or execution")
+        if event_source == "execution" and weights_tf is None:
+            raise ValueError("Actual execution events require signed weights_tf")
         ruler: ArchetypeRuler = ARCHETYPE_RULERS[archetype]
         is_mask = (df_tf["dt"] <= self.is_end_dt).values
         if int(is_mask.sum()) < 25:
-            is_mask = np.ones(len(df_tf), dtype=bool)
+            return {
+                "passed": False,
+                "event_source": event_source,
+                "is_n_purged": 0,
+                "events": [],
+                "reason": "样本内历史不足",
+            }
         eff_max_bars = ruler.max_bars * 2 if timeframe == "5m" else ruler.max_bars
         eff_tp_atr = ruler.tp_atr * 1.35 if timeframe == "5m" else ruler.tp_atr
         eff_sl_atr = ruler.sl_atr * 1.20 if timeframe == "5m" else ruler.sl_atr
@@ -816,26 +595,37 @@ class RuleFactorForensicValidator:
         range_time_pct = float(np.mean(reg_is == 0) * 100.0)
 
         c_arr = df_tf["close"].values
-        atr_pct_arr = np.maximum(df_tf["atr14"].bfill().values / np.maximum(c_arr, 1e-6), 1e-4)
-        median_atr_pct = float(np.median(atr_pct_arr[is_mask]) * 100.0)
+        atr_pct_arr = np.maximum(df_tf["atr14"].values / np.maximum(c_arr, 1e-6), 1e-4)
+        median_atr_pct = float(np.nanmedian(atr_pct_arr[is_mask]) * 100.0)
 
-        trig_bool, weights_tf = self._resolve_soft_gated_inputs(
-            df_tf, raw_triggers, weights_tf, archetype, direction, soft_gate
-        )
-        is_raw_idx = np.where(trig_bool & is_mask)[0]
-        is_purged_idx = purge_overlapping_triggers(is_raw_idx, cooldown_bars=eff_max_bars)
-        tb_is = evaluate_triple_barrier(
-            df_tf,
-            is_purged_idx,
-            direction=direction,
-            max_bars=eff_max_bars,
-            tp_atr=eff_tp_atr,
-            sl_atr=eff_sl_atr,
-            fee_rate=fee_rate,
-            weights_tf=weights_tf,
-        )
+        if event_source == "execution":
+            # These are final factor decisions; applying another gate would change
+            # the traded path being audited. Rust owns resizing, fills and costs.
+            tb_is = evaluate_execution_events(df_tf, weights_tf, fee_rate, label_end_dt=self.is_end_dt)
+        else:
+            trig_bool, weights_tf = self._resolve_soft_gated_inputs(
+                df_tf, raw_triggers, weights_tf, archetype, direction, soft_gate
+            )
+            is_raw_idx = np.where(trig_bool & is_mask)[0]
+            tb_is = evaluate_triple_barrier(
+                df_tf,
+                is_raw_idx,
+                direction=direction,
+                max_bars=eff_max_bars,
+                tp_atr=eff_tp_atr,
+                sl_atr=eff_sl_atr,
+                fee_rate=fee_rate,
+                weights_tf=weights_tf,
+                label_end_dt=self.is_end_dt,
+                purge_overlaps=True,
+            )
         if tb_is.empty:
-            return {"is_n_purged": 0, "median_bar_atr_pct": round(median_atr_pct, 3)}
+            return {
+                "event_source": event_source,
+                "is_n_purged": 0,
+                "events": [],
+                "median_bar_atr_pct": round(median_atr_pct, 3),
+            }
 
         t_idx = tb_is["trigger_idx"].values.astype(int)
         raw_nets = tb_is["net_ret"].values
@@ -843,7 +633,7 @@ class RuleFactorForensicValidator:
         use_q_w = weights_tf is not None and (np.std(q_w) > 1e-4 or np.mean(q_w) < 0.99)
         q_norm = (q_w / max(float(np.sum(q_w)), 1e-12)) if use_q_w else np.full(len(tb_is), 1.0 / len(tb_is))
 
-        entry_atr_pct = atr_pct_arr[t_idx]
+        entry_atr_pct = tb_is["atr_pct"].to_numpy()
         # 核心变换 1：转化为无量纲 ATR 单位净收益 (R-Multiple in ATR units)
         r_atr = raw_nets / entry_atr_pct
         trig_regimes = regimes[t_idx]
@@ -886,30 +676,35 @@ class RuleFactorForensicValidator:
                 w_m = q_norm[m]
                 state_r_atr.append(float(np.sum(w_m * r_atr[m]) / max(float(np.sum(w_m)), 1e-12)))
                 state_safeties.append(_calc_safety(raw_nets[m]))
-        ipw_r_atr = float(np.mean(state_r_atr)) if state_r_atr else norm_r_atr_val
-        ipw_safety = float(np.mean(state_safeties)) if state_safeties else uncond_safety
+        ipw_r_atr = float(np.mean(state_r_atr)) if len(state_r_atr) == 3 else 0.0
+        ipw_safety = float(np.mean(state_safeties)) if len(state_safeties) == 3 else 0.0
 
-        if weights_tf is not None:
+        if event_source == "execution":
+            net_sh_pack = compute_execution_net_metrics(df_tf, weights_tf, fee_rate=fee_rate, is_end_dt=self.is_end_dt)
+        elif weights_tf is not None:
             net_sh_pack = compute_single_factor_net_sharpe_and_turnover(
                 df_tf, weights_tf, timeframe, fee_rate=fee_rate, is_end_dt=self.is_end_dt
             )
         else:
             synth_w = np.zeros(len(df_tf), dtype=np.float64)
             for _, r_row in tb_is.iterrows():
-                st_i = int(r_row["trigger_idx"]) + 1
-                ed_i = min(st_i + max(1, int(r_row["bars_held"])), len(df_tf))
+                st_i = int(r_row["trigger_idx"])
+                ed_i = int(r_row["exit_idx"])
                 synth_w[st_i:ed_i] = float(direction)
             net_sh_pack = compute_single_factor_net_sharpe_and_turnover(
                 df_tf, synth_w, timeframe, fee_rate=fee_rate, is_end_dt=self.is_end_dt
             )
 
         std_r_atr = float(np.std(r_atr, ddof=1)) if len(r_atr) > 1 else 0.5
-        t_stat_r_atr = float(norm_r_atr_val / (std_r_atr / np.sqrt(len(r_atr)))) if std_r_atr > 1e-9 else 0.0
+        effective_n = float(1.0 / np.sum(q_norm**2))
+        variance = float(np.sum(q_norm * (r_atr - norm_r_atr_val) ** 2))
+        t_stat_r_atr = float(norm_r_atr_val / np.sqrt(variance / max(effective_n - 1, 1))) if variance > 1e-9 else 0.0
         mfe_mean = float(np.sum(q_norm * tb_is["mfe_atr"].values))
         mae_mean = float(np.sum(q_norm * tb_is["mae_atr"].values))
         exc_ratio = float(mfe_mean / max(mae_mean, 1e-6))
 
         return {
+            "event_source": event_source,
             "is_n_purged": int(len(tb_is)),
             "median_bar_atr_pct": round(median_atr_pct, 3),
             "regime_dist_str": f"牛{bull_time_pct:.0f}%/震{range_time_pct:.0f}%/熊{bear_time_pct:.0f}%",
@@ -917,7 +712,10 @@ class RuleFactorForensicValidator:
             "norm_r_atr": round(norm_r_atr_val, 3),
             "std_r_atr": round(std_r_atr, 3),
             "t_stat_r_atr": round(t_stat_r_atr, 3),
-            "r_atr_values": [round(float(x), 4) for x in r_atr],
+            "r_atr_values": [float(x) for x in r_atr],
+            "events": tb_is.assign(r_atr=r_atr, regime=trig_regimes).to_dict("records"),
+            "is_effective_n": effective_n,
+            "regime_support_complete": len(state_r_atr) == 3,
             "ipw_r_atr": round(ipw_r_atr, 3),
             "home_r_atr": round(home_r_atr, 3),
             "uncond_safety_pct": round(uncond_safety, 1),
@@ -925,8 +723,9 @@ class RuleFactorForensicValidator:
             "home_safety_pct": round(home_safety, 1),
             "excursion_ratio": round(exc_ratio, 3),
             "is_net_sharpe": round(float(net_sh_pack["is_net_sharpe"]), 3),
-            "ann_turnover": round(float(net_sh_pack["ann_turnover"]), 2),
-            "cost_to_atr_pct": round(float(fee_rate / (median_atr_pct / 100.0) * 100.0), 1),
+            "ann_turnover": round(float(net_sh_pack.get("ann_turnover", 0.0)), 2),
+            "cost_to_atr_pct": round(float(2 * fee_rate / (median_atr_pct / 100.0) * 100.0), 1),
+            "cost_to_atr_basis": "nominal_round_trip_estimate",
         }
 
 
@@ -935,6 +734,56 @@ def run_stratified_pooled_gate1b_audit(*args: Any, **kwargs: Any) -> dict[str, A
     is_end_dt = kwargs.pop("is_end_dt", IS_END_DT)
     validator = RuleFactorForensicValidator(is_end_dt=is_end_dt)
     return validator.run_stratified_pooled_gate1b_audit(*args, **kwargs)
+
+
+def select_pooled_multitf_gate1_units(
+    f_scores: pd.DataFrame,
+    f_pool: pd.DataFrame,
+    asset_id: str,
+    *,
+    allow_lowturn_hetero_15m: bool = False,
+) -> pd.DataFrame:
+    """
+    滚动样本内多周期跨品种池化自由度 Gate 1 统一准入接口：
+    - 30m: 单品种 n >= 15, mean_net_pct > 0, is_net_sharpe > 0.15
+    - 15m: 标准候选要求 n >= 15；若启用低换手异构 15m 跨日波段因子 (H15M_*)，允许 n >= 6 且年化换手 <= 26x 且池化 total_n >= 150
+    - 60m: 单品种 n >= 10, mean_net_pct > 0, is_net_sharpe > 0.15
+    - 1d: 单品种 n >= 2, mean_net_pct > 0, is_net_sharpe > 0.10 且池化 total_n >= 25、池化均值 > 0
+    """
+    sub = f_scores[f_scores["asset"] == asset_id].merge(
+        f_pool[["uid", "total_n", "pooled_mean_pct", "pooled_t", "pos_asset_ratio"]],
+        on="uid",
+        how="left",
+    )
+    c_30m = (sub["tf"] == "30m") & (sub["n"] >= 15) & (sub["mean_net_pct"] > 0.0) & (sub["is_net_sharpe"] > 0.15)
+    if allow_lowturn_hetero_15m:
+        c_15m = (
+            (sub["tf"] == "15m")
+            & (
+                (sub["n"] >= 15)
+                | (
+                    sub["uid"].str.startswith("H15M_")
+                    & (sub["n"] >= 6)
+                    & (sub["ann_turnover"] <= 26.0)
+                    & (sub["total_n"] >= 150)
+                )
+            )
+            & (sub["mean_net_pct"] > 0.0)
+            & (sub["is_net_sharpe"] > 0.15)
+        )
+    else:
+        c_15m = (sub["tf"] == "15m") & (sub["n"] >= 15) & (sub["mean_net_pct"] > 0.0) & (sub["is_net_sharpe"] > 0.15)
+
+    c_60m = (sub["tf"] == "60m") & (sub["n"] >= 10) & (sub["mean_net_pct"] > 0.0) & (sub["is_net_sharpe"] > 0.15)
+    c_1d = (
+        (sub["tf"] == "1d")
+        & (sub["n"] >= 2)
+        & (sub["mean_net_pct"] > 0.0)
+        & (sub["is_net_sharpe"] > 0.10)
+        & (sub["total_n"] >= 25)
+        & (sub["pooled_mean_pct"] > 0.0)
+    )
+    return sub[c_30m | c_15m | c_60m | c_1d].copy()
 
 
 def classify_causal_market_regime(df_tf: pd.DataFrame, er_window: int = 20, er_th: float = 0.22) -> np.ndarray:
@@ -947,15 +796,11 @@ def classify_causal_market_regime(df_tf: pd.DataFrame, er_window: int = 20, er_t
     """
     c = df_tf["close"].values.astype(np.float64)
     c_series = pd.Series(c)
-    ma20 = (
-        df_tf["ma20"].bfill().values if "ma20" in df_tf.columns else c_series.rolling(20, min_periods=1).mean().values
-    )
-    ma60 = (
-        df_tf["ma60"].bfill().values if "ma60" in df_tf.columns else c_series.rolling(60, min_periods=1).mean().values
-    )
+    ma20 = df_tf["ma20"].values if "ma20" in df_tf.columns else c_series.rolling(20, min_periods=1).mean().values
+    ma60 = df_tf["ma60"].values if "ma60" in df_tf.columns else c_series.rolling(60, min_periods=1).mean().values
 
     net_chg = np.abs(c_series.diff(er_window).fillna(0.0).values)
-    abs_path = pd.Series(np.abs(np.diff(c, prepend=c[0]))).rolling(er_window, min_periods=5).sum().bfill().values
+    abs_path = pd.Series(np.abs(np.diff(c, prepend=c[0]))).rolling(er_window, min_periods=5).sum().fillna(np.inf).values
     er = net_chg / np.maximum(abs_path, 1e-6)
 
     regimes = np.zeros(len(c), dtype=np.int8)
@@ -1133,29 +978,23 @@ class RollingEmpiricalBayesWeighter:
         unit_weights_on_grid: dict[str, np.ndarray],
         fee_rate: float = 0.0002,
     ) -> dict[str, np.ndarray]:
-        """
-        从价格序列与各单元时序仓位构造严格因果的已实现单步净收益序列 r_{k, s}：
-        在时刻 s >= 1，已实现净收益为 s-1 时刻持仓在 (s-1 -> s) 价格变动上的收益扣除调仓成本：
-            r_{k, s} = w_{k, s-1} * (close_s - close_{s-1}) / close_{s-1} - fee_rate * |w_{k, s-1} - w_{k, s-2}|
-        保证 r_{k, s} 仅依赖 <= s 的已知价格与 <= s-1 的持仓。
-        """
-        close_arr = np.asarray(df_grid["close"].values, dtype=np.float64)
-        n = len(close_arr)
-        realized_price_ret = np.zeros(n, dtype=np.float64)
-        if n > 1:
-            realized_price_ret[1:] = (close_arr[1:] - close_arr[:-1]) / np.maximum(close_arr[:-1], 1e-8)
+        """Build observed next-open PnL, charging turnover at its actual fill.
 
-        unit_rets: dict[str, np.ndarray] = {}
-        for uid, w_raw in unit_weights_on_grid.items():
-            w = np.asarray(w_raw, dtype=np.float64)
-            r_u = np.zeros(n, dtype=np.float64)
-            if n > 1:
-                w_prev = w[:-1]
-                w_prev2 = np.concatenate(([0.0], w[:-2])) if n > 2 else np.zeros_like(w_prev)
-                dw_prev = np.abs(w_prev - w_prev2)
-                r_u[1:] = w_prev * realized_price_ret[1:] - fee_rate * dw_prev
-            unit_rets[uid] = r_u
-        return unit_rets
+        A close decision becomes a fixed-initial-capital target at the next
+        open. Rust marks the existing quantity and charges actual traded
+        notional, including resizing needed to restore an unchanged weight.
+        No terminal liquidation is injected: a rolling history cannot know its end.
+        """
+        from czsc import execution_net_returns
+
+        if "open" not in df_grid:
+            raise ValueError("Rolling allocation requires actual open execution prices")
+        opens = df_grid["open"].to_numpy(dtype=np.float64)
+        unit_returns = {}
+        for uid, values in unit_weights_on_grid.items():
+            decisions = np.asarray(values, dtype=np.float64)
+            unit_returns[uid] = np.asarray(execution_net_returns(opens, decisions, fee_rate))
+        return unit_returns
 
     def compute_weights(
         self,

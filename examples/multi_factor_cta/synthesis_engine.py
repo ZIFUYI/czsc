@@ -5,7 +5,7 @@ r"""
 包含两级核心合成架构（Issue #7 Phase 4 升级）：
 1. 第一级（单品种内 · 六簇分层正交合成 `IntraAssetThreePillarSynthesizer` / `IntraAssetSixClusterSynthesizer`）：
    - 支柱一：六簇 × 五周期第一级簇内合成 + 第二级跨簇施密特残差正交 (`gram_schmidt_cluster_orthogonalize`)，
-     剥离战术簇对主基石簇的冗余共线成分，保证正交化后任意两簇 $|\rho(U_m, U_n)| < 0.25$；
+     在因果历史窗口拟合残差；样本外相关性需要另外检验；
    - 支柱二：六簇明确风险预算配权（支持滚动经验贝叶斯收缩 `RollingEmpiricalBayesWeighter`）+ 跨簇多空非对称反向断路器；
    - 支柱三：因果有效湍流波动率封顶调制 $\sigma_{\text{turb}} = \sigma_{15d} \cdot (1 - 0.35 \cdot ER_{5d})$
      + 非对称进出场滞回状态机 (`ContinuousSignalStateMachine`) + 截面强弱风险预算倾斜 (`apply_cross_sectional_budget_tilt`)
@@ -26,7 +26,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from czsc import WeightBacktest
 from examples.alpha_mining_agent.forensic_pipeline import IS_END_DT, apply_rebalance_deadzone
 from examples.alpha_mining_agent.hypothesis_bank import (
     ALL_ARCHETYPES,
@@ -47,75 +46,9 @@ from examples.multi_factor_cta.forensic_validator import (
     compute_rolling_empirical_bayes_weights,
 )
 
+DEFAULT_CAUSAL_ORTHO_WINDOW = 120
+
 DEFAULT_BASIS_ORDER: tuple[str, ...] = (ARCH_A, ARCH_F, ARCH_E, ARCH_D, ARCH_B, ARCH_C)
-
-
-def _orthogonalize_step_against_basis(
-    raw_v: np.ndarray,
-    basis_list: list[np.ndarray],
-    eps: float = 1e-3,
-    beta_clip: float = 4.0,
-) -> np.ndarray:
-    """
-    在给定正交基列表 `basis_list` 上剥离 `raw_v` 的冗余线性共线投影（支持软缩放与激活集中心化/非中心化双正交），
-    使输出向量在 `[-1, 1]` 内且与所有前序基向量的全样本相关与激活态并集相关均严格接近 0。
-    """
-    v = np.asarray(raw_v, dtype=np.float64).copy()
-    if len(v) == 0 or float(np.max(np.abs(v))) <= eps:
-        return np.zeros_like(v)
-    if not basis_list:
-        return np.clip(v, -1.0, 1.0)
-
-    # 第一轮：剥离主线性投影并施加双曲正切软缩放到 (-1, 1)，防止逆势信号被极端拉伸
-    for u in basis_list:
-        uu = float(np.dot(u, u))
-        if uu > eps * eps:
-            beta = float(np.clip(np.dot(v, u) / (uu + 1e-12), -beta_clip, beta_clip))
-            v = v - beta * u
-    v = np.tanh(v)
-
-    # 第二轮：消除 tanh 软缩放引入的微弱非线性残差共线性（同时保证全样本协方差与激活并集内积正交）
-    aug_basis: list[np.ndarray] = []
-    n = len(v)
-    ones_vec = np.ones(n, dtype=np.float64)
-    for u in basis_list:
-        if float(np.dot(u, u)) > 1e-12:
-            aug_basis.append(u)
-            u_centered = u - float(np.mean(u))
-            if float(np.dot(u_centered, u_centered)) > 1e-12:
-                aug_basis.append(u_centered)
-            act_u = (np.abs(u) > eps).astype(np.float64)
-            if float(np.dot(act_u, act_u)) > 1e-12:
-                aug_basis.append(act_u)
-    aug_basis.append(ones_vec)
-
-    # 构建标准正交子空间基 Q 并执行两轮 Modified Gram-Schmidt 投影剥离
-    q_list: list[np.ndarray] = []
-    for b in aug_basis:
-        q = b.copy()
-        for prev_q in q_list:
-            q = q - float(np.dot(q, prev_q)) * prev_q
-        norm_q = float(np.linalg.norm(q))
-        if norm_q > 1e-9:
-            q_list.append(q / norm_q)
-
-    # 保存原始静默零值掩码：若某簇与前序所有基均无激活重叠则保持原样
-    has_any_overlap = False
-    for u in basis_list:
-        if np.any((np.abs(v) > eps) & (np.abs(u) > eps)):
-            has_any_overlap = True
-            break
-
-    if has_any_overlap:
-        for _ in range(2):
-            for q in q_list:
-                proj = float(np.clip(np.dot(v, q), -beta_clip * np.sqrt(n), beta_clip * np.sqrt(n)))
-                v = v - proj * q
-
-    max_abs = float(np.max(np.abs(v)))
-    if max_abs > 1.0:
-        v = v / max_abs
-    return np.clip(v, -1.0, 1.0)
 
 
 def gram_schmidt_cluster_orthogonalize(
@@ -129,8 +62,8 @@ def gram_schmidt_cluster_orthogonalize(
     - 以趋势主升浪基石簇 U_1 = S^(A) 与多周期/跨品种截面共振簇 U_2 = S^(F) - proj_{U_1}(S^(F)) 为优先主正交基，
       按 `basis_order` 顺序依次对后续战术簇 S^(k) 剥离其对前序已正交化基向量 U_1, ..., U_{k-1} 的同向线性投影残差：
           U_k = S^(k) - sum_{j=1}^{k-1} β_{k,j} U_j
-    - 支持全序列激活并集正交 (`causal_window=None`) 与严格零前视因果滚动窗口正交 (`causal_window: int`)；
-    - 正交化后任意两簇之间的激活态并集相关系数与全样本相关系数严格满足 |ρ(U_m, U_n)| < 0.25。
+    - 始终使用因果滚动窗口；None 使用默认 120 根，禁止全样本拟合。
+    - 回归只用当前决策时刻已知信号，不承诺未来样本相关系数的固定上界。
     """
     if not cluster_signals:
         return {}
@@ -144,18 +77,14 @@ def gram_schmidt_cluster_orthogonalize(
     n = len(first_arr)
     ortho_out: dict[str, np.ndarray] = {}
 
-    if causal_window is None or causal_window <= 0:
-        basis_so_far: list[np.ndarray] = []
-        for idx, k in enumerate(ordered_keys):
-            s_k = np.nan_to_num(np.asarray(cluster_signals[k], dtype=np.float64), nan=0.0)
-            if idx == 0:
-                u_k = np.clip(s_k.copy(), -1.0, 1.0)
-            else:
-                u_k = _orthogonalize_step_against_basis(s_k, basis_so_far, eps=eps)
-            ortho_out[k] = u_k
-            if float(np.max(np.abs(u_k))) > eps:
-                basis_so_far.append(u_k)
-        return ortho_out
+    if causal_window is None:
+        causal_window = DEFAULT_CAUSAL_ORTHO_WINDOW
+    if causal_window <= 0:
+        raise ValueError("causal_window must be positive; full-sample fitting is not a trading path")
+    if any(len(np.asarray(cluster_signals[k])) != n for k in ordered_keys):
+        raise ValueError("All cluster signals must have the same length")
+    if n == 0:
+        return {k: np.zeros(0, dtype=np.float64) for k in ordered_keys}
 
     # 因果滚动窗口模式 (Causal Rolling Window Gram-Schmidt): 在任意时刻 t 仅使用 [max(0, t-W+1), t] 窗口内历史信号
     w_len = max(int(causal_window), 10)
@@ -204,7 +133,8 @@ class ContinuousSignalStateMachine:
        - 建仓后只要方向未反转且 |w_t| >= exit_threshold (如 0.03 < entry_threshold) 即维持持仓，
          低于 exit_threshold 时立即零延迟清仓归零；
     2. 同向微调死区与半衰期平滑：
-       - 同向微调幅度 |w_t - w_{t-1}| < rebalance_deadband (如 0.06) 时保持原仓位不交易，滤除连续强度微幅抖动；
+       - 同向微调幅度 |w_t - w_{t-1}| < rebalance_deadband (如 0.06) 时保持目标名义权重，滤除信号微幅抖动；
+         执行账本仍会按价格漂移再平衡实际数量，相关成交计费；
        - 当发生多空方向反转 (w_t * w_{t-1} < 0) 或触发清仓门限时，立即零延迟响应。
     """
 
@@ -338,7 +268,7 @@ class IntraAssetThreePillarSynthesizer:
         asset_spec: AssetSpec,
         enable_regime_gating: bool = True,
         cs_slope_rank: np.ndarray | None = None,
-        soft_gate: SoftCrossSectionalGate | bool | None = True,
+        soft_gate: SoftCrossSectionalGate | bool | None = False,
     ) -> tuple[dict[str, np.ndarray], bool, np.ndarray | None]:
         """
         第一级（簇内合成 Intra-Cluster Synthesis）：
@@ -377,7 +307,7 @@ class IntraAssetThreePillarSynthesizer:
 
         regimes = (
             self._get_causal_regimes(df_grid)
-            if (enable_regime_gating and eff_cs_rank is None and asset_spec.symbol != "SZSE.159915")
+            if (enable_regime_gating and gate_obj is not None and eff_cs_rank is None)
             else None
         )
 
@@ -435,8 +365,8 @@ class IntraAssetThreePillarSynthesizer:
         execution_mode_override: ExecutionMode | None = None,
         enable_regime_gating: bool = True,
         cs_slope_rank: np.ndarray | None = None,
-        soft_gate: SoftCrossSectionalGate | bool | None = True,
-        state_machine: ContinuousSignalStateMachine | bool | None = None,
+        soft_gate: SoftCrossSectionalGate | bool | None = False,
+        state_machine: ContinuousSignalStateMachine | bool | None = True,
         cs_strength: np.ndarray | None = None,
         tilt_Floor: float = 0.25,
         tilt_Cap: float = 1.50,
@@ -519,49 +449,51 @@ class IntraAssetThreePillarSynthesizer:
         enable_regime_gating: bool,
         rebalance_deadzone: float,
         execution_mode_override: ExecutionMode | None,
-        state_machine: ContinuousSignalStateMachine | bool | None = None,
+        state_machine: ContinuousSignalStateMachine | bool | None = True,
         cs_strength: np.ndarray | None = None,
         tilt_Floor: float = 0.25,
         tilt_Cap: float = 1.50,
     ) -> np.ndarray:
         u_a = cluster_map[ARCH_A] * self.cluster_risk_budgets.get(ARCH_A, 1.0)
-        if not has_ortho:
-            w_multi = np.clip(u_a, -1.0, 1.0)
+        is_commodity = asset_spec.asset_class == AssetClass.COMMODITY_FUTURES
+        if is_commodity and eff_cs_rank is not None:
+            b_long, b_short = 0.25, 0.25
+            bcd_mult = 0.85
+        elif is_commodity and enable_regime_gating:
+            b_long, b_short = 0.15, 0.15
+            bcd_mult = 0.35
+        elif is_commodity:
+            b_long, b_short = 0.40, 0.40
+            bcd_mult = 1.25
         else:
-            is_commodity = asset_spec.asset_class == AssetClass.COMMODITY_FUTURES
-            if is_commodity and eff_cs_rank is not None:
-                b_long, b_short = 0.25, 0.25
-                bcd_mult = 0.85
-            elif is_commodity and enable_regime_gating:
-                b_long, b_short = 0.15, 0.15
-                bcd_mult = 0.35
-            elif is_commodity:
-                b_long, b_short = 0.40, 0.40
-                bcd_mult = 1.25
-            else:
-                b_long, b_short = 0.35, 0.50
-                bcd_mult = 1.25
+            b_long, b_short = 0.35, 0.50
+            bcd_mult = 1.25
 
-            tactical_total = np.zeros(len(df_grid), dtype=np.float64)
-            rev_pos = np.zeros(len(df_grid), dtype=np.float64)
-            rev_neg = np.zeros(len(df_grid), dtype=np.float64)
-            for arch in (ARCH_B, ARCH_C, ARCH_D, ARCH_E, ARCH_F):
-                u_k = cluster_map[arch] * self.cluster_risk_budgets.get(arch, 1.0)
-                tactical_total += u_k
-                rev_pos += np.maximum(u_k, 0.0)
-                rev_neg += np.minimum(u_k, 0.0)
+        tactical_total = np.zeros(len(df_grid), dtype=np.float64)
+        rev_pos = np.zeros(len(df_grid), dtype=np.float64)
+        rev_neg = np.zeros(len(df_grid), dtype=np.float64)
+        for arch in (ARCH_B, ARCH_C, ARCH_D, ARCH_E, ARCH_F):
+            u_k = cluster_map[arch] * self.cluster_risk_budgets.get(arch, 1.0)
+            tactical_total += u_k
+            rev_pos += np.maximum(u_k, 0.0)
+            rev_neg += np.minimum(u_k, 0.0)
 
-            tactical_total = np.clip(tactical_total, -1.5, 1.5)
-            w_a_gated = u_a.copy()
-            long_mask = w_a_gated > 0.0
-            short_mask = w_a_gated < 0.0
-            w_a_gated[long_mask] *= np.clip(1.0 - b_long * np.abs(rev_neg[long_mask]), 0.15, 1.0)
-            w_a_gated[short_mask] *= np.clip(1.0 - b_short * rev_pos[short_mask], 0.15, 1.0)
+        tactical_total = np.clip(tactical_total, -1.5, 1.5)
+        w_a_gated = u_a.copy()
+        long_mask = w_a_gated > 0.0
+        short_mask = w_a_gated < 0.0
+        w_a_gated[long_mask] *= np.clip(1.0 - b_long * np.abs(rev_neg[long_mask]), 0.15, 1.0)
+        w_a_gated[short_mask] *= np.clip(1.0 - b_short * rev_pos[short_mask], 0.15, 1.0)
 
-            w_raw = w_a_gated + bcd_mult * tactical_total
+        w_raw = w_a_gated + bcd_mult * tactical_total
 
-            vol_cap = self._get_causal_turbulence_cap(df_grid, asset_spec.base_tf)
-            w_multi = np.clip(w_raw * np.sqrt(vol_cap), -vol_cap, vol_cap)
+        vol_cap = self._get_causal_turbulence_cap(df_grid, asset_spec.base_tf)
+        w_multi = np.clip(w_raw * np.sqrt(vol_cap), -vol_cap, vol_cap)
+
+        tactical_active = np.zeros(len(df_grid), dtype=bool)
+        for arch in (ARCH_B, ARCH_C, ARCH_D, ARCH_E, ARCH_F):
+            tactical_active |= np.abs(cluster_map[arch]) > 1e-6
+        w_multi = np.where(tactical_active, w_multi, np.clip(u_a, -1.0, 1.0))
 
         if cs_strength is not None:
             w_multi = apply_cross_sectional_budget_tilt(
@@ -594,10 +526,10 @@ class IntraAssetThreePillarSynthesizer:
         execution_mode_override: ExecutionMode | None = None,
         enable_regime_gating: bool = True,
         cs_slope_rank: np.ndarray | None = None,
-        soft_gate: SoftCrossSectionalGate | bool | None = True,
+        soft_gate: SoftCrossSectionalGate | bool | None = False,
         enable_gram_schmidt: bool = True,
         causal_ortho_window: int | None = None,
-        state_machine: ContinuousSignalStateMachine | bool | None = None,
+        state_machine: ContinuousSignalStateMachine | bool | None = True,
         cs_strength: np.ndarray | None = None,
         tilt_Floor: float = 0.25,
         tilt_Cap: float = 1.50,
@@ -649,44 +581,34 @@ class IntraAssetThreePillarSynthesizer:
 
     @staticmethod
     def _get_causal_regimes(df_grid: pd.DataFrame) -> np.ndarray:
-        n = len(df_grid)
-        cached = df_grid.attrs.get("_cached_regimes")
-        if cached is not None and len(cached) == n:
-            return cached
         from examples.multi_factor_cta.forensic_validator import classify_causal_market_regime
 
         regs = classify_causal_market_regime(df_grid, er_window=30, er_th=0.30)
-        df_grid.attrs["_cached_regimes"] = regs
         return regs
 
     @staticmethod
     def _get_causal_turbulence_cap(df_grid: pd.DataFrame, base_tf: str) -> np.ndarray:
-        n = len(df_grid)
-        cached = df_grid.attrs.get("_cached_vol_cap")
-        if cached is not None and len(cached) == n:
-            return cached
 
-        bars_per_day = {"5m": 48, "15m": 16, "30m": 8, "60m": 4}.get(base_tf, 16)
+        bars_per_day = {"5m": 48, "15m": 16, "30m": 8, "60m": 4, "1d": 1}.get(base_tf, 16)
         w_15d = max(20, 15 * bars_per_day)
         w_5d = max(10, 5 * bars_per_day)
 
         close_arr = df_grid["close"].values
         ret_b = pd.Series(close_arr).pct_change().fillna(0.0).values
-        vol_15d = pd.Series(ret_b).rolling(w_15d, min_periods=bars_per_day).std().bfill().values * np.sqrt(
-            bars_per_day * 242.0
-        )
+        vol_15d = pd.Series(ret_b).rolling(w_15d, min_periods=bars_per_day).std().fillna(
+            0.28 / np.sqrt(bars_per_day * 242.0)
+        ).values * np.sqrt(bars_per_day * 242.0)
         net_chg_5d = np.abs(pd.Series(close_arr).diff(w_5d).fillna(0.0).values)
         abs_path_5d = (
             pd.Series(np.abs(np.diff(close_arr, prepend=close_arr[0])))
             .rolling(w_5d, min_periods=bars_per_day)
             .sum()
-            .bfill()
+            .fillna(0.0)
             .values
         )
         er_5d = np.clip(net_chg_5d / np.maximum(abs_path_5d, 1e-6), 0.0, 1.0)
         turb_vol = vol_15d * (1.0 - 0.35 * er_5d)
         vol_cap = np.clip(0.28 / np.maximum(turb_vol, 0.28), 0.72, 1.0)
-        df_grid.attrs["_cached_vol_cap"] = vol_cap
         return vol_cap
 
     @staticmethod
@@ -733,7 +655,9 @@ def joint_is_coordinate_reweight(
     """
     is_mask = (df_grid["dt"] <= is_end_dt).values
     mid_dt = pd.Timestamp("2021-12-31 23:59:59")
-    h1_mask = (df_grid["dt"] <= mid_dt).values
+    if int(is_mask.sum()) < 2:
+        raise ValueError("IS coordinate selection requires at least two training bars")
+    h1_mask = (df_grid["dt"] <= mid_dt).values & is_mask
     h2_mask = ((df_grid["dt"] > mid_dt) & (df_grid["dt"] <= is_end_dt)).values
     if int(h1_mask.sum()) < 100 or int(h2_mask.sum()) < 100:
         # 若品种起点较晚 (如 2021 起)，按样本内中位时间点切分 H1/H2
@@ -743,27 +667,14 @@ def joint_is_coordinate_reweight(
         h2_mask = (df_grid["dt"].values > mid_val) & is_mask
 
     def _prep_slice(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        sub = df_grid.iloc[mask].reset_index(drop=True)
-        c = sub["close"].values
-        r = np.zeros(len(c), dtype=np.float64)
-        r[:-1] = (c[1:] - c[:-1]) / c[:-1]
-        _, dids = np.unique(pd.to_datetime(sub["dt"]).dt.date.values, return_inverse=True)
-        return r, dids
+        from examples.alpha_mining_agent.forensic_pipeline import _prepare_next_open_slice
 
-    def _fast_stats(close_ret: np.ndarray, day_ids: np.ndarray, w_slice: np.ndarray) -> dict[str, float]:
-        dw = np.abs(np.diff(w_slice, prepend=0.0))
-        bar_net = w_slice * close_ret - dw * asset_spec.fee_rate
-        daily_net = np.bincount(day_ids, weights=bar_net)
-        cum_ret = float(daily_net.sum() * 100.0)
-        n_years = len(daily_net) / 252.0
-        ann_ret = float(cum_ret / max(n_years, 1e-6))
-        std_d = float(daily_net.std(ddof=1)) if len(daily_net) > 1 else 0.0
-        sharpe = float((daily_net.mean() / std_d) * np.sqrt(252.0)) if std_d > 1e-12 else 0.0
-        curve = np.cumsum(daily_net)
-        peak = np.maximum.accumulate(np.maximum(curve, 0.0))
-        mdd = float((peak - curve).max() * 100.0)
-        calmar = float(ann_ret / mdd) if mdd > 1e-6 else 0.0
-        return {"cum_ret_pct": cum_ret, "ann_ret_pct": ann_ret, "sharpe": sharpe, "mdd_pct": mdd, "calmar": calmar}
+        return _prepare_next_open_slice(df_grid.loc[mask].reset_index(drop=True))
+
+    def _fast_stats(interval_ret: np.ndarray, day_ids: np.ndarray, w_slice: np.ndarray) -> dict[str, float]:
+        from examples.alpha_mining_agent.forensic_pipeline import _fast_next_open_slice_stats
+
+        return _fast_next_open_slice_stats(interval_ret, day_ids, w_slice, fee_rate=asset_spec.fee_rate)
 
     ret_is, dids_is = _prep_slice(is_mask)
     ret_h1, dids_h1 = _prep_slice(h1_mask)
@@ -798,10 +709,12 @@ def joint_is_coordinate_reweight(
     base_budget = sum(initial_alloc.values())
 
     def _eval(alloc: dict[str, float]) -> tuple[float, dict, dict, dict]:
-        w_full = synthesizer.synthesize(df_grid, unit_weights_on_grid, alloc, asset_spec)
-        s_is = _fast_stats(ret_is, dids_is, w_full[is_mask])
-        s_h1 = _fast_stats(ret_h1, dids_h1, w_full[h1_mask])
-        s_h2 = _fast_stats(ret_h2, dids_h2, w_full[h2_mask])
+        train_grid = df_grid.loc[is_mask].reset_index(drop=True)
+        train_weights = {uid: np.asarray(w)[is_mask] for uid, w in unit_weights_on_grid.items()}
+        w_train = synthesizer.synthesize(train_grid, train_weights, alloc, asset_spec)
+        s_is = _fast_stats(ret_is, dids_is, w_train)
+        s_h1 = _fast_stats(ret_h1, dids_h1, w_train[h1_mask[is_mask]])
+        s_h2 = _fast_stats(ret_h2, dids_h2, w_train[h2_mask[is_mask]])
         l2_pen = sum((alloc[u] - eb_prior[u]) ** 2 for u in alloc)
         min_sh = min(s_h1["sharpe"], s_h2["sharpe"])
         obj = (
@@ -906,6 +819,105 @@ def _project_capped_simplex_row(
     return out
 
 
+def build_asset_execution_inputs(
+    df_grid: pd.DataFrame,
+    signed_targets: np.ndarray,
+    *,
+    execution_clock: str = "next_open",
+    liquidate_at_end: bool = True,
+) -> tuple[pd.Series, pd.Series]:
+    """Align close decisions to next-open fills, then mark/liquidate at the last close.
+
+    Bar labels identify their opening executions; the last close is an accounting
+    mark one microsecond after the final label, with no invented future price.
+    A live target snapshot may explicitly request ``close`` and no liquidation;
+    those targets are prospective and must not be used to claim next-open PnL.
+    """
+    index = pd.DatetimeIndex(pd.to_datetime(df_grid["dt"]))
+    if index.has_duplicates or not index.is_monotonic_increasing or len(index) != len(signed_targets):
+        raise ValueError("Execution bars must be ordered, unique and aligned with signed targets")
+    if execution_clock not in {"next_open", "close"}:
+        raise ValueError("execution_clock must be next_open or close")
+    targets = pd.Series(signed_targets, index=index, dtype=float)
+    if not np.isfinite(targets).all():
+        raise ValueError("Signed targets must be finite")
+    price_col = "open" if execution_clock == "next_open" else "close"
+    price = pd.Series(df_grid[price_col].to_numpy(dtype=float), index=index)
+    if not np.isfinite(price).all() or (price <= 0).any():
+        raise ValueError("Execution prices must be finite and positive")
+    if execution_clock == "next_open":
+        targets = targets.shift(1).fillna(0.0)
+    if len(index) and liquidate_at_end:
+        terminal = index[-1] + pd.Timedelta(microseconds=1)
+        last_close = float(df_grid["close"].iloc[-1])
+        if not np.isfinite(last_close) or last_close <= 0:
+            raise ValueError("The terminal close must be finite and positive")
+        price.loc[terminal] = last_close
+        targets.loc[terminal] = 0.0
+    returns = price.pct_change(fill_method=None).fillna(0.0)
+    returns.attrs["execution_clock"] = targets.attrs["execution_clock"] = execution_clock
+    return returns, targets
+
+
+def account_portfolio_execution(
+    price_returns: pd.DataFrame,
+    signed_weights: pd.DataFrame,
+    asset_fee_rates: dict[str, float],
+    *,
+    tradable_mask: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    """Convert labeled panels to the shared Rust fixed-initial-capital execution ledger.
+
+    Returns and weights must already share the same execution timestamps: the previous
+    quantity earns the interval ending at t, then the target restores its notional weight
+    against initial capital. Unchanged targets can therefore require real trades after
+    a price move. Rust charges fees on the absolute traded quantity at the execution price.
+    ``tradable_mask=False`` freezes quantity; missing quotes must carry zero price return
+    and preserve the previously executed weight. Rust rejects inconsistent targets.
+    A zero target liquidates at that timestamp and still pays its exit fee. A nonzero
+    final target remains open unless the caller supplies an explicit liquidation mark.
+    Calendar-day aggregation keeps the original timestamps (including night sessions).
+    """
+    from czsc import executed_weight_ledger
+
+    if not price_returns.index.equals(signed_weights.index) or not price_returns.columns.equals(signed_weights.columns):
+        raise ValueError("Price returns and final weights must be exactly aligned")
+    if tradable_mask is not None and (
+        not tradable_mask.index.equals(price_returns.index) or not tradable_mask.columns.equals(price_returns.columns)
+    ):
+        raise ValueError("Tradable mask and price returns must be exactly aligned")
+    fees = pd.Series(asset_fee_rates, dtype=float).reindex(price_returns.columns)
+    ledgers = {
+        symbol: executed_weight_ledger(
+            price_returns[symbol].to_list(),
+            signed_weights[symbol].to_list(),
+            fee_rate=float(fees[symbol]),
+            tradable=None if tradable_mask is None else tradable_mask[symbol].to_list(),
+        )
+        for symbol in price_returns.columns
+    }
+
+    def panel(field: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            {symbol: getattr(ledger, field) for symbol, ledger in ledgers.items()}, index=price_returns.index
+        )
+
+    gross = panel("gross_returns")
+    turnover = panel("turnover")
+    costs = panel("cost_returns")
+    net = panel("net_returns").sum(axis=1).rename("net_return")
+    daily = net.groupby(net.index.normalize()).sum()
+    return {
+        "daily_returns": daily,
+        "bar_net_returns": net,
+        "gross_returns_df": gross,
+        "cost_returns_df": costs,
+        "turnover_df": turnover,
+        "pretrade_weights_df": panel("pretrade_weights"),
+        "executed_weights_df": panel("executed_weights"),
+    }
+
+
 class CrossAssetHRPSynthesizer:
     """
     跨品种（股指期货 + ETF + 商品期货）动态活跃池分配 ($1/N_{active}$) 与三层因果风险平价组合构建器
@@ -948,6 +960,10 @@ class CrossAssetHRPSynthesizer:
         is_end_date: pd.Timestamp = IS_END_DT,
         *,
         asset_positions_df: dict[str, pd.Series] | pd.DataFrame | None = None,
+        asset_fee_rates: dict[str, float] | None = None,
+        returns_kind: str | None = None,
+        positions_timing: str | None = None,
+        periods_per_year: float = 252.0,
         asset_cs_strength_df: dict[str, pd.Series] | pd.DataFrame | None = None,
         asset_atr_pct_df: dict[str, pd.Series] | pd.DataFrame | None = None,
         use_dynamic_active_pool: bool = True,
@@ -958,22 +974,37 @@ class CrossAssetHRPSynthesizer:
         tilt_Floor: float = 0.25,
         tilt_Cap: float = 1.50,
     ) -> dict[str, Any]:
-        r"""
-        基于各品种单品种策略日净值收益率序列与可选的时序持仓/截面强弱序列，按严格零前视的三层因果风险预算闭环：
-        1. 动态活跃池识别 ($1 / N_{active, t}$)：
-           区分“已上市但当前空仓静默 (|W_{i,t}| <= eps)”与“当前有实际非零信号激活 (|W_{i,t}| > eps)”的品种集合 A_t，
-           消除空仓品种占用分母造成的现金拖累 (Cash Drag)，并执行单品种上限 `max_single_asset_weight` (默认 0.35)
-           与最低活跃品种数保底 `min_effective_assets` (默认 3)；
-        2. 第一层（因果 ATR / 收益率逆波动率平价）：
-           基于严格 `shift(1)` 的 60 日因果滚动波动率（或因果 `atr14 / close`），对每个激活品种分配逆波动率基准权重；
-        3. 第二层（板块内去拥挤 $1/\sqrt{K_{s,t}}$ 与板块间分层风险平价 Sector HRP）：
-           按当前时刻同板块实际激活品种数 $K_{s,t}$ 动态施加 $1/\sqrt{K_{s,t}}$ 折减，并结合板块间因果逆波动率/低相关配权；
-        4. 第三层（截面强弱风险预算倾斜 + 组合目标波动率 $\sigma_{target}$ + 调仓死区）。
+        """Build a ledger from raw price returns and aligned signed execution targets.
+
+        ``asset_daily_returns`` retains its historical name but contains fill-to-fill
+        price returns, never fee-paid sleeve returns. With ``positions_timing="execution"``,
+        targets have already been aligned to their fills (for example, next-open decisions
+        prepared by ``build_asset_execution_inputs``). ``positions_timing="close"`` explicitly
+        identifies a close-execution clock. Neither mode shifts targets inside this method.
+        Every tradable mark restores target notional against fixed initial capital; the
+        shared Rust ledger charges actual traded quantity, including price drift at an
+        unchanged target. An explicit zero target closes terminal inventory.
+        Risk data is lagged; warmup uses fixed priors. Aggregate daily statistics after accounting.
         """
-        raw_df = pd.DataFrame(asset_daily_returns).sort_index()
+        if returns_kind != "price" or positions_timing not in {"close", "execution"}:
+            raise ValueError("Explicit returns_kind='price' and positions_timing='close' or 'execution' are required")
+        if asset_positions_df is None or asset_fee_rates is None:
+            raise ValueError("Signed asset_positions_df and per-asset single-side asset_fee_rates are required")
+        if not np.isfinite(periods_per_year) or periods_per_year <= 0:
+            raise ValueError("periods_per_year must be positive")
+        raw_df = pd.DataFrame(asset_daily_returns).copy()
         raw_df.index = pd.to_datetime(raw_df.index)
+        raw_df = raw_df.sort_index()
+        if raw_df.empty or raw_df.index.has_duplicates:
+            raise ValueError("Price returns must have a nonempty unique timestamp index")
+        if np.isinf(raw_df.to_numpy(dtype=float)).any():
+            raise ValueError("Price returns must be finite where observed")
         listed_mask = raw_df.notna().astype(np.float64)
         ret_df = raw_df.fillna(0.0).astype(np.float64)
+        ann_scale = np.sqrt(periods_per_year)
+        bars_per_day = max(int(round(periods_per_year / 252.0)), 1)
+        risk_window = 60 * bars_per_day
+        risk_min_periods = 10 * bars_per_day
 
         eff_max_w = float(
             max_single_asset_weight if max_single_asset_weight is not None else self.max_single_asset_weight
@@ -984,37 +1015,33 @@ class CrossAssetHRPSynthesizer:
         eff_eps = float(active_eps if active_eps is not None else self.active_eps)
         eff_deadzone = float(rebalance_deadzone if rebalance_deadzone is not None else self.rebalance_deadzone)
 
-        pos_df = self._align_optional_panel(asset_positions_df, ret_df.index, ret_df.columns, fill_val=0.0)
+        raw_positions = pd.DataFrame(asset_positions_df).copy()
+        raw_positions.index = pd.to_datetime(raw_positions.index)
+        raw_positions = raw_positions.reindex(index=ret_df.index, columns=ret_df.columns)
+        if (raw_df.notna() & raw_positions.isna()).any().any():
+            raise ValueError("Every observed price bar needs an explicit signed target position")
+        pos_df = raw_positions.fillna(0.0).astype(float)
         cs_df = self._align_optional_panel(asset_cs_strength_df, ret_df.index, ret_df.columns, fill_val=0.0)
         atr_df = self._align_optional_panel(asset_atr_pct_df, ret_df.index, ret_df.columns, fill_val=np.nan)
 
-        # 0. 基准对比：静态在市品种等权组合 (Static Listed Equal-Weight 1 / N_{total, t})
+        assert pos_df is not None
+        if not np.isfinite(pos_df.to_numpy()).all() or (pos_df.abs() > 1.0 + 1e-12).any().any():
+            raise ValueError("Signed signal positions must be finite and within [-1, 1]")
+        fees = pd.Series(asset_fee_rates, dtype=float).reindex(ret_df.columns)
+        if fees.isna().any() or (~np.isfinite(fees)).any() or (fees < 0).any():
+            raise ValueError("Every asset requires a finite nonnegative single-side fee")
         eq_weights = listed_mask.div(listed_mask.sum(axis=1).replace(0.0, np.nan), axis=0).fillna(0.0)
-        eq_daily_ret = (ret_df * eq_weights).sum(axis=1)
+        active_mask = ((pos_df.abs() > eff_eps) & (listed_mask > 0.0)).astype(float)
+        allocation_mask = active_mask if use_dynamic_active_pool else listed_mask
 
-        # 动态活跃池掩码 A_t = {i | |W_{i,t}| > eps}
-        if use_dynamic_active_pool:
-            if pos_df is not None:
-                active_mask = ((pos_df.abs() > eff_eps) & (listed_mask > 0.0)).astype(np.float64)
-            else:
-                active_from_ret = ((ret_df.abs() > min(eff_eps * 1e-2, 1e-6)) & (listed_mask > 0.0)).astype(np.float64)
-                # 若某日所有在市品种收益均为 0，回退为 listed_mask 避免分母全空
-                row_any = active_from_ret.sum(axis=1) > 0.0
-                active_mask = active_from_ret.where(row_any, listed_mask, axis=0)
-        else:
-            active_mask = listed_mask.copy()
-
-        # 1. 第一层：因果 60 日滚动波动率 / ATR 逆波动率平价 (严格 shift(1) 零前视)
-        # 在计算活跃品种条件波动率时，剔除空仓静默 0 收益日的稀释效应
-        active_ret_for_vol = raw_df.where(raw_df.abs() > 1e-8, np.nan)
-        cond_vol = active_ret_for_vol.rolling(60, min_periods=5).std().shift(1) * np.sqrt(252.0)
-        uncond_vol = raw_df.rolling(60, min_periods=10).std().shift(1) * np.sqrt(252.0)
-        roll_vol = cond_vol.fillna(uncond_vol).bfill().ffill().fillna(0.15)
+        # Zero price returns are observations, not evidence of an inactive strategy.
+        roll_vol = raw_df.rolling(risk_window, min_periods=risk_min_periods).std().shift(1) * ann_scale
+        roll_vol = roll_vol.ffill().fillna(0.15)
         if atr_df is not None:
-            causal_atr_vol = (atr_df.shift(1).bfill().ffill() * np.sqrt(252.0)).fillna(roll_vol)
+            causal_atr_vol = (atr_df.shift(1).ffill() * ann_scale).fillna(roll_vol)
             roll_vol = 0.50 * roll_vol + 0.50 * causal_atr_vol
 
-        inv_vol = (1.0 / np.maximum(roll_vol, 0.05)) * active_mask
+        inv_vol = (1.0 / np.maximum(roll_vol, 0.05)) * allocation_mask
 
         # 2. 第二层：动态板块内去拥挤 (1 / sqrt(K_{s,t})) 与板块间因果分层风险平价 (Sector HRP)
         sectors: dict[str, list[str]] = {}
@@ -1030,10 +1057,14 @@ class CrossAssetHRPSynthesizer:
         sector_inv_vol: dict[str, pd.Series] = {}
 
         for sec, syms in sectors.items():
-            k_s_t = active_mask[syms].sum(axis=1)
+            k_s_t = allocation_mask[syms].sum(axis=1)
             sector_active_counts[sec] = k_s_t
-            sec_ret = ret_df[syms].mean(axis=1)
-            sec_vol = sec_ret.rolling(60, min_periods=10).std().shift(1).bfill().ffill().fillna(0.12) * np.sqrt(252.0)
+            sec_ret = raw_df[syms].mean(axis=1, skipna=True)
+            sec_vol = (
+                (sec_ret.rolling(risk_window, min_periods=risk_min_periods).std().shift(1) * ann_scale)
+                .ffill()
+                .fillna(0.12)
+            )
             sector_inv_vol[sec] = (1.0 / np.maximum(sec_vol, 0.05)) * (k_s_t > 0.0).astype(np.float64)
 
         sec_inv_vol_df = pd.DataFrame(sector_inv_vol, index=ret_df.index)
@@ -1048,7 +1079,7 @@ class CrossAssetHRPSynthesizer:
             for sym in syms:
                 sector_mult_df[sym] = sec_factor
 
-        raw_alloc = inv_vol * sector_mult_df * active_mask
+        raw_alloc = inv_vol * sector_mult_df * allocation_mask
 
         # 3. 第三层：跨品种截面强弱风险预算倾斜 (Cross-Sectional Budget Tilt)
         if cs_df is not None:
@@ -1057,8 +1088,7 @@ class CrossAssetHRPSynthesizer:
                 r_str = np.clip(cs_df[col].to_numpy(dtype=np.float64), -1.0, 1.0)
                 if pos_df is not None:
                     w_dir = np.sign(pos_df[col].to_numpy(dtype=np.float64))
-                    # 若当日持仓方向未定但有收益，回退为正顺势度
-                    r_eff = np.where(w_dir != 0.0, w_dir * r_str, r_str)
+                    r_eff = w_dir * r_str
                 else:
                     r_eff = r_str
                 cs_tilt_df[col] = np.clip(0.5 + 0.5 * (1.0 + r_eff), float(tilt_Floor), float(tilt_Cap))
@@ -1069,10 +1099,10 @@ class CrossAssetHRPSynthesizer:
         n_rows, n_cols = raw_alloc.shape
         alloc_mat = np.zeros((n_rows, n_cols), dtype=np.float64)
         raw_mat = raw_alloc.to_numpy(dtype=np.float64)
-        act_mat = active_mask.to_numpy(dtype=np.float64)
+        act_mat = allocation_mask.to_numpy(dtype=np.float64)
 
         for t_idx in range(n_rows):
-            n_act = float(n_active_series.iloc[t_idx])
+            n_act = float(allocation_mask.iloc[t_idx].sum())
             if n_act <= 0.0:
                 continue
             # 当活跃品种数 >= min_effective_assets 时满额分配 1.0；当仅 1~2 个品种激活时按 n_act / min_effective_assets 保底防单票满仓赌博
@@ -1084,31 +1114,77 @@ class CrossAssetHRPSynthesizer:
                 max_weight=eff_max_w,
             )
 
-        if eff_deadzone > 0.0:
-            for c_idx in range(n_cols):
-                alloc_mat[:, c_idx] = np.clip(
-                    apply_rebalance_deadzone(alloc_mat[:, c_idx], deadzone=eff_deadzone),
-                    0.0,
-                    eff_max_w,
-                )
-
         alloc_weights = pd.DataFrame(alloc_mat, index=ret_df.index, columns=ret_df.columns)
-
-        # 因果组合级波动率目标缩放 (严格 shift(1) 零前视，并严守单品种权重上限 <= eff_max_w)
-        unscaled_port_ret = (ret_df * alloc_weights).sum(axis=1)
-        port_roll_vol = unscaled_port_ret.rolling(40, min_periods=15).std().shift(1).bfill().ffill() * np.sqrt(252.0)
-        lev_scalar = np.clip(
-            self.target_portfolio_vol / np.maximum(port_roll_vol.fillna(self.target_portfolio_vol), 0.05), 0.70, 1.65
+        unscaled_positions = alloc_weights * pos_df
+        unscaled_gross = account_portfolio_execution(
+            ret_df,
+            unscaled_positions.where(raw_df.notna()).ffill().fillna(0.0),
+            dict.fromkeys(ret_df.columns, 0.0),
+            tradable_mask=raw_df.notna(),
+        )["bar_net_returns"]
+        port_roll_vol = unscaled_gross.rolling(40 * bars_per_day, min_periods=15 * bars_per_day).std().shift(1)
+        active_exp_bars = (
+            (unscaled_positions.abs().sum(axis=1) > 1e-12)
+            .astype(np.float64)
+            .rolling(40 * bars_per_day, min_periods=1)
+            .sum()
+            .shift(1)
+            .fillna(0.0)
         )
+        port_roll_vol = port_roll_vol.where(active_exp_bars >= float(15 * bars_per_day))
+        port_roll_vol = (port_roll_vol * ann_scale).ffill().fillna(self.target_portfolio_vol)
+        lev_scalar = np.clip(self.target_portfolio_vol / np.maximum(port_roll_vol, 0.05), 0.0, 1.65)
+        budget_weights = alloc_weights.multiply(lev_scalar, axis=0).clip(lower=0.0, upper=eff_max_w)
+        final_weights_df = budget_weights * pos_df
 
-        final_weights_df = alloc_weights.multiply(lev_scalar, axis=0).clip(lower=0.0, upper=eff_max_w)
-        port_daily_ret = (ret_df * final_weights_df).sum(axis=1)
+        # Missing quotes keep the last observed price: freezing its marked weight thus
+        # freezes quantity, and that inventory still consumes the current gross budget.
+        def _reserve_frozen(target, previous, tradable, gross_budget):
+            target = target.copy()
+            target[~tradable] = previous[~tradable]
+            frozen = float(np.abs(previous[~tradable]).sum())
+            available = max(0.0, float(gross_budget) - frozen)
+            proposed = float(np.abs(target[tradable]).sum())
+            if proposed > available and proposed > 0:
+                target[tradable] *= available / proposed
+            return target, frozen, max(0.0, frozen - float(gross_budget))
+
+        budget_fraction = allocation_mask.sum(axis=1).div(eff_min_assets).clip(upper=1.0)
+        if not use_dynamic_active_pool:
+            budget_fraction[:] = 1.0
+        gross_budget_series = budget_fraction * lev_scalar
+        final_mat = final_weights_df.to_numpy().copy()
+        observed = raw_df.notna().to_numpy()
+        frozen_gross = np.zeros(n_rows)
+        untradable_excess = np.zeros(n_rows)
+        prev = np.zeros(n_cols)
+        for t_idx in range(n_rows):
+            target = final_mat[t_idx]
+            same_direction = target * prev > 0.0
+            keep = same_direction & (np.abs(target) >= np.abs(prev)) & (np.abs(target - prev) < eff_deadzone)
+            target[keep] = prev[keep]
+            target, frozen_gross[t_idx], untradable_excess[t_idx] = _reserve_frozen(
+                target, prev, observed[t_idx], gross_budget_series.iloc[t_idx]
+            )
+            final_mat[t_idx] = np.clip(target, -eff_max_w, eff_max_w)
+            prev = final_mat[t_idx].copy()
+        final_weights_df = pd.DataFrame(final_mat, index=ret_df.index, columns=ret_df.columns)
+        ledger = account_portfolio_execution(ret_df, final_weights_df, asset_fee_rates, tradable_mask=raw_df.notna())
+        eq_mat = (eq_weights * pos_df).to_numpy()
+        prev = np.zeros(n_cols)
+        for t_idx in range(n_rows):
+            eq_mat[t_idx], _, _ = _reserve_frozen(eq_mat[t_idx], prev, observed[t_idx], 1.0)
+            prev = eq_mat[t_idx].copy()
+        eq_positions = pd.DataFrame(eq_mat, index=ret_df.index, columns=ret_df.columns)
+        eq_ledger = account_portfolio_execution(ret_df, eq_positions, asset_fee_rates, tradable_mask=raw_df.notna())
+        port_daily_ret = ledger["daily_returns"]
+        eq_daily_ret = eq_ledger["daily_returns"]
 
         # 统计有效资金利用率 (Active Capital Utilization Ratio)
         any_active_days = n_active_series > 0
         if bool(any_active_days.any()):
             dyn_util = float((alloc_weights * active_mask).sum(axis=1).loc[any_active_days].mean())
-            final_util = float((final_weights_df * active_mask).sum(axis=1).loc[any_active_days].mean())
+            final_util = float((final_weights_df.abs() * active_mask).sum(axis=1).loc[any_active_days].mean())
             static_util = float((eq_weights * active_mask).sum(axis=1).loc[any_active_days].mean())
         else:
             dyn_util = final_util = static_util = 0.0
@@ -1117,7 +1193,12 @@ class CrossAssetHRPSynthesizer:
         oos_mask = port_daily_ret.index > pd.Timestamp(is_end_date.date())
 
         return {
-            "daily_returns": port_daily_ret,
+            **ledger,
+            "budget_weights_df": budget_weights,
+            "target_gross_budget": gross_budget_series,
+            "frozen_gross_exposure": pd.Series(frozen_gross, index=ret_df.index),
+            "untradable_budget_excess": pd.Series(untradable_excess, index=ret_df.index),
+            "equal_weight_positions_df": eq_positions,
             "equal_weight_returns": eq_daily_ret,
             "equal_weights_df": eq_weights,
             "unscaled_hrp_weights_df": alloc_weights,
@@ -1128,7 +1209,7 @@ class CrossAssetHRPSynthesizer:
             "final_active_capital_utilization_ratio": round(final_util, 4),
             "static_active_capital_utilization_ratio": round(static_util, 4),
             "utilization_lift_ratio": round(dyn_util / max(static_util, 1e-6), 4) if static_util > 0 else 1.0,
-            "max_single_asset_weight_realized": round(float(final_weights_df.max().max()), 4)
+            "max_single_asset_weight_realized": round(float(final_weights_df.abs().max().max()), 4)
             if not final_weights_df.empty
             else 0.0,
             "full": self._calc_return_series_stats(port_daily_ret),
@@ -1194,60 +1275,30 @@ def evaluate_single_asset_backtest(
     fee_rate: float = 0.0002,
     is_end_dt: pd.Timestamp = IS_END_DT,
 ) -> dict[str, Any]:
-    """调用 czsc.WeightBacktest 评估单品种 IS / OOS / Full 表现并返回日收益序列"""
+    """Reuse the admission runner's next-open ledger with charged terminal liquidation.
 
-    def _run_slice(sub_df: pd.DataFrame, sub_w: np.ndarray) -> tuple[dict[str, float], pd.Series]:
-        if len(sub_df) < 10:
-            return (
-                {
-                    "cum_ret_pct": 0.0,
-                    "ann_ret_pct": 0.0,
-                    "sharpe": 0.0,
-                    "mdd_pct": 0.0,
-                    "calmar": 0.0,
-                    "active_pct": 0.0,
-                },
-                pd.Series(dtype=np.float64),
-            )
-        dfw = pd.DataFrame(
-            {
-                "dt": sub_df["dt"].astype(str),
-                "symbol": symbol,
-                "weight": sub_w,
-                "price": sub_df["close"].values,
-            }
-        )
-        wb = WeightBacktest(data=dfw, fee_rate=fee_rate, weight_type="ts")
-        st = wb.stats
-        dr = wb.daily_return.copy()
-        dts = pd.to_datetime(dr["date"])
-        wk = dts.dt.weekday
-        shift_d = np.where(wk == 5, 2, np.where(wk == 6, 1, 0))
-        dr["date"] = dts + pd.to_timedelta(shift_d, unit="D")
-        s_dr = dr.groupby("date")["total"].sum()
-        return (
-            {
-                "cum_ret_pct": round(float(st.get("绝对收益", 0.0) * 100.0), 2),
-                "ann_ret_pct": round(float(st.get("年化收益", 0.0) * 100.0), 2),
-                "sharpe": round(float(st.get("夏普比率", 0.0)), 2),
-                "mdd_pct": round(float(st.get("最大回撤", 0.0) * 100.0), 2),
-                "calmar": round(float(st.get("卡玛比率", 0.0)), 2),
-                "active_pct": round(float((np.abs(sub_w) > 0.01).mean() * 100.0), 1),
-            },
-            s_dr,
-        )
+    Full, IS and OOS are explicit standalone backtest slices, each starting flat
+    and closing its remaining inventory at its final observed price.
+    """
+    from examples.alpha_mining_agent.forensic_pipeline import backtest_slice
 
-    is_mask = (df_grid["dt"] <= is_end_dt).values
-    oos_mask = (df_grid["dt"] > is_end_dt).values
-
-    st_full, dr_full = _run_slice(df_grid, w_grid)
-    st_is, _ = _run_slice(df_grid.iloc[is_mask].reset_index(drop=True), w_grid[is_mask])
-    st_oos, _ = _run_slice(df_grid.iloc[oos_mask].reset_index(drop=True), w_grid[oos_mask])
-    return {"full": st_full, "is": st_is, "oos": st_oos, "daily_return": dr_full}
+    grid = df_grid.copy()
+    grid["symbol"] = symbol
+    grid.attrs["fee_rate"] = fee_rate
+    weights = np.asarray(w_grid, dtype=float)
+    is_mask = (pd.to_datetime(grid["dt"]) <= is_end_dt).to_numpy()
+    full = backtest_slice(grid, weights)
+    inside = backtest_slice(grid.loc[is_mask], weights[is_mask])
+    outside = backtest_slice(grid.loc[~is_mask], weights[~is_mask])
+    daily = full["daily_return"].set_index("date")["total"]
+    return {"full": full, "is": inside, "oos": outside, "daily_return": daily, "execution_clock": "next_open"}
 
 
 __all__ = [
     "DEFAULT_BASIS_ORDER",
+    "DEFAULT_CAUSAL_ORTHO_WINDOW",
+    "account_portfolio_execution",
+    "build_asset_execution_inputs",
     "ContinuousSignalStateMachine",
     "CrossAssetHRPSynthesizer",
     "DynamicActivePoolAllocator",

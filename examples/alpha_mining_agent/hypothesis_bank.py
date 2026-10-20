@@ -995,7 +995,7 @@ def attach_native_czsc_signals(df: pd.DataFrame, tf: str, workspace_dir, extende
             cached = pd.read_pickle(cache_path)
             attrs_cols = cached.attrs.get("_expected_cols")
             attrs_sha = cached.attrs.get("_cache_sha256")
-            expected_min_cols = len(sigs_cfg)
+            expected_min_cols = len(attrs_cols) if attrs_cols is not None else len(sigs_cfg)
             valid = (
                 isinstance(cached, pd.DataFrame)
                 and len(cached) == len(df)
