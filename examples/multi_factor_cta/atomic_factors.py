@@ -939,9 +939,16 @@ def _build_fc01(ctx: FactorContext, side: int):
         hq = np.clip(0.55 + 0.45 * np.tanh(3.0 * np.maximum(slope_s, 0.0)), 0.5, 1.0)
     fx_ok, fx_q = _dir_eq(ctx, "fx", side)
     mult = np.clip(1.0 + 0.5 * side * xs, 0.5, 1.5)  # 中性截面 = 1.0
-    cs_ok = (side * xs) >= -0.45  # 过滤截面极度逆势区，中性 xs=0 时恒为 True
+    cs_ok = ((side * xs) >= 0.26) if ctx.has_external_cs else ((side * xs) >= -0.45)
     setup = (hdir == side) & cs_ok
-    return setup, np.clip(hq * mult, 0.0, 1.0), fx_ok & (fx_q >= 0.3), fx_q, 3
+    win = 4 if ctx.has_external_cs else 3
+    return (
+        setup,
+        np.clip(hq * mult, 0.25 if ctx.has_external_cs else 0.0, 1.0),
+        fx_ok & (fx_q >= 0.3),
+        np.clip(fx_q, 0.25 if ctx.has_external_cs else 0.0, 1.0),
+        win,
+    )
 
 
 def _build_fc02(ctx: FactorContext, side: int):
@@ -974,15 +981,15 @@ def _build_fc03(ctx: FactorContext, side: int):
     div_ok, div_q = _dir_eq(ctx, "bi_div", side)
     rev_ok, rev_q = _dir_eq(ctx, "zs_revert", side)
     exhaust_depth = np.nan_to_num(np.maximum(side * (ctx.ma20 - ctx.c), 0.0) / _safe_atr(ctx), nan=0.0)
-    exhaust_ok = div_ok | rev_ok | (exhaust_depth > 0.45)
+    exhaust_ok = div_ok | rev_ok | (exhaust_depth > 0.50)
 
-    setup = (spread_stretch > 1.50) & exhaust_ok
+    setup = (spread_stretch > 1.28) & exhaust_ok
     ex_q = np.maximum(np.maximum(div_q, rev_q), np.tanh(0.6 * exhaust_depth))
-    setup_q = np.clip(0.55 * np.tanh(0.65 * np.maximum(spread_stretch - 1.0, 0.0)) + 0.45 * ex_q, 0.10, 1.0)
+    setup_q = np.clip(0.55 * np.tanh(0.65 * np.maximum(spread_stretch - 0.8, 0.0)) + 0.45 * ex_q, 0.15, 1.0)
 
     fx_ok, fx_q = _dir_eq(ctx, "fx", side)
     brk_ok, brk_q = _break_confirm(ctx, side)
-    confirm = (fx_ok & (fx_q >= 0.25)) | brk_ok
+    confirm = (fx_ok & (fx_q >= 0.35)) | brk_ok
     confirm_q = np.maximum(fx_q, brk_q)
     return setup, setup_q, confirm, confirm_q, 5
 
@@ -1033,6 +1040,25 @@ _BREAKOUT_TRAIL_DECAY = DecayConfig(
     ratchet_stop=True,
     max_hold=24,
 )
+_SQUEEZE_ACCEL_DECAY = DecayConfig(
+    lam0=0.10,
+    max_hold=64,
+    trailing=0.012,
+    ratchet_stop=True,
+)
+_HTF_RESONANCE_DECAY = DecayConfig(
+    lam0=0.08,
+    max_hold=56,
+    trailing=0.012,
+    use_fx_exit=True,
+    ratchet_stop=True,
+)
+_SPREAD_REVERT_DECAY = DecayConfig(
+    lam0=0.10,
+    max_hold=48,
+    trailing=0.012,
+    ratchet_stop=True,
+)
 ATOMIC_FACTOR_DEFS: dict[str, AtomicFactorDef] = {
     d.family: d
     for d in (
@@ -1049,12 +1075,21 @@ ATOMIC_FACTOR_DEFS: dict[str, AtomicFactorDef] = {
         AtomicFactorDef("DC01", "量价资金流CLV共振", ARCH_D, _build_dc01, _ALL_TFS),
         AtomicFactorDef("DC02", "NTMDK-KCATR多空共振放量突破", ARCH_D, _build_dc02, _ALL_TFS),
         AtomicFactorDef("DC03", "PLR分段线性回归与DIF动量放量脉冲", ARCH_D, _build_dc03, _ALL_TFS),
-        AtomicFactorDef("EC01", "挤压后波动率扩张点火", ARCH_E, _build_ec01, _ALL_TFS, _BREAKOUT_TRAIL_DECAY),
+        AtomicFactorDef("EC01", "挤压后波动率扩张点火", ARCH_E, _build_ec01, _ALL_TFS),
         AtomicFactorDef("EC02", "NR7窄幅突破", ARCH_E, _build_ec02, _ALL_TFS),
-        AtomicFactorDef("EC03", "TNR趋势信噪比降噪窄幅压缩与二阶加速点火", ARCH_E, _build_ec03, _ALL_TFS),
-        AtomicFactorDef("FC01", "大级别结构锚定小级别分型扳机", ARCH_F, _build_fc01, ("60m", "30m", "15m", "5m")),
+        AtomicFactorDef(
+            "EC03", "TNR趋势信噪比降噪窄幅压缩与二阶加速点火", ARCH_E, _build_ec03, _ALL_TFS, _SQUEEZE_ACCEL_DECAY
+        ),
+        AtomicFactorDef(
+            "FC01",
+            "大级别结构锚定小级别分型扳机",
+            ARCH_F,
+            _build_fc01,
+            ("60m", "30m", "15m", "5m"),
+            _HTF_RESONANCE_DECAY,
+        ),
         AtomicFactorDef("FC02", "F01_板块龙头共振补涨补跌", ARCH_F, _build_fc02, _ALL_TFS),
-        AtomicFactorDef("FC03", "F02_截面比价超跌超涨背驰反包", ARCH_F, _build_fc03, _ALL_TFS),
+        AtomicFactorDef("FC03", "F02_截面比价超跌超涨背驰反包", ARCH_F, _build_fc03, _ALL_TFS, _SPREAD_REVERT_DECAY),
         AtomicFactorDef("FC04", "F03_截面TopK斜率时序突破双共振", ARCH_F, _build_fc04, _ALL_TFS),
     )
 }

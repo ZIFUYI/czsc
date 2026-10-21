@@ -1791,7 +1791,7 @@ def compute_signal_triggers_and_weights(
                 if c < l_btop * (1 - 0.005 * scale):
                     pend_l = False
                 elif c > o and c >= h_arr[i - 1]:
-                    pos, stop_p, entry_p, peak_p, pend_l = 1, max(l_ret, l_btop * (1 - 0.008 * scale)), c, c, False
+                    pos, stop_p, entry_p, peak_p, pend_l = 1, max(l_ret, l_btop * (1 - 0.006 * scale)), c, c, False
                     entered = True
 
         elif sig_id == "S1S":
@@ -1804,7 +1804,7 @@ def compute_signal_triggers_and_weights(
                 if c > s_bbot * (1 + 0.005 * scale):
                     pend_s = False
                 elif c < o and c <= l_arr[i - 1]:
-                    pos, stop_p, entry_p, trough_p, pend_s = -1, min(s_reb, s_bbot * (1 + 0.008 * scale)), c, c, False
+                    pos, stop_p, entry_p, trough_p, pend_s = -1, min(s_reb, s_bbot * (1 + 0.006 * scale)), c, c, False
                     entered = True
 
         elif sig_id == "S2L":

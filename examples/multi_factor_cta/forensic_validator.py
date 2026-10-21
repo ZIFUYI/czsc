@@ -116,6 +116,20 @@ COMMODITY_SUBCHAIN_FAMILIES: dict[frozenset[str], dict[str, tuple[str, ...]]] = 
 }
 
 
+def _extract_commodity_root_code(symbol: str) -> str:
+    """Extract lowercase commodity root code from short ('rb') or full symbol ('RB9999.XSGE', 'KQ.m@SHFE.rb')."""
+    import re
+
+    s = str(symbol).strip().lower()
+    if "@" in s:
+        s = s.rsplit("@", 1)[-1]
+    if "." in s:
+        parts = s.split(".")
+        s = parts[-1] if parts[0] in {"shfe", "dce", "czce", "zce", "ine", "gfex", "cffex"} else parts[0]
+    m = re.match(r"^([a-z]+)", s)
+    return m.group(1) if m else s
+
+
 def refine_commodity_pool_groups(groups: dict[str, str]) -> dict[str, str]:
     """Split oversized commodity sector pools into fixed homogeneous sub-chain pools.
 
@@ -129,7 +143,10 @@ def refine_commodity_pool_groups(groups: dict[str, str]) -> dict[str, str]:
         members = {asset: group for asset, group in groups.items() if str(group).strip().lower() in sectors}
         if len(members) <= COMMODITY_SUBCHAIN_MIN_FAMILY_SIZE:
             continue
-        present = {name: [a for a in codes if a in members] for name, codes in chains.items()}
+        present = {
+            name: [asset for asset in members if _extract_commodity_root_code(asset) in codes]
+            for name, codes in chains.items()
+        }
         if any(len(assets) < COMMODITY_SUBCHAIN_FLOOR for assets in present.values()):
             continue
         for name, assets in present.items():
@@ -379,9 +396,10 @@ class RuleFactorForensicValidator:
         target = infer_asset_pool_group(target_pool_group, target_pool_group)
         broad_all = {groups[s].split(":", 1)[0] for s in raw_audits}
         commodity_sector_mode = broad_all == {"commodity"} and target.startswith("commodity:")
-        if commodity_sector_mode and target_asset in groups:
+        if commodity_sector_mode and (target_asset in groups or target.startswith("commodity:chain_")):
             groups = refine_commodity_pool_groups(groups)
-            target = groups[target_asset]
+            if target_asset in groups:
+                target = groups[target_asset]
         if commodity_sector_mode:
             peer_groups = _resolve_commodity_peer_groups(groups, target, floor=5)
             selected = [s for s in raw_audits if groups[s] in peer_groups]
@@ -419,8 +437,11 @@ class RuleFactorForensicValidator:
         for symbol in selected:
             audit = raw_audits[symbol]
             records = audit.get("events")
-            if not isinstance(records, list) or not records:
+            if not isinstance(records, list) or (not records and int(audit.get("is_n_purged", 0)) > 0):
                 reasons.append(f"{symbol}: 缺少真实events，不得用摘要生成样本")
+                continue
+            if not records:
+                low_eff_reasons.append(f"{symbol}: 缺少真实events (有效独立样本=0 < 30)")
                 continue
             events = pd.DataFrame(records)
             required = {"trigger_dt", "entry_dt", "exit_dt", "r_atr", "net_ret", "quality_w", "regime"}

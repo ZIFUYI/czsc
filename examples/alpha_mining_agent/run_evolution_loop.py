@@ -62,6 +62,7 @@ from examples.multi_factor_cta.forensic_validator import (  # noqa: E402
     RuleFactorForensicValidator,
     get_stratified_pool_tier,
     infer_asset_pool_group,
+    refine_commodity_pool_groups,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -397,12 +398,14 @@ def evaluate_candidate_pooled_gate1b(
             if audit_context is not None:
                 audit_context._normalized[local_key] = per_symbol_gate1[psym]
 
+    asset_groups = refine_commodity_pool_groups(asset_groups)
     target_group = asset_groups.get(primary_symbol, infer_asset_pool_group(primary_symbol))
     target_microstructure = microstructure_groups.get(primary_symbol)
     tier = get_stratified_pool_tier(spec.archetype, tf)
+    all_commodity_sector = bool(asset_groups) and all(str(g).startswith("commodity:") for g in asset_groups.values())
     pooled_key = (
         cache_key,
-        None if tier == 1 else target_group,
+        target_group if (tier != 1 or all_commodity_sector) else None,
         target_microstructure if tier == 3 else None,
         allow_single_asset_degrade,
     )
@@ -420,6 +423,7 @@ def evaluate_candidate_pooled_gate1b(
             microstructure_groups=microstructure_groups,
             target_microstructure_group=target_microstructure,
             allow_single_asset_degrade=allow_single_asset_degrade,
+            target_asset=primary_symbol,
         )
     )
     if cache_pool and pooled_key not in audit_context._pooled:
