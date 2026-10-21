@@ -277,7 +277,8 @@ class RuleFactorForensicValidator:
         Tier 1 requires at least 15 assets and both equity and commodity classes.
         Tier 2 requires five assets from the exact equity or commodity:<sector> group.
         Tier 3 additionally requires an explicitly identical trading/liquidity regime.
-        Legacy single-asset flags preserve diagnostics, never admission permission.
+        Legacy single-asset and pooled-effective-sample flags preserve call compatibility,
+        never permission to lower the per-asset evidence floor or missing-regime requirements.
         """
         raw_audits = dict(asset_audits or per_symbol_gate1 or {})
         if not raw_audits and pool_tf_dfs is not None:
@@ -364,11 +365,7 @@ class RuleFactorForensicValidator:
                 continue
             q = events["quality_w"].to_numpy(dtype=float)
             effective_n = float(q.sum() ** 2 / (q @ q))
-            min_asset_eff_n = (
-                float({"1d": 2, "60m": 10, "30m": 15, "15m": 6, "5m": 15}.get(timeframe, 10))
-                if allow_pooled_effective_n
-                else 30.0
-            )
+            min_asset_eff_n = 30.0
             if effective_n < min_asset_eff_n - 1e-9:
                 reasons.append(f"{symbol}: 有效独立样本={effective_n:.2f} < {min_asset_eff_n:.0f}")
             # Recompute all moments from the immutable event table; summaries are display-only.
@@ -378,20 +375,16 @@ class RuleFactorForensicValidator:
             events["pool_weight"] = 0.0
             for regime in (-1, 0, 1):
                 mask = events["regime"] == regime
-                if int(mask.sum()) < (1 if allow_pooled_effective_n else 2):
+                if int(mask.sum()) < 2:
                     continue
                 regime_q = events.loc[mask, "quality_w"]
                 regime_means.append(float(np.average(events.loc[mask, "r_atr"], weights=regime_q)))
                 events.loc[mask, "pool_weight"] = regime_q / regime_q.sum() / 3.0
-            if len(regime_means) != 3 and not allow_pooled_effective_n:
+            if len(regime_means) != 3:
                 reasons.append(f"{symbol}: 三态IPW缺少事件支持，不能声称状态均衡")
                 ipw_mean = 0.0
-            elif regime_means:
-                ipw_mean = float(np.mean(regime_means))
-                if len(regime_means) != 3:
-                    events["pool_weight"] = q / max(float(q.sum()), 1e-12)
             else:
-                ipw_mean = 0.0
+                ipw_mean = float(np.mean(regime_means))
             if effective_n >= min_asset_eff_n - 1e-9 and norm_r > 0 and raw_mean > 0 and ipw_mean > 0:
                 positive.append(symbol)
             events["symbol"] = symbol
@@ -399,18 +392,6 @@ class RuleFactorForensicValidator:
             ipw_means.append(ipw_mean)
             net_sharpes.append(float(audit.get("is_net_sharpe", 0.0)))
             valid_audits[symbol] = audit
-        if allow_pooled_effective_n:
-            pooled_eff_n = sum(
-                float(
-                    (df["quality_w"].sum() ** 2)
-                    / (df["quality_w"].to_numpy(dtype=float) @ df["quality_w"].to_numpy(dtype=float))
-                )
-                for df in event_frames
-                if len(df) > 0
-            )
-            min_pool_eff_n = float(TF_MIN_PURGED_SAMPLES.get(timeframe, 30))
-            if pooled_eff_n < min_pool_eff_n - 1e-9:
-                reasons.append(f"跨品种池化有效样本={pooled_eff_n:.1f} < {min_pool_eff_n:.0f}")
         ratio = len(positive) / len(selected) if selected else 0.0
         pooled_t, block_count = _pooled_time_block_t_stat(event_frames)
         min_ratio = 0.60 if tier == 1 else (0.70 if tier == 3 else (0.75 if target == "equity" else 0.65))
@@ -736,6 +717,119 @@ def run_stratified_pooled_gate1b_audit(*args: Any, **kwargs: Any) -> dict[str, A
     return validator.run_stratified_pooled_gate1b_audit(*args, **kwargs)
 
 
+_EXECUTION_POOL_COLUMNS = [
+    "fold",
+    "uid",
+    "sig_id",
+    "tf",
+    "archetype",
+    "total_n",
+    "min_asset_n",
+    "median_asset_n",
+    "pos_asset_ratio",
+    "pooled_mean_pct",
+    "mean_sharpe",
+    "pooled_t",
+    "independent_time_blocks",
+    "pool_evidence_kind",
+    "pool_passed_assets",
+    "pool_audits",
+]
+
+
+def summarize_execution_pooled_scores(scores_df: pd.DataFrame) -> pd.DataFrame:
+    """Pool completed execution evidence using the existing stratified time-block audit.
+
+    Input rows identify ``fold/asset/uid/tf/archetype`` and carry the complete
+    ``events`` list and ``cutoff`` returned by the study evaluator. Explicit
+    ``pool_group`` and ``microstructure_group`` identify the applicable universe.
+    Missing events or pool metadata never grant admission. Display summaries,
+    including historical t statistics, are not evidence. One output row per
+    fold/unit retains per-target audit results and the assets actually admitted.
+    """
+    if scores_df.empty:
+        return pd.DataFrame(columns=_EXECUTION_POOL_COLUMNS)
+    required = {"fold", "asset", "uid", "tf", "archetype"}
+    if not required.issubset(scores_df.columns):
+        raise ValueError(f"Missing candidate identity columns: {sorted(required - set(scores_df.columns))}")
+    if scores_df.duplicated(["fold", "asset", "uid"]).any():
+        raise ValueError("Duplicate fold/asset/unit evidence is not an independent sample")
+    rows = []
+    for (fold, uid), group in scores_df.groupby(["fold", "uid"], sort=True):
+        if group["tf"].nunique() != 1 or group["archetype"].nunique() != 1:
+            raise ValueError("One fold/unit cannot mix timeframes or archetype definitions")
+        tf, archetype = str(group["tf"].iloc[0]), str(group["archetype"].iloc[0])
+        audits, asset_groups, micro_groups = {}, {}, {}
+        cutoffs = set()
+        for record in group.to_dict("records"):
+            asset = str(record["asset"])
+            events = record.get("events")
+            audits[asset] = {
+                "events": events if isinstance(events, list) else [],
+                "event_source": "execution",
+                "is_net_sharpe": record.get("is_net_sharpe", 0.0),
+            }
+            # The broad commodity label deliberately fails the Tier 2 sector contract.
+            pool_group = record.get("pool_group")
+            asset_groups[asset] = pool_group if isinstance(pool_group, str) and pool_group else "unknown"
+            micro = record.get("microstructure_group")
+            if isinstance(micro, str) and micro:
+                micro_groups[asset] = micro
+            cutoff = pd.to_datetime(record.get("cutoff"), errors="coerce")
+            if pd.notna(cutoff):
+                cutoffs.add(cutoff)
+        cutoff_valid = len(cutoffs) == 1 and "cutoff" in group and group["cutoff"].notna().all()
+        cutoff = next(iter(cutoffs)) if cutoff_valid else pd.Timestamp.min
+        checker = RuleFactorForensicValidator(is_end_dt=cutoff, soft_gate=False)
+        by_target, by_asset, passed_assets = {}, {}, []
+        for asset in audits:
+            target = (asset_groups[asset], micro_groups.get(asset))
+            if target not in by_target:
+                by_target[target] = checker.run_stratified_pooled_gate1b_audit(
+                    archetype=archetype,
+                    timeframe=tf,
+                    asset_audits=audits,
+                    asset_groups=asset_groups,
+                    target_pool_group=target[0],
+                    microstructure_groups=micro_groups,
+                    target_microstructure_group=target[1],
+                )
+            result = by_target[target]
+            by_asset[asset] = {key: value for key, value in result.items() if key != "per_asset_audits"}
+            if result["passed"] and cutoff_valid and asset_groups[asset] != "unknown":
+                passed_assets.append(asset)
+        # These scalar fields are descriptive only; selection consumes the target's audit.
+        results = list(by_target.values())
+        sizes = [len(audit["events"]) for audit in audits.values()]
+        event_net = [
+            float(event["net_ret"])
+            for audit in audits.values()
+            for event in audit["events"]
+            if "net_ret" in event and np.isfinite(event["net_ret"])
+        ]
+        rows.append(
+            {
+                "fold": fold,
+                "uid": uid,
+                "sig_id": str(uid).split("@")[0],
+                "tf": tf,
+                "archetype": archetype,
+                "total_n": sum(sizes),
+                "min_asset_n": min(sizes, default=0),
+                "median_asset_n": float(np.median(sizes)) if sizes else 0.0,
+                "pos_asset_ratio": min((r["universal_ratio"] for r in results), default=0.0),
+                "pooled_mean_pct": float(np.mean(event_net) * 100) if event_net else 0.0,
+                "mean_sharpe": float(group["is_net_sharpe"].mean()) if "is_net_sharpe" in group else 0.0,
+                "pooled_t": min((r["pooled_t_stat"] for r in results), default=0.0),
+                "independent_time_blocks": min((r["independent_time_blocks"] for r in results), default=0),
+                "pool_evidence_kind": "execution_time_block_hac",
+                "pool_passed_assets": passed_assets,
+                "pool_audits": by_asset,
+            }
+        )
+    return pd.DataFrame(rows, columns=_EXECUTION_POOL_COLUMNS)
+
+
 def select_pooled_multitf_gate1_units(
     f_scores: pd.DataFrame,
     f_pool: pd.DataFrame,
@@ -743,47 +837,68 @@ def select_pooled_multitf_gate1_units(
     *,
     allow_lowturn_hetero_15m: bool = False,
 ) -> pd.DataFrame:
-    """
-    滚动样本内多周期跨品种池化自由度 Gate 1 统一准入接口：
-    - 30m: 单品种 n >= 15, mean_net_pct > 0, is_net_sharpe > 0.15
-    - 15m: 标准候选要求 n >= 15；若启用低换手异构 15m 跨日波段因子 (H15M_*)，允许 n >= 6 且年化换手 <= 26x 且池化 total_n >= 150
-    - 60m: 单品种 n >= 10, mean_net_pct > 0, is_net_sharpe > 0.15
-    - 1d: 单品种 n >= 2, mean_net_pct > 0, is_net_sharpe > 0.10 且池化 total_n >= 25、池化均值 > 0
-    """
-    sub = f_scores[f_scores["asset"] == asset_id].merge(
-        f_pool[["uid", "total_n", "pooled_mean_pct", "pooled_t", "pos_asset_ratio"]],
-        on="uid",
-        how="left",
-    )
-    c_30m = (sub["tf"] == "30m") & (sub["n"] >= 15) & (sub["mean_net_pct"] > 0.0) & (sub["is_net_sharpe"] > 0.15)
-    if allow_lowturn_hetero_15m:
-        c_15m = (
-            (sub["tf"] == "15m")
-            & (
-                (sub["n"] >= 15)
-                | (
-                    sub["uid"].str.startswith("H15M_")
-                    & (sub["n"] >= 6)
-                    & (sub["ann_turnover"] <= 26.0)
-                    & (sub["total_n"] >= 150)
-                )
-            )
-            & (sub["mean_net_pct"] > 0.0)
-            & (sub["is_net_sharpe"] > 0.15)
-        )
-    else:
-        c_15m = (sub["tf"] == "15m") & (sub["n"] >= 15) & (sub["mean_net_pct"] > 0.0) & (sub["is_net_sharpe"] > 0.15)
+    """Select all timeframes through formal local SOP and real pooled evidence.
 
-    c_60m = (sub["tf"] == "60m") & (sub["n"] >= 10) & (sub["mean_net_pct"] > 0.0) & (sub["is_net_sharpe"] > 0.15)
-    c_1d = (
-        (sub["tf"] == "1d")
-        & (sub["n"] >= 2)
-        & (sub["mean_net_pct"] > 0.0)
-        & (sub["is_net_sharpe"] > 0.10)
-        & (sub["total_n"] >= 25)
-        & (sub["pooled_mean_pct"] > 0.0)
+    The historical low-turnover option remains accepted for call compatibility;
+    it cannot lower the sample, payoff, confidence or pooled-evidence requirements.
+    Summary-only CSVs are diagnostic data and fail closed until regenerated from
+    the completed execution events. Percent fields use percentage points.
+    """
+    pool_cols = ["total_n", "pooled_mean_pct", "pooled_t", "pos_asset_ratio"]
+    empty = f_scores.iloc[:0].copy()
+    for name in pool_cols:
+        if name not in empty:
+            empty[name] = pd.Series(dtype=float)
+    required = {
+        "asset",
+        "uid",
+        "n",
+        "effective_n",
+        "win_rate",
+        "pl_ratio",
+        "safety_margin",
+        "mean_ci_low_pct",
+        "is_net_sharpe",
+        "strict_local_pass",
+        "events",
+    }
+    evidence = {"uid", "pool_evidence_kind", "pool_passed_assets", "pool_audits", *pool_cols}
+    if not required.issubset(f_scores.columns) or not evidence.issubset(f_pool.columns):
+        return empty
+    if f_scores.empty or f_pool.empty:
+        return empty
+    join = ["fold", "uid"] if "fold" in f_scores and "fold" in f_pool else ["uid"]
+    if f_pool.duplicated(join).any():
+        raise ValueError("Pooled evidence must contain one row per fold/unit")
+    sub = f_scores.loc[f_scores["asset"] == asset_id].merge(
+        f_pool[[*join, *pool_cols, "pool_evidence_kind", "pool_passed_assets", "pool_audits"]],
+        on=join,
+        how="left",
+        validate="many_to_one",
     )
-    return sub[c_30m | c_15m | c_60m | c_1d].copy()
+    local_ok = (
+        (sub["n"] >= 30)
+        & (sub["effective_n"] >= 30 - 1e-9)
+        & (sub["win_rate"] > 50)
+        & (sub["pl_ratio"] > 1.5)
+        & (sub["safety_margin"] > 10)
+        & (sub["mean_ci_low_pct"] > 0)
+        & (sub["is_net_sharpe"] > 0)
+        & sub["strict_local_pass"].eq(True)
+        & sub["events"].map(lambda events: isinstance(events, list) and len(events) >= 30)
+    )
+    pool_ok = sub["pool_evidence_kind"].eq("execution_time_block_hac") & sub["pool_passed_assets"].map(
+        lambda assets: isinstance(assets, list) and asset_id in assets
+    )
+    selected = sub.loc[local_ok & pool_ok].copy()
+    for index, record in selected.iterrows():
+        audit = record["pool_audits"].get(asset_id, {})
+        if not audit.get("passed", False):
+            selected = selected.drop(index)
+            continue
+        selected.loc[index, "pooled_t"] = audit["pooled_t_stat"]
+        selected.loc[index, "pos_asset_ratio"] = audit["universal_ratio"]
+    return selected
 
 
 def classify_causal_market_regime(df_tf: pd.DataFrame, er_window: int = 20, er_th: float = 0.22) -> np.ndarray:

@@ -1,21 +1,20 @@
-"""
-全商品池（方案B：60个流动性合格商品期货）多周期 × 6大簇增量筛选 + 缠论结构化出场与核心-卫星因果配置实证脚本
-========================================================================================================
-本脚本完整复现从 Core-20（20个主力核心商品）扩展至 Scheme B（60个全市场流动性合格商品期货，覆盖6大板块）的：
-1. 60品种流动性普查与数据覆盖表 (`full60_universe_summary.csv`)
-2. 为什么朴素全量60品种等权HRP会遭遇「板块风险预算膨胀 + 产业链影子品种稀释」陷阱（Sharpe 2.36 -> 1.18）的归因诊断
-3. 100% 严格因果的机构级「Core-20旗舰锚定 + 40扩展池SOP阶段三门禁 + 剩余容量因果袖套分配」架构实证
-4. 1.0x 与 3.0x 敞口下的全链路控制变量消融对比表 (`full60_ablation_comparison.csv`)
-5. 40个扩展卫星品种的样本内 SOP 阶段三门禁指标与样本外独立表现明细表 (`full60_satellite_sop_admission.csv`)
-6. 6大板块归因表 (`full60_sector_attribution.csv`) 与 60品种归因表 (`full60_symbol_attribution.csv`)
-7. 自包含交互式 Plotly HTML 报告 (`full60_cta_expansion_report.html`)
+"""Recompute the 60-commodity CTA study from verified real-market evidence.
+
+Each historical fold uses complete training execution episodes, formal SOP and
+synchronized time-block pooling. Core-20 is recomputed with its own manifest,
+fees and cross-sectional universe. The 2025–2026 comparison is retrospective
+validation; it is not a fresh blind holdout or evidence of live contract fills.
+Artifacts are written outside the original study directory with provenance.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import pickle
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import numpy as np
@@ -31,30 +30,20 @@ if str(ROOT / "examples") not in sys.path:
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from multi_factor_cta.data_engine import AssetClass, AssetSpec  # noqa: E402
-from multi_factor_cta.synthesis_engine import (  # noqa: E402
-    _project_capped_simplex_row,
-    account_portfolio_execution,
-    assign_futures_trading_day,
-    compute_causal_sleeve_health_multiplier,
-    compute_continuous_cluster_risk_shares,
-)
 from run_multitf_incremental_study import (  # noqa: E402
     ALL_TFS,
     CORE_20_IDS,
     FOLDS,
-    OUT_DIR,
+    MANIFEST_PATH,
+    SOURCE_DIR,
     allocate_and_account_5m_grid,
     build_asset_execution_inputs,
     build_structure_pack,
     compute_episode_payoff_stats,
-    compute_hetero_1d_signals,
-    compute_hetero_15m_signals,
     eval_is_net_sharpe,
     evaluate_execution_events,
     map_15m_target_to_5m_grid,
     map_tf_weight_to_base_grid,
-    register_hetero_signal_specs,
     run_incremental_funnel_gate123,
     scale_fold_ledgers_exposure,
     summarize_pooled_scores,
@@ -63,8 +52,29 @@ from run_multitf_incremental_study import (  # noqa: E402
     synthesize_structure_aware_synergy,
 )
 
+from examples.alpha_mining_agent.forensic_pipeline import run_execution_audit  # noqa: E402
+from examples.multi_factor_cta.audit_protocol import (  # noqa: E402
+    UnverifiedArtifactError,
+    build_fingerprint,
+    file_sha256,
+    read_verified_pickle,
+    validate_output_directory,
+    write_verified_artifact,
+)
+from examples.multi_factor_cta.data_engine import AssetClass, AssetSpec  # noqa: E402
+from examples.multi_factor_cta.rebuild_audited_study import prepare_study_inputs  # noqa: E402
+from examples.multi_factor_cta.study_execution import study_execution_ledger  # noqa: E402
+from examples.multi_factor_cta.synthesis_engine import (  # noqa: E402
+    _project_capped_simplex_row,
+    account_portfolio_execution,
+    assign_futures_trading_day,
+    compute_causal_sleeve_health_multiplier,
+    compute_continuous_cluster_risk_shares,
+)
+
+OUT_DIR = Path(os.environ.get("CZSC_CTA_OUTPUT_DIR", str(ROOT / "examples/results/cta_research/full60"))).resolve()
 CACHE_60_DIR = OUT_DIR / "cache_60"
-DATA_15M_60_DIR = OUT_DIR / "data_15m_60"
+DATA_15M_60_DIR = SOURCE_DIR / "data_15m_60"
 
 # ---------------------------------------------------------------------------
 # 1. 方案B：60个流动性合格商品期货元数据定义（6大板块）
@@ -165,41 +175,140 @@ ANN_SCALE = np.sqrt(PERIODS_PER_YEAR)
 BARS_PER_DAY = 48
 
 
+def _core20_specs_from_manifest() -> dict[str, AssetSpec]:
+    """Retain the Core-20 reference's own sector, data and fee definitions."""
+    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    records = {row["id"]: row for row in manifest["intraday"] if row["asset_group"] == "commodity"}
+    return {
+        aid: AssetSpec(
+            symbol=records[aid]["symbol"],
+            name=aid,
+            asset_class=AssetClass.COMMODITY_FUTURES,
+            sector=records[aid]["sector"],
+            base_tf="15m",
+            eligible_tfs=tuple(tf for tf in ALL_TFS if tf != "5m"),
+            fee_rate=records[aid]["fee_rate"],
+            has_night_session=records[aid]["has_night_session"],
+            data_path=Path(records[aid]["path"]),
+            adjust_rolls=False,
+        )
+        for aid in CORE_20_IDS
+    }
+
+
+def _structure_inputs(frames: dict, specs: dict, admitted: dict) -> tuple[dict, dict]:
+    """Rebuild structure only for assets with admitted factors, from verified frames."""
+    intraday, daily_aligned = {}, {}
+    for aid, spec in specs.items():
+        if not any(admitted.get((fold["id"], aid)) for fold in FOLDS):
+            continue
+        df15, df1 = frames[spec.symbol]["15m"], frames[spec.symbol]["1d"]
+        sp15 = build_structure_pack(df15, "15m", box_window=32)
+        sp1 = build_structure_pack(df1, "1d", box_window=10)
+        mapped = dict(sp15)
+        for key in (
+            "long_sec",
+            "short_sec",
+            "long_zs",
+            "short_zs",
+            "long_box",
+            "short_box",
+            "long_hyb",
+            "short_hyb",
+            "zs_zg",
+            "zs_zd",
+        ):
+            source = np.asarray(sp1[key], dtype=np.float64)
+            clean = np.where(np.isfinite(source) & (source > 0), source, -1.0)
+            values = map_tf_weight_to_base_grid(df1, clean, df15)
+            bad = (~np.isfinite(values)) | (values <= 0)
+            mapped[key] = np.where(bad, np.nan if key in ("zs_zg", "zs_zd") else sp15[key], values)
+        intraday[aid], daily_aligned[aid] = sp15, mapped
+    return intraday, daily_aligned
+
+
+def _sleeve_training_metrics(
+    frame: pd.DataFrame,
+    weights: np.ndarray,
+    fee_rate: float,
+    cutoff: pd.Timestamp,
+    train_start: pd.Timestamp,
+) -> dict:
+    """Use only completed training episodes and the shared next-open ledger for Stage 3."""
+    mask = pd.to_datetime(frame["dt"]).between(train_start, cutoff).to_numpy()
+    training = frame.loc[mask].reset_index(drop=True)
+    decisions = np.asarray(weights, dtype=np.float64)[mask]
+    audit = run_execution_audit(training, decisions, fee_rate=fee_rate, is_end_dt=cutoff, min_net_sharpe=-float("inf"))
+    sharpe = eval_is_net_sharpe(decisions, training, fee_rate)
+    return {
+        "is_shp_hr": sharpe,
+        "is_payoff_r": audit.get("is_pl_ratio", 0.0),
+        "is_win_rate": audit.get("is_win_rate_pct", 0.0),
+        "is_safety_margin": audit.get("is_safety_margin_pct", 0.0),
+        "is_ep_count": audit["is_n_purged"],
+        "is_effective_n": audit["is_effective_n"],
+        "is_mean_ci_low_pct": audit["is_mean_ci_low_pct"],
+        "is_execution_passed": audit["passed"] and sharpe > 0,
+        "is_execution_reason": audit["reason"],
+    }
+
+
+def _sleeve_sop_passed(metrics: dict) -> bool:
+    """A composite sleeve cannot bypass the same formal SOP as its components."""
+    return bool(
+        metrics.get("is_execution_passed", False)
+        and metrics.get("is_ep_count", 0) >= 30
+        and metrics.get("is_effective_n", 0) >= 30 - 1e-9
+        and metrics.get("is_win_rate", 0) > 50
+        and metrics.get("is_payoff_r", 0) > 1.5
+        and metrics.get("is_safety_margin", 0) > 10
+        and (metrics.get("is_mean_ci_low_pct") or 0) > 0
+    )
+
+
+def _save_bundle(path: Path, value: dict, fingerprint) -> None:
+    """Write derived ledgers with the full source/data/configuration fingerprint."""
+    manifest = fingerprint.manifest()
+    for section in ("sources", "data"):
+        if any(file_sha256(record["path"]) != record["sha256"] for record in manifest[section]):
+            raise UnverifiedArtifactError("Research inputs changed while building derived ledgers; rebuild")
+    write_verified_artifact(
+        path,
+        pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL),
+        fingerprint,
+        output_dir=OUT_DIR,
+        readonly_roots=(SOURCE_DIR,),
+    )
+
+
 def ensure_full60_oos_bundles(force_rebuild: bool = False) -> tuple[dict, dict]:
-    """
-    确保 `fast_oos_bundle_v1.pkl` 与 `exact_core20_ledgers_v3.pkl` 具备完整端到端源码生成闭环，
-    并强制对齐期货交易日归属 (assign_futures_trading_day) 与因果样本内波动率预热。
-    """
-    bundle_path = CACHE_60_DIR / "fast_oos_bundle_v1.pkl"
-    c20_path = CACHE_60_DIR / "exact_core20_ledgers_v3.pkl"
-    register_hetero_signal_specs()
+    """Rebuild or reuse provenance-verified execution bundles from complete real evidence."""
+    validate_output_directory(OUT_DIR, (SOURCE_DIR,))
+    bundle_path = CACHE_60_DIR / "audited_full60_bundle.pkl"
+    c20_path = CACHE_60_DIR / "audited_core20_ledgers.pkl"
+    prepared_60 = prepare_study_inputs(UNIVERSE_60_SPECS, source_dir=SOURCE_DIR, output_dir=OUT_DIR / "full60_inputs")
+    specs_20 = _core20_specs_from_manifest()
+    prepared_20 = prepare_study_inputs(
+        list(specs_20.values()),
+        source_dir=SOURCE_DIR,
+        output_dir=Path(os.environ.get("CZSC_CTA_CORE20_INPUT_DIR", str(OUT_DIR.parent / "core20"))).resolve(),
+    )
 
-    def _get_15m_df(frames_15m_60: dict, aid: str) -> pd.DataFrame:
-        sym = SPECS_60[aid].symbol
-        v = frames_15m_60[sym] if sym in frames_15m_60 else frames_15m_60[aid]
-        return v["15m"] if isinstance(v, dict) else v
+    def _get_15m_df(frames: dict, aid: str) -> pd.DataFrame:
+        return frames[SPECS_60[aid].symbol]["15m"]
 
-    need_rebuild_b = force_rebuild or (not bundle_path.exists())
     b = {}
-    if not need_rebuild_b:
-        with open(bundle_path, "rb") as f:
-            b = pickle.load(f)
-        if not b.get("trading_date_aligned"):
-            need_rebuild_b = True
-
+    if not force_rebuild:
+        with suppress(UnverifiedArtifactError):
+            b = read_verified_pickle(bundle_path, prepared_60["fingerprint"])
+    need_rebuild_b = not b
     if need_rebuild_b:
-        with open(CACHE_60_DIR / "frames_15m_60.pkl", "rb") as f:
-            frames_15m_60 = pickle.load(f)
-        with open(CACHE_60_DIR / "unit_grid_15m_60.pkl", "rb") as f:
-            ugrid_60 = pickle.load(f)
-        with open(CACHE_60_DIR / "sp_packs_60.pkl", "rb") as f:
-            sp_packs = pickle.load(f)
-        sp15_60, sp1d_15_60 = sp_packs["sp15"], sp_packs["sp1d_15"]
-        het_scores_60 = pd.read_csv(CACHE_60_DIR / "multitf_60_hetero_scores.csv")
-
+        frames_15m_60 = prepared_60["frames"]
+        ugrid_60 = prepared_60["units"]
+        het_scores_60 = prepared_60["scores"]
         df5_map_60 = {}
         for aid in IDS_60:
-            df = pd.read_parquet(OUT_DIR / "data_5m" / f"{aid}_5m.parquet")
+            df = pd.read_parquet(SOURCE_DIR / "data_5m" / f"{aid}_5m.parquet")
             df["dt"] = pd.to_datetime(df["dt"])
             df5_map_60[aid] = df.sort_values("dt").reset_index(drop=True)
 
@@ -235,11 +344,21 @@ def ensure_full60_oos_bundles(force_rebuild: bool = False) -> tuple[dict, dict]:
                     is_sharpe_60[(f_id, aid)] = 0.0
                     continue
                 df15 = _get_15m_df(frames_15m_60, aid)
-                m_is = (pd.to_datetime(df15["dt"]) <= cutoff).to_numpy()
-                ret_is = np.nan_to_num(df15["close"].pct_change().fillna(0.0).to_numpy(dtype=np.float64)[m_is], nan=0.0)
+                m_is = pd.to_datetime(df15["dt"]).between(fold["train_start"], cutoff).to_numpy()
+                df_is = df15.loc[m_is].reset_index(drop=True)
                 fee_r = float(SPECS_60[aid].fee_rate)
                 acc, _, _ = run_incremental_funnel_gate123(
-                    f_s, f_p, aid, f_id, ugrid_60[aid], m_is, ret_is, fee_r, allow_lowturn_hetero_15m=True
+                    f_s,
+                    f_p,
+                    aid,
+                    f_id,
+                    ugrid_60[aid],
+                    m_is,
+                    df_is,
+                    fee_r,
+                    allow_lowturn_hetero_15m=True,
+                    df_is=df15.loc[m_is].reset_index(drop=True),
+                    spec=SPECS_60[aid],
                 )
                 sel_60_std[(f_id, aid)] = acc
                 syn_is = synthesize_fast_slow_synergy(
@@ -248,8 +367,9 @@ def ensure_full60_oos_bundles(force_rebuild: bool = False) -> tuple[dict, dict]:
                     acc,
                     SPECS_60[aid],
                 )
-                is_sharpe_60[(f_id, aid)] = eval_is_net_sharpe(syn_is, ret_is, fee_r)
+                is_sharpe_60[(f_id, aid)] = eval_is_net_sharpe(syn_is, df_is, fee_r)
 
+        sp15_60, sp1d_15_60 = _structure_inputs(frames_15m_60, SPECS_60, sel_60_std)
         t15_fs, t15_full, t15_hr = {}, {}, {}
         t5_fs, t5_full, t5_hr = {}, {}, {}
         ep_fs, ep_full, ep_hr = {}, {}, {}
@@ -313,13 +433,17 @@ def ensure_full60_oos_bundles(force_rebuild: bool = False) -> tuple[dict, dict]:
             f_id = fold["id"]
             oos_s = pd.Timestamp(fold["oos_start"])
             oos_e = pd.Timestamp(fold["oos_end"])
-            returns = {}
+            returns, prices = {}, {}
             for aid in IDS_60:
                 grid5 = df5_map_60[aid]
                 mask = (grid5["dt"] <= oos_e).to_numpy()
                 sub_grid = grid5.loc[mask].copy().reset_index(drop=True)
                 ret_s, _ = build_asset_execution_inputs(sub_grid, np.zeros(len(sub_grid)))
                 returns[aid] = ret_s
+                price = pd.Series(sub_grid["open"].to_numpy(dtype=float), index=pd.DatetimeIndex(sub_grid["dt"]))
+                if len(price):
+                    price.loc[price.index[-1] + pd.Timedelta(microseconds=1)] = float(sub_grid["close"].iloc[-1])
+                prices[aid] = price
             raw_ret_df = pd.DataFrame(returns).sort_index()
             tradable_mask = raw_ret_df.notna()
             ret_df = raw_ret_df.fillna(0.0)
@@ -373,6 +497,7 @@ def ensure_full60_oos_bundles(force_rebuild: bool = False) -> tuple[dict, dict]:
             oos_fast_cache[f_id] = {
                 "raw_oos": raw_ret_df.loc[oos_mask].copy(),
                 "ret_oos": ret_df.loc[oos_mask].copy(),
+                "execution_prices_df": pd.DataFrame(prices).reindex_like(ret_df.loc[oos_mask]),
                 "mask_oos": tradable_mask.loc[oos_mask].copy(),
                 "roll_vol_oos": roll_vol_full.loc[oos_mask].copy(),
                 "sec_vol_oos": sec_vol_oos,
@@ -386,31 +511,14 @@ def ensure_full60_oos_bundles(force_rebuild: bool = False) -> tuple[dict, dict]:
             for aid in IDS_60:
                 df15 = _get_15m_df(frames_15m_60, aid)
                 dt15 = pd.to_datetime(df15["dt"])
-                m_is = (dt15 <= cutoff).to_numpy()
-                ret15 = np.nan_to_num(df15["close"].pct_change().fillna(0.0).to_numpy(dtype=np.float64), nan=0.0)
+                valid = dt15.between(fold["train_start"], fold["oos_end"]).to_numpy()
                 w = t15_hr[(f_id, aid)]
-                pos = np.roll(w, 1)
-                pos[0] = 0.0
-                turn = np.abs(np.diff(pos, prepend=0.0))
-                net15 = pos * ret15 - turn * float(SPECS_60[aid].fee_rate)
-                t_day_idx = assign_futures_trading_day(dt15)
-                d_ser = pd.Series(net15, index=t_day_idx).groupby(level=0).sum()
-                sleeve_daily_ret.setdefault(f_id, {})[aid] = d_ser
-                df_is = df15.loc[m_is].reset_index(drop=True)
-                ep_is = evaluate_execution_events(df_is, w[m_is], fee_rate=float(SPECS_60[aid].fee_rate))
-                ep_st = compute_episode_payoff_stats(
-                    [ep_is["net_ret"].to_numpy(dtype=np.float64)] if len(ep_is) > 0 else []
-                )
-                d_is = d_ser[d_ser.index <= cutoff.normalize()]
-                sd_is = float(d_is.std(ddof=1)) if len(d_is) > 10 else 0.0
-                shp_hr_is = float((d_is.mean() / sd_is) * np.sqrt(252.0)) if sd_is > 1e-12 else 0.0
+                fee = float(SPECS_60[aid].fee_rate)
+                ledger = study_execution_ledger(df15.loc[valid].reset_index(drop=True), w[valid], fee)
+                sleeve_daily_ret.setdefault(f_id, {})[aid] = ledger["daily_returns"]
                 is_meta_stats[(f_id, aid)] = {
+                    **_sleeve_training_metrics(df15, w, fee, cutoff, pd.Timestamp(fold["train_start"])),
                     "is_shp_fs": is_sharpe_60.get((f_id, aid), 0.0),
-                    "is_shp_hr": shp_hr_is,
-                    "is_payoff_r": ep_st["payoff_r"],
-                    "is_win_rate": ep_st["win_rate_pct"],
-                    "is_safety_margin": ep_st["safety_margin_pct"],
-                    "is_ep_count": ep_st["ep_count"],
                     "n_factors": len(sel_60_std.get((f_id, aid), [])),
                 }
         for f_id in list(sleeve_daily_ret.keys()):
@@ -427,59 +535,20 @@ def ensure_full60_oos_bundles(force_rebuild: bool = False) -> tuple[dict, dict]:
             "pit_assets": pit_assets,
             "trading_date_aligned": True,
         }
-        with open(bundle_path, "wb") as f:
-            pickle.dump(b, f)
+        b["daily_frames"] = {spec.symbol: prepared_60["frames"][spec.symbol]["1d"] for spec in UNIVERSE_60_SPECS}
+        b["fingerprint"] = prepared_60["fingerprint"]
+        _save_bundle(bundle_path, b, prepared_60["fingerprint"])
 
-    need_rebuild_c20 = force_rebuild or (not c20_path.exists())
     d_c20 = {}
-    if not need_rebuild_c20:
-        with open(c20_path, "rb") as f:
-            d_c20 = pickle.load(f)
-        if not d_c20.get("is_vol_warmup_fixed"):
-            need_rebuild_c20 = True
-
+    if not force_rebuild:
+        with suppress(UnverifiedArtifactError):
+            d_c20 = read_verified_pickle(c20_path, prepared_20["fingerprint"])
+    need_rebuild_c20 = not d_c20
     if need_rebuild_c20:
-        with open(OUT_DIR / "multitf_unit_grid_cache.pkl", "rb") as f:
-            ugrid_20 = pickle.load(f)
-        with open(OUT_DIR / "multitf_grid15m_frames.pkl", "rb") as f:
-            frames_20 = pickle.load(f)
-        with open(OUT_DIR / "multitf_grid1d_frames.pkl", "rb") as f:
-            frames_1d_20 = pickle.load(f)
-        het_scores_60 = pd.read_csv(CACHE_60_DIR / "multitf_60_hetero_scores.csv")
-        het_scores_20 = het_scores_60[het_scores_60["asset"].isin(CORE_20_IDS)].copy()
-        het_pool_20 = summarize_pooled_scores(het_scores_20)
-
-        sp15_20, sp1d_15_20 = {}, {}
-        for aid in CORE_20_IDS:
-            sym = SPECS_60[aid].symbol
-            df_1d = frames_1d_20[sym]
-            df_15m = frames_20[sym]["15m"]
-            for uid, (_, w_1d) in compute_hetero_1d_signals(df_1d).items():
-                ugrid_20[aid][uid] = np.asarray(map_tf_weight_to_base_grid(df_1d, w_1d, df_15m), dtype=np.float32)
-            for uid, (_, w_15m) in compute_hetero_15m_signals(df_15m).items():
-                ugrid_20[aid][uid] = np.asarray(w_15m, dtype=np.float32)
-            sp15_20[aid] = build_structure_pack(df_15m, "15m", box_window=32)
-            sp1d = build_structure_pack(df_1d, "1d", box_window=10)
-            sp1d_15 = dict(sp15_20[aid])
-            for k in (
-                "long_sec",
-                "short_sec",
-                "long_zs",
-                "short_zs",
-                "long_box",
-                "short_box",
-                "long_hyb",
-                "short_hyb",
-                "zs_zg",
-                "zs_zd",
-            ):
-                src_arr = np.asarray(sp1d[k], dtype=np.float64)
-                src_clean = np.where(np.isfinite(src_arr) & (src_arr > 0), src_arr, -1.0)
-                mapped = map_tf_weight_to_base_grid(df_1d, src_clean, df_15m)
-                bad = (~np.isfinite(mapped)) | (mapped <= 0)
-                sp1d_15[k] = np.where(bad, np.nan if k in ("zs_zg", "zs_zd") else sp15_20[aid][k], mapped)
-            sp1d_15_20[aid] = sp1d_15
-
+        ugrid_20 = prepared_20["units"]
+        frames_20 = prepared_20["frames"]
+        het_scores_20 = prepared_20["scores"]
+        het_pool_20 = prepared_20["pool"]
         sel_20_anchor = {}
         for fold in FOLDS:
             f_id = fold["id"]
@@ -487,9 +556,9 @@ def ensure_full60_oos_bundles(force_rebuild: bool = False) -> tuple[dict, dict]:
             f_s = het_scores_20[het_scores_20["fold"] == f_id]
             f_p = het_pool_20[het_pool_20["fold"] == f_id]
             for aid in CORE_20_IDS:
-                df15 = frames_20[SPECS_60[aid].symbol]["15m"]
-                m_is = (pd.to_datetime(df15["dt"]) <= cutoff).to_numpy()
-                ret_is = np.nan_to_num(df15["close"].pct_change().fillna(0.0).to_numpy(dtype=np.float64)[m_is], nan=0.0)
+                df15 = frames_20[specs_20[aid].symbol]["15m"]
+                m_is = pd.to_datetime(df15["dt"]).between(fold["train_start"], cutoff).to_numpy()
+                df_is = df15.loc[m_is].reset_index(drop=True)
                 acc, _, _ = run_incremental_funnel_gate123(
                     f_s,
                     f_p,
@@ -497,18 +566,20 @@ def ensure_full60_oos_bundles(force_rebuild: bool = False) -> tuple[dict, dict]:
                     f_id,
                     ugrid_20[aid],
                     m_is,
-                    ret_is,
-                    float(SPECS_60[aid].fee_rate),
+                    df_is,
+                    float(specs_20[aid].fee_rate),
                     allow_lowturn_hetero_15m=True,
+                    df_is=df15.loc[m_is].reset_index(drop=True),
+                    spec=specs_20[aid],
                 )
                 sel_20_anchor[(f_id, aid)] = acc
 
+        sp15_20, sp1d_15_20 = _structure_inputs(frames_20, specs_20, sel_20_anchor)
         df5_map_20 = {}
         for aid in CORE_20_IDS:
-            df = pd.read_parquet(OUT_DIR / "data_5m" / f"{aid}_5m.parquet")
+            df = pd.read_parquet(SOURCE_DIR / "data_5m" / f"{aid}_5m.parquet")
             df["dt"] = pd.to_datetime(df["dt"])
             df5_map_20[aid] = df.sort_values("dt").reset_index(drop=True)
-        specs_20 = {aid: SPECS_60[aid] for aid in CORE_20_IDS}
 
         exact_core20 = {}
         ep_20_exact: dict[str, dict] = {"fs": {}, "full": {}, "hr": {}}
@@ -521,8 +592,10 @@ def ensure_full60_oos_bundles(force_rebuild: bool = False) -> tuple[dict, dict]:
                 targets_5m = {}
                 for aid in CORE_20_IDS:
                     sel = sel_20_anchor[(f_id, aid)]
-                    df15 = frames_20[SPECS_60[aid].symbol]["15m"]
-                    if scheme == "fs":
+                    df15 = frames_20[specs_20[aid].symbol]["15m"]
+                    if not sel:
+                        t15 = np.zeros(len(df15), dtype=np.float64)
+                    elif scheme == "fs":
                         t15 = synthesize_fast_slow_synergy(df15, ugrid_20[aid], sel, specs_20[aid])
                     elif scheme == "full":
                         t15 = synthesize_structure_aware_synergy(
@@ -565,9 +638,13 @@ def ensure_full60_oos_bundles(force_rebuild: bool = False) -> tuple[dict, dict]:
                 led = allocate_and_account_5m_grid(df5_map_20, specs_20, targets_5m, oos_s, oos_e, deadzone=0.08)
                 ledgers.append(led)
             exact_core20[scheme] = ledgers
-        d_c20 = {"ledgers": exact_core20, "ep_20_exact": ep_20_exact, "is_vol_warmup_fixed": True}
-        with open(c20_path, "wb") as f:
-            pickle.dump(d_c20, f)
+        d_c20 = {
+            "ledgers": exact_core20,
+            "ep_20_exact": ep_20_exact,
+            "is_vol_warmup_fixed": True,
+        }
+        d_c20["fingerprint"] = prepared_20["fingerprint"]
+        _save_bundle(c20_path, d_c20, prepared_20["fingerprint"])
 
     return b, d_c20
 
@@ -605,6 +682,24 @@ def build_universe_60_summary_table() -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _portfolio_execution_evidence(fc: dict, core_ledger: dict | None = None) -> dict:
+    """Retain observed execution prices and effective fees for independent replay."""
+    fees = {aid: float(SPECS_60[aid].fee_rate) for aid in IDS_60}
+    prices = fc["execution_prices_df"][IDS_60].copy()
+    if core_ledger is not None:
+        fees.update(core_ledger["fee_rates"])
+        for aid in core_ledger["execution_prices_df"]:
+            prices[aid] = core_ledger["execution_prices_df"][aid].reindex(prices.index)
+    return {
+        "execution_prices_df": prices,
+        "returns_df": fc["ret_oos"][IDS_60],
+        "tradable_mask": fc["mask_oos"][IDS_60],
+        "fee_rates": fees,
+        "execution_clock": "next_open",
+        "accounting": "fixed_initial_capital",
+    }
 
 
 def _execute_sector_conserved_allocation(
@@ -716,7 +811,10 @@ def _execute_sector_conserved_allocation(
     fees = {c: float(SPECS_60[c].fee_rate) for c in IDS_60}
     ledger = account_portfolio_execution(ret_oos, w_oos, fees, tradable_mask=mask_oos)
     return {
-        "daily_returns": ledger["daily_returns"],
+        **_portfolio_execution_evidence(fc),
+        "daily_returns": ledger["bar_net_returns"]
+        .groupby(assign_futures_trading_day(ledger["bar_net_returns"].index))
+        .sum(),
         "bar_net_returns": ledger["bar_net_returns"],
         "gross_returns_df": ledger["gross_returns_df"],
         "cost_returns_df": ledger["cost_returns_df"],
@@ -818,12 +916,13 @@ def run_zero_hardcode_sop_stage3(
                 continue
             m = is_meta_stats[(f_id, aid)]
             if (
-                m["n_factors"] >= min_nf
+                _sleeve_sop_passed(m)
+                and m["n_factors"] >= min_nf
                 and m["is_shp_fs"] >= min_shp_fs
                 and m["is_shp_hr"] >= min_shp_hr
                 and m["is_payoff_r"] >= min_r
                 and m["is_safety_margin"] >= min_sm
-                and m["is_ep_count"] >= 6
+                and m["is_ep_count"] >= 30
             ):
                 sel_ids.append(aid)
         selected_per_fold[f_id] = sel_ids
@@ -868,15 +967,14 @@ def run_zero_hardcode_sop_stage3(
     return s, ledgers, selected_per_fold
 
 
-def compute_is_liquidity_and_price_returns() -> tuple[dict[tuple[str, str], dict[str, float]], pd.DataFrame]:
+def compute_is_liquidity_and_price_returns(
+    frames_1d: dict,
+) -> tuple[dict[tuple[str, str], dict[str, float]], pd.DataFrame]:
     """
     严格在每个折次的训练截止日 (<= cutoff) 前，按期货交易日归属计算全池 60 品种的样本内客观流动性深度
     （日均成交手数、名义成交额、有效上市天数）以及用于无监督产业链共线性风险分摊的日频价格收益率矩阵。
     全程 100% 零先验硬编码 (不引用 CORE_20_IDS)，杜绝任何未来信息泄露。
     """
-    with open(CACHE_60_DIR / "frames_1d_60.pkl", "rb") as f:
-        frames_1d = pickle.load(f)
-
     is_liq_stats: dict[tuple[str, str], dict[str, float]] = {}
     price_ret_dict: dict[str, pd.Series] = {}
 
@@ -965,9 +1063,10 @@ def run_zero_hardcode_cluster_conserved(
             m = is_meta_stats[(f_id, aid)]
             lq = is_liq_stats[(f_id, aid)]
             if (
-                lq["is_vol_wan"] >= min_vol_wan
+                _sleeve_sop_passed(m)
+                and lq["is_vol_wan"] >= min_vol_wan
                 and m["n_factors"] >= min_nf
-                and m["is_ep_count"] >= min_ep
+                and m["is_ep_count"] >= max(30, min_ep)
                 and m["is_shp_fs"] >= min_shp_fs
                 and m["is_shp_hr"] >= min_shp_hr
                 and m["is_payoff_r"] >= min_r
@@ -1086,12 +1185,13 @@ def run_core_satellite_sop_stage3(
             m = is_meta_stats[(f_id, aid)]
             c = is_corrs_with_core[(f_id, aid)]
             if (
-                m["n_factors"] >= min_nf
+                _sleeve_sop_passed(m)
+                and m["n_factors"] >= min_nf
                 and m["is_shp_fs"] >= min_shp_fs
                 and m["is_shp_hr"] >= min_shp_hr
                 and m["is_payoff_r"] >= min_r
                 and m["is_safety_margin"] >= min_sm
-                and m["is_ep_count"] >= 8
+                and m["is_ep_count"] >= 30
                 and c <= max_corr
             ):
                 sats.append(aid)
@@ -1099,7 +1199,24 @@ def run_core_satellite_sop_stage3(
 
         w_full = pd.DataFrame(0.0, index=ret_oos.index, columns=IDS_60, dtype=np.float64)
         for c in CORE_20_IDS:
-            w_full[c] = w_core[c].reindex(ret_oos.index).fillna(0.0)
+            w_full[c] = w_core[c].reindex(ret_oos.index).ffill().fillna(0.0)
+
+        if not sats or sat_cap <= 0.0:
+            expanded = {
+                key: c_led[key].reindex(index=ret_oos.index, columns=IDS_60, fill_value=0.0).fillna(0.0)
+                for key in ("gross_returns_df", "cost_returns_df", "turnover_df")
+            }
+            bar_net = expanded["gross_returns_df"].sum(axis=1) - expanded["cost_returns_df"].sum(axis=1)
+            combined_ledgers.append(
+                {
+                    **_portfolio_execution_evidence(fc, c_led),
+                    **expanded,
+                    "bar_net_returns": bar_net,
+                    "daily_returns": bar_net.groupby(assign_futures_trading_day(bar_net.index)).sum(),
+                    "weights_df": w_full,
+                }
+            )
+            continue
 
         if sats and sat_cap > 0.0:
             pos_sat = fc["pos_oos_map"][scheme][sats].copy()
@@ -1159,17 +1276,18 @@ def run_core_satellite_sop_stage3(
             cost_df = pd.DataFrame(0.0, index=ret_oos.index, columns=IDS_60)
             turn_df = pd.DataFrame(0.0, index=ret_oos.index, columns=IDS_60)
             for c in CORE_20_IDS:
-                gross_df[c] = c_led["gross_returns_df"][c]
-                cost_df[c] = c_led["cost_returns_df"][c]
-                turn_df[c] = c_led["turnover_df"][c]
+                gross_df[c] = c_led["gross_returns_df"][c].reindex(ret_oos.index).fillna(0.0)
+                cost_df[c] = c_led["cost_returns_df"][c].reindex(ret_oos.index).fillna(0.0)
+                turn_df[c] = c_led["turnover_df"][c].reindex(ret_oos.index).fillna(0.0)
             for s_aid in sats:
                 gross_df[s_aid] = sat_led["gross_returns_df"][s_aid]
                 cost_df[s_aid] = sat_led["cost_returns_df"][s_aid]
                 turn_df[s_aid] = sat_led["turnover_df"][s_aid]
-            bar_net = c_led["bar_net_returns"] + sat_led["bar_net_returns"]
-            daily_net = bar_net.groupby(bar_net.index.normalize()).sum()
+            bar_net = c_led["bar_net_returns"].add(sat_led["bar_net_returns"], fill_value=0.0)
+            daily_net = bar_net.groupby(assign_futures_trading_day(bar_net.index)).sum()
             combined_ledgers.append(
                 {
+                    **_portfolio_execution_evidence(fc, c_led),
                     "daily_returns": daily_net,
                     "bar_net_returns": bar_net,
                     "gross_returns_df": gross_df,
@@ -1196,18 +1314,24 @@ def build_attribution_tables(
     flat_gross = pd.concat([led["gross_returns_df"] for led in flat_ledgers]).sum() * 100.0
     flat_cost = pd.concat([led["cost_returns_df"] for led in flat_ledgers]).sum() * 100.0
     flat_net = flat_gross - flat_cost
-    flat_turn = pd.concat([led["turnover_df"] for led in flat_ledgers]).sum() / (503.0 / 252.0)
+    flat_turn = pd.concat([led["turnover_df"] for led in flat_ledgers]).sum() / (
+        max(pd.concat([led["daily_returns"] for led in flat_ledgers]).index.nunique(), 1) / 252.0
+    )
 
     cs_gross = pd.concat([led["gross_returns_df"] for led in cs_ledgers]).sum() * 100.0
     cs_cost = pd.concat([led["cost_returns_df"] for led in cs_ledgers]).sum() * 100.0
     cs_net = cs_gross - cs_cost
-    cs_turn = pd.concat([led["turnover_df"] for led in cs_ledgers]).sum() / (503.0 / 252.0)
+    cs_turn = pd.concat([led["turnover_df"] for led in cs_ledgers]).sum() / (
+        max(pd.concat([led["daily_returns"] for led in cs_ledgers]).index.nunique(), 1) / 252.0
+    )
 
     if zhc_ledgers is not None:
         zhc_gross = pd.concat([led["gross_returns_df"] for led in zhc_ledgers]).sum() * 100.0
         zhc_cost = pd.concat([led["cost_returns_df"] for led in zhc_ledgers]).sum() * 100.0
         zhc_net = zhc_gross - zhc_cost
-        zhc_turn = pd.concat([led["turnover_df"] for led in zhc_ledgers]).sum() / (503.0 / 252.0)
+        zhc_turn = pd.concat([led["turnover_df"] for led in zhc_ledgers]).sum() / (
+            max(pd.concat([led["daily_returns"] for led in zhc_ledgers]).index.nunique(), 1) / 252.0
+        )
     else:
         zhc_gross = cs_gross
         zhc_cost = cs_cost
@@ -1351,7 +1475,7 @@ def generate_html_report(
         rows=2,
         cols=2,
         subplot_titles=(
-            "1.0x 纯样本外累计净值曲线对比 (2025.01 ~ 2026.09, 503交易日)",
+            "1.0x 历史滚动验证累计净值曲线对比 (2025.01 ~ 2026.09, 按实际交易日统计)",
             "3.0x 机构目标敞口累计净收益对比",
             "6大板块净收益贡献对比：Flat-60 vs ZeroHC-ClusterConserved-60 vs Core-Satellite-60",
             "活跃品种净收益贡献排序（ZeroHC-ClusterConserved-60 vs Flat-60稀释）",
@@ -1428,7 +1552,7 @@ def generate_html_report(
         go.Bar(
             x=sec_df["sector"],
             y=sec_df["zerohc60_net_pct"],
-            name="ZeroHC-ClusterConserved-60 零先验最优 (净收益%)",
+            name="ZeroHC-ClusterConserved-60 固定参数配置 (净收益%)",
             marker_color="#c0392b",
         ),
         row=2,
@@ -1438,7 +1562,7 @@ def generate_html_report(
         go.Bar(
             x=sec_df["sector"],
             y=sec_df["coresat60_net_pct"],
-            name="Core-Satellite-60 最优架构 (净收益%)",
+            name="Core-Satellite-60 固定参数架构 (净收益%)",
             marker_color="#27ae60",
         ),
         row=2,
@@ -1481,13 +1605,13 @@ def generate_html_report(
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0.0},
     )
 
-    chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn")
+    chart_html = fig.to_html(full_html=False, include_plotlyjs=True)
     ablation_show = ablation_df.drop(columns=["daily_series"], errors="ignore")
     html_doc = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>方案B（60商品期货）100%零先验硬编码重构：F簇因果截面去噪与产业链簇预算守恒实证报告</title>
+<title>60商品CTA修正后历史验证：完整执行证据与严格准入</title>
 <style>
 body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 24px; color: #2c3e50; background: #f8f9fa; }}
 h1, h2, h3 {{ color: #1a252f; }}
@@ -1500,9 +1624,10 @@ td:first-child, td:nth-child(2), td:nth-child(3) {{ text-align: left; }}
 </style>
 </head>
 <body>
-<h1>方案B（60个流动性合格商品期货）100%零先验硬编码重构：F簇因果截面去噪与产业链簇风险预算守恒实证报告</h1>
+<h1>60商品CTA修正后历史验证：完整执行证据与严格准入</h1>
 <div class="card">
-<h2>一、核心消融实验总表（2025.01 ~ 2026.09，503个纯样本外交易日，原生5m网格计价）</h2>
+<p>本报告重新计算真实连续参考价格上的信号与完整执行事件；历史2025–2026区间已经用于研究对比，属于回溯验证，不构成未触碰盲测。2026-10-01起的数据封存。无准入与零交易表示证据不足，不证明策略有效；主连换月与真实合约成交仍需另行验证。</p>
+<h2>一、核心消融实验总表（2025.01 ~ 2026.09，历史滚动验证区间，原生5m网格计价）</h2>
 {ablation_show.to_html(index=False)}
 </div>
 <div class="card">
@@ -1522,8 +1647,51 @@ td:first-child, td:nth-child(2), td:nth-child(3) {{ text-align: left; }}
     output_path.write_text(html_doc, encoding="utf-8")
 
 
+def save_execution_ledgers(ledger_map: dict[str, list[dict]], full_fingerprint, core_fingerprint) -> None:
+    """Persist replayable fold evidence bound to both full-universe and core inputs."""
+    manifests = {"full60": full_fingerprint.manifest(), "core20": core_fingerprint.manifest()}
+    for manifest in manifests.values():
+        for record in (*manifest["sources"], *manifest["data"]):
+            if file_sha256(record["path"]) != record["sha256"]:
+                raise UnverifiedArtifactError("Research inputs changed before publishing execution ledgers; rebuild")
+    fingerprint = build_fingerprint(
+        source_paths=[record["path"] for manifest in manifests.values() for record in manifest["sources"]],
+        data_paths=[record["path"] for manifest in manifests.values() for record in manifest["data"]],
+        config={"input_studies": manifests, "ledger_protocol": "next_open_fixed_initial_capital"},
+    )
+    required = {
+        "execution_prices_df",
+        "returns_df",
+        "weights_df",
+        "tradable_mask",
+        "fee_rates",
+        "gross_returns_df",
+        "cost_returns_df",
+        "turnover_df",
+        "daily_returns",
+        "bar_net_returns",
+    }
+    for variant, ledgers in ledger_map.items():
+        if len(ledgers) != len(FOLDS):
+            raise ValueError(f"Missing execution folds for {variant}")
+        for fold, ledger in zip(FOLDS, ledgers, strict=True):
+            missing = required - ledger.keys()
+            if missing:
+                raise ValueError(f"Incomplete execution evidence for {variant}/{fold['id']}: {sorted(missing)}")
+            payload = {**ledger, "variant": variant, "fold": fold["id"], "fold_settings": dict(fold)}
+            write_verified_artifact(
+                OUT_DIR / "ledgers" / f"{variant}_{fold['id']}.pkl",
+                pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL),
+                fingerprint,
+                output_dir=OUT_DIR,
+                readonly_roots=(SOURCE_DIR,),
+            )
+
+
 def main() -> None:
     t0 = time.time()
+    validate_output_directory(OUT_DIR, (SOURCE_DIR,))
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     print("=" * 96)
     print("启动方案B（60个流动性合格商品期货）全链路消融实证与归因分析...")
     print("=" * 96)
@@ -1544,7 +1712,7 @@ def main() -> None:
     ep_20_exact = d_c20["ep_20_exact"]
     ep_60_map_all = {"fs": ep_fs, "full": ep_full, "hr": ep_hr}
 
-    is_liq_stats, price_ret_df = compute_is_liquidity_and_price_returns()
+    is_liq_stats, price_ret_df = compute_is_liquidity_and_price_returns(b["daily_frames"])
 
     # 计算扩展品种与同板块 Core-20 旗舰在样本内 (<= cutoff) 的最大绝对相关性（仅供 Core-Satellite 对照组使用）
     is_corrs_with_core: dict[tuple[str, str], float] = {}
@@ -1664,7 +1832,7 @@ def main() -> None:
     results.append(s_opt)
     ledger_map["Full60_CoreSatellite_SOPStage3_Optimal"] = leds_opt
 
-    # 6. Full-60 100% 零先验硬编码 + F簇因果截面去噪 + 无监督产业链共线性聚类 + 板块风险预算守恒最优架构
+    # 6. Full-60 100% 零先验硬编码 + F簇因果截面去噪 + 无监督产业链共线性聚类 + 板块风险预算守恒固定参数架构
     s_zhc_opt, leds_zhc_opt, sel_zhc_opt = run_zero_hardcode_cluster_conserved(
         "Full60_ZeroHardcode_ClusterConserved_Optimal",
         oos_fast_cache=oos_fast_cache,
@@ -1711,7 +1879,12 @@ def main() -> None:
         results.append(s3)
         ledger_map[name_3x] = leds_3x
 
+    save_execution_ledgers(ledger_map, b["fingerprint"], d_c20["fingerprint"])
     ablation_df = pd.DataFrame(results)
+    ablation_df["validation_scope"] = "retrospective_oos_validation"
+    ablation_df["execution_evidence"] = np.where(
+        ablation_df["ann_turnover"].abs() > 1e-12, "historical_reference_price_trades", "no_executed_positions"
+    )
     ablation_csv = OUT_DIR / "full60_ablation_comparison.csv"
     ablation_df.to_csv(ablation_csv, index=False)
     print(f"[2/5] 已生成消融对比表: {ablation_csv.name}")

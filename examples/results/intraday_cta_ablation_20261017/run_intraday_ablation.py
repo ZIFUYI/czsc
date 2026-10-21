@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -32,8 +33,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from examples.alpha_mining_agent.forensic_pipeline import (  # noqa: E402
-    compute_single_factor_net_sharpe_and_turnover,
-    evaluate_execution_events,
+    run_execution_audit,
 )
 from examples.alpha_mining_agent.hypothesis_bank import (  # noqa: E402
     ALL_ARCHETYPES,
@@ -49,8 +49,14 @@ from examples.multi_factor_cta.data_engine import (  # noqa: E402
     CrossAssetDataEngine,
     map_tf_weight_to_base_grid,
 )
-from examples.multi_factor_cta.forensic_validator import RollingEmpiricalBayesWeighter  # noqa: E402
+from examples.multi_factor_cta.forensic_validator import (  # noqa: E402
+    RollingEmpiricalBayesWeighter,
+    classify_causal_market_regime,
+    select_pooled_multitf_gate1_units,
+    summarize_execution_pooled_scores,
+)
 from examples.multi_factor_cta.run_framework_demo import load_research_universe  # noqa: E402
+from examples.multi_factor_cta.study_execution import execution_sharpe, study_execution_ledger  # noqa: E402
 from examples.multi_factor_cta.synthesis_engine import (  # noqa: E402
     ContinuousSignalStateMachine,
     CrossAssetHRPSynthesizer,
@@ -60,7 +66,9 @@ from examples.multi_factor_cta.synthesis_engine import (  # noqa: E402
 )
 
 OUT_DIR = Path(__file__).resolve().parent
-MANIFEST_PATH = ROOT / "examples/results/research_rerun_20261017/manifest.json"
+MANIFEST_PATH = Path(
+    os.environ.get("CZSC_CTA_MANIFEST", ROOT / "examples/results/research_rerun_20261017/manifest.json")
+).resolve()
 CACHE_ROOT = ROOT / "examples/results/research_rerun_20261017/intraday/native_cache"
 
 # Core-20 主力商品期货池（覆盖全部 5 大商品板块，2024.01-2026.09 全周期无缺失）
@@ -129,71 +137,52 @@ def evaluate_candidate_on_fold(
     fee_rate: float,
     cutoff: pd.Timestamp,
 ) -> dict[str, Any]:
-    """在训练截止时刻 cutoff 之前评估单个候选因子的 Rust 原生执行事件与时序净 Sharpe"""
-    episodes = evaluate_execution_events(df_tf, w_tf, fee_rate=fee_rate, label_end_dt=cutoff)
-    ts_stats = compute_single_factor_net_sharpe_and_turnover(
-        df_tf, w_tf, timeframe=tf, fee_rate=fee_rate, is_end_dt=cutoff
-    )
-    n = len(episodes)
-    if n == 0:
-        return {
-            "n": 0,
-            "effective_n": 0.0,
-            "mean_net_pct": 0.0,
-            "q_mean_net_pct": 0.0,
-            "win_rate": 0.0,
-            "pl_ratio": 0.0,
-            "safety_margin": -1.0,
-            "t_stat": 0.0,
-            "is_net_sharpe": ts_stats["is_net_sharpe"],
-            "ann_turnover": ts_stats["ann_turnover"],
-            "strict_local_pass": False,
-            "event_returns": np.zeros(0, dtype=np.float64),
-        }
+    """Evaluate completed training-only next-open episodes through the formal SOP.
 
-    rets = episodes["net_ret"].to_numpy(dtype=np.float64)
-    q = np.clip(episodes["quality_w"].to_numpy(dtype=np.float64), 1e-6, 1.0)
-    q_sum = float(q.sum())
-    eff_n = float((q_sum * q_sum) / max(float((q * q).sum()), 1e-12))
-    mean_ret = float(rets.mean())
-    q_mean_ret = float((q * rets).sum() / q_sum)
-    std_ret = float(rets.std(ddof=1)) if n > 1 else 1e-6
-    t_stat = float(mean_ret / (std_ret / np.sqrt(n))) if std_ret > 1e-12 and n > 1 else 0.0
-
-    wins = rets[rets > 0]
-    losses = np.abs(rets[rets <= 0])
-    win_rate = float(len(wins) / n)
-    avg_win = float(wins.mean()) if len(wins) > 0 else 0.0
-    avg_loss = float(losses.mean()) if len(losses) > 0 else 1e-6
-    pl_ratio = avg_win / max(avg_loss, 1e-6)
-    be_win = 1.0 / (1.0 + pl_ratio)
-    safety_margin = win_rate - be_win
-
-    # CI 下界近似 (95% 单侧 / 97.5% 双侧)
-    ci_low = mean_ret - 1.96 * (std_ret / np.sqrt(n)) if n >= 2 else -1.0
-    strict_local_pass = bool(
-        n >= 30
-        and eff_n >= 30.0
-        and win_rate > 0.50
-        and pl_ratio > 1.50
-        and safety_margin > 0.10
-        and ci_low > 0.0
-        and ts_stats["is_net_sharpe"] > 0.0
-    )
-    return {
-        "n": int(n),
-        "effective_n": round(eff_n, 2),
-        "mean_net_pct": round(mean_ret * 100.0, 4),
-        "q_mean_net_pct": round(q_mean_ret * 100.0, 4),
-        "win_rate": round(win_rate * 100.0, 2),
-        "pl_ratio": round(pl_ratio, 3),
-        "safety_margin": round(safety_margin * 100.0, 2),
-        "t_stat": round(t_stat, 3),
-        "is_net_sharpe": ts_stats["is_net_sharpe"],
-        "ann_turnover": ts_stats["ann_turnover"],
-        "strict_local_pass": strict_local_pass,
-        "event_returns": rets,
+    Complete event evidence is returned for stratified pooling; callers may omit
+    it from display CSVs, but must retain it in memory for admission. Future rows
+    and decisions are physically removed before computing either statistics or
+    causal regime metadata. No synthetic closing trade is added at the cutoff.
+    """
+    mask = pd.to_datetime(df_tf["dt"]) <= cutoff
+    training = df_tf.loc[mask].reset_index(drop=True)
+    decisions = np.asarray(w_tf, dtype=np.float64)[mask.to_numpy()]
+    audit = run_execution_audit(training, decisions, fee_rate=fee_rate, is_end_dt=cutoff, min_net_sharpe=-float("inf"))
+    execution = study_execution_ledger(training, decisions, fee_rate)
+    net_sharpe = execution_sharpe(training, decisions, fee_rate)
+    daily_count = len(execution["daily_returns"])
+    turnover = float(execution["turnover_df"].to_numpy().sum())
+    reason = audit["reason"]
+    if net_sharpe <= 0:
+        reason = (reason + "; " if not audit["passed"] else "") + "实际次开执行交易日Sharpe不大于0"
+    events = audit["events"]
+    if events:
+        regimes = classify_causal_market_regime(training)
+        for event in events:
+            event["regime"] = int(regimes[int(event["trigger_idx"])])
+    returns = np.asarray([event["net_ret"] for event in events], dtype=np.float64)
+    result = {
+        "n": audit["is_n_purged"],
+        "effective_n": audit["is_effective_n"],
+        "mean_net_pct": audit.get("is_mean_pct", 0.0),
+        "q_mean_net_pct": audit.get("is_mean_pct", 0.0),
+        "win_rate": audit.get("is_win_rate_pct", 0.0),
+        "pl_ratio": audit.get("is_pl_ratio", 0.0),
+        "safety_margin": audit.get("is_safety_margin_pct", 0.0),
+        "mean_ci_low_pct": audit["is_mean_ci_low_pct"],
+        "is_boot_pval": audit.get("is_boot_pval", 1.0),
+        "is_net_sharpe": net_sharpe,
+        "ann_turnover": turnover * 252 / max(daily_count, 1),
+        "strict_local_pass": audit["passed"] and net_sharpe > 0,
+        "admission_reason": reason,
+        "cutoff": pd.Timestamp(cutoff).isoformat(),
+        "events": events,
+        "event_returns": returns,
     }
+    for key in ("pool_group", "microstructure_group"):
+        if isinstance(df_tf.attrs.get(key), str):
+            result[key] = df_tf.attrs[key]
+    return result
 
 
 def select_factors_by_gate(
@@ -203,66 +192,29 @@ def select_factors_by_gate(
     gate_mode: str,
     allowed_tfs: tuple[str, ...] = ("60m", "30m", "15m"),
 ) -> list[str]:
-    """根据不同准入漏斗规则筛选当前资产的入选候选因子 (uid = sid@tf)"""
+    """Select formal admissions; Gate0 is an explicitly unfiltered diagnostic control.
+
+    Historical Gate1/2/3 names remain report labels, but none may waive the local
+    SOP or manufacture pooled significance. Gate3 may rank admitted units within
+    each archetype; a failed or empty evidence pool has no fallback candidate.
+    """
     sub = fold_scores[(fold_scores["asset"] == asset_id) & (fold_scores["tf"].isin(allowed_tfs))].copy()
     if sub.empty:
         return []
-
     if gate_mode == "Gate0_All":
         return sorted(sub["uid"].tolist())
-
-    if gate_mode == "Gate1_Strict":
-        # 原版严苛准入：本地严格通过 + 全池无一品种缺事件 (min_asset_n >= 30) + 普适率 >= 65% + 池化 t >= 1.96
-        valid_pools = set(
-            pooled_stats[
-                (pooled_stats["min_asset_n"] >= 30)
-                & (pooled_stats["pos_asset_ratio"] >= 0.65)
-                & (pooled_stats["pooled_t"] >= 1.96)
-            ]["uid"]
+    if gate_mode not in {"Gate1_Strict", "Gate2_Local", "Gate3_PooledSynergy"}:
+        raise ValueError(f"Unknown gate_mode: {gate_mode}")
+    admitted = select_pooled_multitf_gate1_units(sub, pooled_stats, asset_id)
+    if gate_mode != "Gate3_PooledSynergy":
+        return sorted(admitted["uid"].tolist())
+    selected = []
+    for archetype in ALL_ARCHETYPES:
+        ranked = admitted.loc[admitted["archetype"] == archetype].sort_values(
+            ["pooled_t", "is_net_sharpe"], ascending=[False, False]
         )
-        passed = sub[sub["strict_local_pass"] & sub["uid"].isin(valid_pools)]
-        return sorted(passed["uid"].tolist())
-
-    if gate_mode == "Gate2_Local":
-        # 单品种本地正期望准入：n >= 15, mean_net_pct > 0, is_net_sharpe > 0.15
-        passed = sub[(sub["n"] >= 15) & (sub["mean_net_pct"] > 0.0) & (sub["is_net_sharpe"] > 0.15)]
-        return sorted(passed["uid"].tolist())
-
-    if gate_mode == "Gate3_PooledSynergy":
-        # 跨品种池化协同准入（多因子弱预测器正交合成范式）：
-        # 1. 池内汇总事件数 total_n >= 150，池化平均净收益 > 0，池化 t_stat >= 1.50（或池化平均 Sharpe >= 0.10），正收益品种占比 >= 45%
-        # 2. 按 6 大战略簇分层优选 Top 4 候选，结合本品种未出现严重水土不服 (is_net_sharpe >= -0.15 且 mean_net_pct >= -0.02)
-        pool_ok = pooled_stats[
-            (pooled_stats["tf"].isin(allowed_tfs))
-            & (pooled_stats["total_n"] >= 150)
-            & (pooled_stats["pooled_mean_pct"] > 0.0)
-            & ((pooled_stats["pooled_t"] >= 1.50) | (pooled_stats["mean_sharpe"] >= 0.10))
-            & (pooled_stats["pos_asset_ratio"] >= 0.45)
-        ].copy()
-        if pool_ok.empty:
-            # 保底按各簇池化 t_stat 选最优正均值因子
-            pool_ok = pooled_stats[
-                (pooled_stats["tf"].isin(allowed_tfs))
-                & (pooled_stats["total_n"] >= 100)
-                & (pooled_stats["pooled_mean_pct"] > 0.0)
-            ].copy()
-
-        selected_uids: set[str] = set()
-        for arch in ALL_ARCHETYPES:
-            arch_df = pool_ok[pool_ok["archetype"] == arch].sort_values(
-                ["pooled_t", "mean_sharpe"], ascending=[False, False]
-            )
-            selected_uids.update(arch_df.head(4)["uid"].tolist())
-
-        # 本地兼容性过滤：剔除在该品种上明显反向亏损的因子
-        local_ok = sub[
-            sub["uid"].isin(selected_uids)
-            & (sub["n"] >= 5)
-            & ((sub["is_net_sharpe"] >= -0.10) | (sub["mean_net_pct"] > 0.0))
-        ]
-        return sorted(local_ok["uid"].tolist())
-
-    raise ValueError(f"Unknown gate_mode: {gate_mode}")
+        selected.extend(ranked.head(4)["uid"].tolist())
+    return sorted(selected)
 
 
 def synthesize_asset_signal(
@@ -599,7 +551,6 @@ def main() -> None:
         fid = fold["id"]
         cutoff = pd.Timestamp(fold["cutoff"])
         f_rows = []
-        event_pool: dict[str, list[np.ndarray]] = {uid: [] for uid in candidates}
 
         for spec in specs_list:
             aid = spec.name
@@ -613,8 +564,6 @@ def main() -> None:
                     fee_rate=spec.fee_rate,
                     cutoff=cutoff,
                 )
-                if len(res["event_returns"]) > 0:
-                    event_pool[uid].append(res["event_returns"])
                 row = {
                     "fold": fid,
                     "asset": aid,
@@ -631,43 +580,16 @@ def main() -> None:
         df_f = pd.DataFrame(f_rows)
         fold_score_dfs[fid] = df_f
 
-        # 汇总跨品种池化指标
-        p_rows = []
-        for uid in candidates:
-            sid, tf = uid.split("@")
-            sub_u = df_f[df_f["uid"] == uid]
-            all_ev = np.concatenate(event_pool[uid]) if event_pool[uid] else np.zeros(0, dtype=np.float64)
-            tot_n = len(all_ev)
-            if tot_n > 1:
-                p_mean = float(all_ev.mean())
-                p_std = float(all_ev.std(ddof=1))
-                p_t = float(p_mean / (p_std / np.sqrt(tot_n))) if p_std > 1e-12 else 0.0
-            else:
-                p_mean, p_t = 0.0, 0.0
-            p_rows.append(
-                {
-                    "fold": fid,
-                    "uid": uid,
-                    "sid": sid,
-                    "tf": tf,
-                    "archetype": ALL_SIGNAL_SPECS[sid].archetype,
-                    "total_n": int(tot_n),
-                    "min_asset_n": int(sub_u["n"].min()),
-                    "median_asset_n": float(sub_u["n"].median()),
-                    "pos_asset_ratio": round(float((sub_u["mean_net_pct"] > 0).mean()), 3),
-                    "pooled_mean_pct": round(p_mean * 100.0, 4),
-                    "pooled_t": round(p_t, 3),
-                    "mean_sharpe": round(float(sub_u["is_net_sharpe"].mean()), 3),
-                    "strict_local_pass_cnt": int(sub_u["strict_local_pass"].sum()),
-                }
-            )
-        df_p = pd.DataFrame(p_rows)
+        # Pool actual time-stamped execution episodes; simultaneous assets are not independent samples.
+        df_p = summarize_execution_pooled_scores(df_f)
         fold_pooled_dfs[fid] = df_p
 
     df_all_scores = pd.DataFrame(all_score_rows)
     df_all_pooled = pd.concat(list(fold_pooled_dfs.values()), ignore_index=True)
-    df_all_scores.to_csv(OUT_DIR / "intraday_factor_scores.csv", index=False)
-    df_all_pooled.to_csv(OUT_DIR / "intraday_factor_pooled_summary.csv", index=False)
+    df_all_scores.drop(columns=["events"], errors="ignore").to_csv(OUT_DIR / "intraday_factor_scores.csv", index=False)
+    df_all_pooled.drop(columns=["pool_audits"], errors="ignore").to_csv(
+        OUT_DIR / "intraday_factor_pooled_summary.csv", index=False
+    )
 
     # 打印各战略簇在日内周期上的整体体检表
     print("\n--- [诊断表 1] 六大战略簇在日内周期 (60m/30m/15m) 的池化体检汇总 ---")
