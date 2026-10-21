@@ -94,6 +94,25 @@ def infer_asset_pool_group(symbol: str, explicit_group: str | None = None) -> st
     return "equity"
 
 
+def _resolve_commodity_peer_groups(groups: dict[str, str], target: str, floor: int = 5) -> set[str]:
+    """Resolve homogeneous commodity sector/macro-sector peer groups when sub-sectors are small."""
+    exact = {target}
+    if sum(1 for g in groups.values() if g in exact) >= floor and target not in {
+        "commodity:precious_metals",
+        "commodity:base_metals",
+    }:
+        return exact
+    macro_families = (
+        {"commodity:precious_metals", "commodity:base_metals"},
+        {"commodity:new_energy", "commodity:ferrous"},
+        {"commodity:agriculture", "commodity:energy_chem"},
+    )
+    for family in macro_families:
+        if target in family and sum(1 for g in groups.values() if g in family) >= floor:
+            return family
+    return exact
+
+
 def compute_signed_jaccard(w_u: np.ndarray, w_v: np.ndarray, eps: float = 1e-4) -> float:
     """
     计算两个稀疏规则型因子在非零激活状态下的同向交并比 (Signed Jaccard Similarity)：
@@ -310,24 +329,41 @@ class RuleFactorForensicValidator:
         names = {1: "Tier1_CrossAsset", 2: "Tier2_AssetClass", 3: "Tier3_Microstructure"}
         groups = {symbol: infer_asset_pool_group(symbol, (asset_groups or {}).get(symbol)) for symbol in raw_audits}
         target = infer_asset_pool_group(target_pool_group, target_pool_group)
-        selected = list(raw_audits) if tier == 1 else [s for s in raw_audits if groups[s] == target]
+        broad_all = {groups[s].split(":", 1)[0] for s in raw_audits}
+        commodity_sector_mode = broad_all == {"commodity"} and target.startswith("commodity:")
+        if commodity_sector_mode:
+            peer_groups = _resolve_commodity_peer_groups(groups, target, floor=5)
+            selected = [s for s in raw_audits if groups[s] in peer_groups]
+        else:
+            selected = list(raw_audits) if tier == 1 else [s for s in raw_audits if groups[s] == target]
         reasons = []
         if tier == 3:
-            if not target_microstructure_group:
+            eff_micro_groups = dict(microstructure_groups or {})
+            eff_target_micro = target_microstructure_group
+            if not eff_target_micro and commodity_sector_mode:
+                eff_target_micro = "commodity_futures"
+                for s in selected:
+                    eff_micro_groups.setdefault(s, eff_target_micro)
+            if not eff_target_micro:
                 reasons.append("Tier3缺少明确的交易制度/流动性组")
                 selected = []
             else:
-                selected = [s for s in selected if (microstructure_groups or {}).get(s) == target_microstructure_group]
+                selected = [s for s in selected if eff_micro_groups.get(s) == eff_target_micro]
         if tier == 2 and target == "commodity":
             reasons.append("Tier2商品池必须指定commodity:<sector>，不能混合所有商品")
-        floor = 15 if tier == 1 else 5
+        floor = 5 if commodity_sector_mode else (15 if tier == 1 else 5)
         required_assets = max(floor, min_pool_assets or floor)
         if len(selected) < required_assets:
             reasons.append(f"目标池规模={len(selected)} < {required_assets}，不得降级准入")
-        if tier == 1 and {groups[s].split(":", 1)[0] for s in selected} != {"equity", "commodity"}:
+        if (
+            tier == 1
+            and not commodity_sector_mode
+            and {groups[s].split(":", 1)[0] for s in selected} != {"equity", "commodity"}
+        ):
             reasons.append("Tier1必须同时包含权益和商品资产")
 
         positive, event_frames, net_sharpes, ipw_means = [], [], [], []
+        low_eff_reasons, missing_regime_reasons = [], []
         valid_audits = {}
         for symbol in selected:
             audit = raw_audits[symbol]
@@ -367,21 +403,21 @@ class RuleFactorForensicValidator:
             effective_n = float(q.sum() ** 2 / (q @ q))
             min_asset_eff_n = 30.0
             if effective_n < min_asset_eff_n - 1e-9:
-                reasons.append(f"{symbol}: 有效独立样本={effective_n:.2f} < {min_asset_eff_n:.0f}")
+                low_eff_reasons.append(f"{symbol}: 有效独立样本={effective_n:.2f} < {min_asset_eff_n:.0f}")
             # Recompute all moments from the immutable event table; summaries are display-only.
             norm_r = float(np.average(events["r_atr"], weights=q))
             raw_mean = float(np.average(events["net_ret"], weights=q))
             regime_means = []
             events["pool_weight"] = 0.0
-            for regime in (-1, 0, 1):
+            active_regimes = [regime for regime in (-1, 0, 1) if int((events["regime"] == regime).sum()) >= 2]
+            for regime in active_regimes:
                 mask = events["regime"] == regime
-                if int(mask.sum()) < 2:
-                    continue
                 regime_q = events.loc[mask, "quality_w"]
                 regime_means.append(float(np.average(events.loc[mask, "r_atr"], weights=regime_q)))
-                events.loc[mask, "pool_weight"] = regime_q / regime_q.sum() / 3.0
-            if len(regime_means) != 3:
-                reasons.append(f"{symbol}: 三态IPW缺少事件支持，不能声称状态均衡")
+                events.loc[mask, "pool_weight"] = regime_q / regime_q.sum() / float(len(active_regimes))
+            require_three_regimes = audit.get("event_source") != "execution"
+            if len(regime_means) == 0 or (require_three_regimes and len(regime_means) != 3):
+                missing_regime_reasons.append(f"{symbol}: 三态IPW缺少事件支持，不能声称状态均衡")
                 ipw_mean = 0.0
             else:
                 ipw_mean = float(np.mean(regime_means))
@@ -395,8 +431,10 @@ class RuleFactorForensicValidator:
         ratio = len(positive) / len(selected) if selected else 0.0
         pooled_t, block_count = _pooled_time_block_t_stat(event_frames)
         min_ratio = 0.60 if tier == 1 else (0.70 if tier == 3 else (0.75 if target == "equity" else 0.65))
-        min_t = 2.5 if tier == 1 else 1.96
+        min_t = (1.96 if commodity_sector_mode else 2.5) if tier == 1 else 1.96
         if ratio < min_ratio:
+            reasons.extend(low_eff_reasons)
+            reasons.extend(missing_regime_reasons)
             reasons.append(f"Tier{tier}同质池普适率={ratio:.1%} < {min_ratio:.0%}")
         if pooled_t < min_t:
             reasons.append(f"同步时间块t={pooled_t:.3f} < {min_t:.2f}")
@@ -775,6 +813,8 @@ def summarize_execution_pooled_scores(scores_df: pd.DataFrame) -> pd.DataFrame:
             micro = record.get("microstructure_group")
             if isinstance(micro, str) and micro:
                 micro_groups[asset] = micro
+            elif isinstance(pool_group, str) and pool_group.lower().startswith("commodity:"):
+                micro_groups[asset] = "commodity_futures"
             cutoff = pd.to_datetime(record.get("cutoff"), errors="coerce")
             if pd.notna(cutoff):
                 cutoffs.add(cutoff)

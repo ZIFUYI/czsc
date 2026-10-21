@@ -117,6 +117,7 @@ def _compute_asset_evidence(args):
                     "archetype": ALL_SIGNAL_SPECS[sid].archetype,
                     "sector": spec.sector,
                     "pool_group": f"commodity:{spec.sector.lower()}",
+                    "microstructure_group": "commodity_futures",
                     **{key: value for key, value in evaluation.items() if key != "event_returns"},
                 }
             )
@@ -190,7 +191,15 @@ def prepare_study_inputs(specs: list[AssetSpec], *, source_dir: Path, output_dir
         # still protected by the complete study fingerprint above.
         cache_dir = output_dir / "native_cache"
         frames = dict(mapper(_load_asset, [(spec, cache_dir) for spec in specs]))
-        metadata = {s.symbol: {"asset_group": "commodity", "sector": s.sector, "fee_rate": s.fee_rate} for s in specs}
+        metadata = {
+            s.symbol: {
+                "asset_group": "commodity",
+                "sector": s.sector,
+                "microstructure_group": "commodity_futures",
+                "fee_rate": s.fee_rate,
+            }
+            for s in specs
+        }
         frames = prepare_research_pool(frames, metadata=metadata)
         print(f"[loaded] {len(specs)} assets; generating executable evidence with {workers} workers", flush=True)
         jobs = [(spec, frames[spec.symbol], base_uids, source_dir, protocol) for spec in specs]

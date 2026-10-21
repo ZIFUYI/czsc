@@ -514,6 +514,27 @@ class FactorContext:
             "ntmdk": _native_state(df, "NTMDK多空V230824"),
             "kcatr": _native_state(df, "KCATR多空V230823"),
             "fake_break": _native_state(df, "假突破"),
+            # Stage 2 新增：182 未开发信号普查筛出的高信噪比且 100% 严格价格镜像对称 (exact_mirror=True) 原生状态
+            "ma_joint": _native_state(df, "均线粘合发散V260520"),
+            "double_ma": _native_state(df, "双均线_BS辅助V240208"),
+            "dif_layer": _native_state(df, "完全分类V241010"),
+            "dif_zero": _native_state(df, "DIF靠近零轴T50_BS辅助V240612"),
+            "macd_bc_ubi": _native_state(df, "MACD背驰_UBI观察V230804"),
+            "macd_bc": _native_state(df, "柱子背驰_BS辅助V240307"),
+            "bar_acc": _native_state(df, "加速V240428"),
+            "polyfit": _native_state(df, "分类V240428"),
+            "plr_long": _native_state(df, "M多头_盈亏比V240427"),
+            "plr_short": _native_state(df, "M空头_盈亏比V240427"),
+            "tnr": _native_state(df, "趋势V230630"),
+            "zfzd": _native_state(df, "形态V241013"),
+            "overlap": _native_state(df, "支撑压力V240612"),
+            "bi_end_618": _native_state(df, "BE辅助V230618"),
+            "zdy_dif": _native_state(df, "DIF远离V230528"),
+            "macd_shrink": _native_state(df, "MACD缩柱_BS辅助V230519"),
+            "xl_candle": _native_state(df, "形态V240412"),
+            "xl_trend": _native_state(df, "突破信号V240623"),
+            "xl_trend_v2": _native_state(df, "突破信号V240623", part=1),
+            "sar": _native_state(df, "SAR_BS辅助V230325"),
         }
         if htf is not None:
             ctx.htf_dir, ctx.htf_q = _align_htf_state(df, htf)
@@ -733,6 +754,40 @@ def _build_ac02(ctx, side):  # A: 均线斜率动量 + 唐奇安突破
     return setup, np.clip(np.tanh(3.0 * slope_s), 0.05, 1.0), confirm, np.tanh(np.maximum(body, 0) / _safe_atr(ctx)), 5
 
 
+def _build_ac03(ctx, side):  # A: 多均线共振粘合发散/双均线蓄势 × K线二阶加速/通道连涨确认 (Stage 2)
+    j_label = "看多" if side > 0 else "看空"
+    dm_label = "多头" if side > 0 else "空头"
+    acc_label = "上涨" if side > 0 else "下跌"
+    xl_label = "做多" if side > 0 else "做空"
+    xl_v2 = "连续2次上涨" if side > 0 else "连续2次下跌"
+    slope_s = np.nan_to_num(side * (ctx.ma20 - _shift(ctx.ma20, 5)) / (5.0 * _safe_atr(ctx)), nan=0.0)
+    setup = ((ctx.states["ma_joint"] == j_label) | (ctx.states["double_ma"] == dm_label)) & (
+        side * (ctx.c - ctx.ma20) > 0
+    )
+    setup_q = np.clip(0.55 + 0.45 * np.tanh(2.5 * np.maximum(slope_s, 0.0)), 0.15, 1.0)
+    c_s, o_s, _, _ = _adj(ctx, side)
+    body = np.maximum(c_s - o_s, 0.0)
+    confirm = ((ctx.states["bar_acc"] == acc_label) | (ctx.states["xl_trend"] == xl_label)) & (c_s > o_s)
+    bonus = np.where(ctx.states["xl_trend_v2"] == xl_v2, 0.20, 0.0)
+    confirm_q = np.clip(np.tanh(body / _safe_atr(ctx)) + bonus, 0.10, 1.0)
+    return setup, setup_q, confirm, confirm_q, 6
+
+
+def _build_ac04(ctx, side):  # A: 中枢重叠支撑压力 + SAR 同向蓄势 × 长蜡烛实体/二次拟合加速突破 (Stage 2)
+    ov_label = "支撑" if side > 0 else "压力"
+    sar_label = "多头" if side > 0 else "空头"
+    candle_label = "看涨长蜡烛" if side > 0 else "看跌长蜡烛"
+    poly_acc = "加速上涨" if side > 0 else "加速下跌"
+    zs_ok, zs_q = _dir_eq(ctx, "zs_break", side)
+    slope_s = np.nan_to_num(side * (ctx.ma20 - _shift(ctx.ma20, 5)) / (5.0 * _safe_atr(ctx)), nan=0.0)
+    setup = (ctx.states["sar"] == sar_label) & ((ctx.states["overlap"] == ov_label) | zs_ok | (slope_s > 0.08))
+    setup_q = np.clip(np.maximum(zs_q, 0.45 + 0.55 * np.tanh(2.5 * np.maximum(slope_s, 0.0))), 0.15, 1.0)
+    brk, brk_q = _break_confirm(ctx, side)
+    confirm = (ctx.states["xl_candle"] == candle_label) | ((ctx.states["polyfit"] == poly_acc) & brk)
+    confirm_q = np.clip(np.maximum(brk_q, 0.55), 0.15, 1.0)
+    return setup, setup_q, confirm, confirm_q, 5
+
+
 def _build_bc01(ctx, side):  # B: 笔背驰 Q_div + 分型确认
     setup, q = _dir_eq(ctx, "bi_div", side)
     fx_ok, fx_q = _dir_eq(ctx, "fx", side)
@@ -748,6 +803,27 @@ def _build_bc02(ctx, side):  # B: TD 九转极值 + 2B 假突破
     confirm = ctx.states["fake_break"] == fb_label
     body = np.maximum(c_s - o_s, 0.0)
     return setup, np.clip(np.tanh(depth), 0.1, 1.0), confirm, np.tanh(body / _safe_atr(ctx)), 6
+
+
+def _build_bc03(ctx, side):  # B: MACD 柱子背驰/UBI背驰 + 连续缩柱蓄势 × 缠论笔终点反转确认 (Stage 2)
+    bc_label = "底背驰" if side > 0 else "顶背驰"
+    ubi_label = "多头" if side > 0 else "空头"
+    shrink_label = "空头连续缩柱" if side > 0 else "多头连续缩柱"
+    be_label = "看多" if side > 0 else "看空"
+    c_s, o_s, _, _ = _adj(ctx, side)
+    depth = np.nan_to_num(np.maximum(side * (ctx.ma20 - ctx.c), 0.0) / (1.8 * _safe_atr(ctx)), nan=0.0)
+    div_ok, div_q = _dir_eq(ctx, "bi_div", side)
+    setup = (
+        (ctx.states["macd_bc"] == bc_label)
+        | (ctx.states["macd_bc_ubi"] == ubi_label)
+        | ((ctx.states["macd_shrink"] == shrink_label) & (depth > 0.25))
+    )
+    setup_q = np.clip(np.maximum(div_q, 0.45 + 0.55 * np.tanh(depth)), 0.15, 1.0)
+    fx_ok, fx_q = _dir_eq(ctx, "fx", side)
+    body = np.maximum(c_s - o_s, 0.0)
+    confirm = (ctx.states["bi_end_618"] == be_label) & ((c_s > o_s) | fx_ok)
+    confirm_q = np.clip(np.maximum(fx_q, np.tanh(body / _safe_atr(ctx))), 0.15, 1.0)
+    return setup, setup_q, confirm, confirm_q, 5
 
 
 def _build_cc01(ctx, side):  # C: 中枢偏离回归 -tanh(kZ) + 低趋势效率 + 反转 K
@@ -773,6 +849,21 @@ def _build_cc02(ctx, side):  # C: KC 轨道刺破 + 收回箱体
     )
 
 
+def _build_cc03(ctx, side):  # C: DIF 分层远离/靠近零轴蓄势 × 二阶多项式拟合减速拐点回归 (Stage 2)
+    layer_opp = "空头远离" if side > 0 else "多头远离"
+    zero_label = "买点" if side > 0 else "卖点"
+    poly_decel = "减速下跌" if side > 0 else "减速上涨"
+    c_s, o_s, _, _ = _adj(ctx, side)
+    stretch = np.nan_to_num(np.maximum(side * (ctx.ma20 - ctx.c), 0.0) / (1.5 * _safe_atr(ctx)), nan=0.0)
+    rev_ok, rev_q = _dir_eq(ctx, "zs_revert", side)
+    setup = ((ctx.states["dif_layer"] == layer_opp) & (ctx.er20 < 0.48)) | (ctx.states["dif_zero"] == zero_label)
+    setup_q = np.clip(np.maximum(rev_q, 0.40 + 0.60 * np.tanh(stretch)), 0.15, 1.0)
+    body = np.maximum(c_s - o_s, 0.0)
+    confirm = (ctx.states["polyfit"] == poly_decel) & (c_s > o_s) & (c_s > _shift(c_s))
+    confirm_q = np.clip(np.tanh(body / _safe_atr(ctx)) + 0.15, 0.15, 1.0)
+    return setup, setup_q, confirm, confirm_q, 4
+
+
 def _build_dc01(ctx, side):  # D: 量价资金流 + CLV 同向 + 放量阳线
     label = "看多" if side > 0 else "看空"
     flow_ok, q = _dir_eq(ctx, "flow", side)
@@ -791,6 +882,20 @@ def _build_dc02(ctx, side):  # D: NTMDK + KC-ATR 通道多空共振 + 放量突�
     return setup, np.maximum(np.where(flow_ok, fq, 0.0), 0.3), brk & (vr >= 1.2), np.tanh(np.maximum(vr - 1.0, 0.0)), 5
 
 
+def _build_dc03(ctx, side):  # D: PLR 分段线性回归盈亏比满足 + DIF 远离蓄势 × 放量突破脉冲 (Stage 2)
+    plr_key = "plr_long" if side > 0 else "plr_short"
+    dif_label = "多头远离" if side > 0 else "空头远离"
+    clv_label = "看多" if side > 0 else "看空"
+    flow_ok, fq = _dir_eq(ctx, "flow", side)
+    vr = np.divide(ctx.v, ctx.vma20, out=np.ones(ctx.n), where=ctx.vma20 > EPS)
+    brk, brk_q = _break_confirm(ctx, side)
+    setup = (ctx.states[plr_key] == "满足") & ((ctx.states["zdy_dif"] == dif_label) | flow_ok)
+    setup_q = np.clip(np.maximum(np.where(flow_ok, fq, 0.35), 0.45), 0.15, 1.0)
+    confirm = brk & ((vr >= 1.10) | (ctx.states["clv"] == clv_label))
+    confirm_q = np.clip(0.5 * brk_q + 0.5 * np.tanh(np.maximum(vr - 0.85, 0.0)), 0.15, 1.0)
+    return setup, setup_q, confirm, confirm_q, 5
+
+
 def _build_ec01(ctx, side):  # E: KC/BOLL 挤压 -> 波动率扩张点火
     sq_recent = pd.Series(ctx.in_squeeze.astype(float)).rolling(8, min_periods=1).max().to_numpy() > 0
     ok, q = _dir_eq(ctx, "squeeze", side)
@@ -805,6 +910,18 @@ def _build_ec02(ctx, side):  # E: NR7 窄幅 -> 突破 (缺口/实体动能)
     big = (c_s - o_s) >= 0.6 * _safe_atr(ctx)
     setup_q = np.clip(1.0 - ctx.rng / (2.0 * _safe_atr(ctx)), 0.1, 1.0)
     return nr7, setup_q, brk & big, bq, 2
+
+
+def _build_ec03(ctx, side):  # E: TNR 趋势信噪比噪音减少 + 窄幅震荡压缩 × 二阶加速突破点火 (Stage 2)
+    poly_acc = "加速上涨" if side > 0 else "加速下跌"
+    xl_label = "做多" if side > 0 else "做空"
+    sq_ok, sq_q = _dir_eq(ctx, "squeeze", side)
+    brk, brk_q = _break_confirm(ctx, side)
+    setup = (ctx.states["tnr"] == "噪音减少") & ((ctx.states["zfzd"] == "满足") | (ctx.atr_rank <= 0.45))
+    setup_q = np.clip(0.55 * (1.0 - ctx.atr_rank) + 0.45 * np.clip(1.0 - ctx.er20, 0.2, 1.0), 0.15, 1.0)
+    confirm = ((ctx.states["polyfit"] == poly_acc) & brk) | ((ctx.states["xl_trend"] == xl_label) & brk) | sq_ok
+    confirm_q = np.clip(np.maximum(brk_q, sq_q), 0.15, 1.0)
+    return setup, setup_q, confirm, confirm_q, 6
 
 
 def _build_fc01(ctx: FactorContext, side: int):
@@ -904,22 +1021,37 @@ class AtomicFactorDef:
     archetype: str
     build: Callable
     eligible_tfs: tuple[str, ...]
+    default_decay: DecayConfig | None = None
 
 
 _ALL_TFS = ("1d", "60m", "30m", "15m", "5m")
+_BREAKOUT_TRAIL_DECAY = DecayConfig(
+    lam0=0.04,
+    trailing=0.012,
+    trail_activation=0.0020,
+    use_fx_exit=True,
+    ratchet_stop=True,
+    max_hold=24,
+)
 ATOMIC_FACTOR_DEFS: dict[str, AtomicFactorDef] = {
     d.family: d
     for d in (
         AtomicFactorDef("AC01", "三买卖中枢脱离安全边际突破确认", ARCH_A, _build_ac01, _ALL_TFS),
-        AtomicFactorDef("AC02", "均线斜率动量唐奇安突破", ARCH_A, _build_ac02, _ALL_TFS),
+        AtomicFactorDef("AC02", "均线斜率动量唐奇安突破", ARCH_A, _build_ac02, _ALL_TFS, _BREAKOUT_TRAIL_DECAY),
+        AtomicFactorDef("AC03", "多均线共振双均线蓄势与斜率加速突破", ARCH_A, _build_ac03, _ALL_TFS),
+        AtomicFactorDef("AC04", "中枢重叠支撑压力与SAR长实体突破", ARCH_A, _build_ac04, _ALL_TFS),
         AtomicFactorDef("BC01", "笔背驰衰竭分型确认", ARCH_B, _build_bc01, _ALL_TFS),
         AtomicFactorDef("BC02", "TD九转极值2B假突破", ARCH_B, _build_bc02, _ALL_TFS),
+        AtomicFactorDef("BC03", "MACD背驰缩柱蓄势与笔终点反转确认", ARCH_B, _build_bc03, _ALL_TFS),
         AtomicFactorDef("CC01", "中枢偏离回归", ARCH_C, _build_cc01, _ALL_TFS),
         AtomicFactorDef("CC02", "KC轨道刺破收回", ARCH_C, _build_cc02, _ALL_TFS),
+        AtomicFactorDef("CC03", "DIF分层远离超跌超涨与二阶拟合减速回归", ARCH_C, _build_cc03, _ALL_TFS),
         AtomicFactorDef("DC01", "量价资金流CLV共振", ARCH_D, _build_dc01, _ALL_TFS),
         AtomicFactorDef("DC02", "NTMDK-KCATR多空共振放量突破", ARCH_D, _build_dc02, _ALL_TFS),
-        AtomicFactorDef("EC01", "挤压后波动率扩张点火", ARCH_E, _build_ec01, _ALL_TFS),
+        AtomicFactorDef("DC03", "PLR分段线性回归与DIF动量放量脉冲", ARCH_D, _build_dc03, _ALL_TFS),
+        AtomicFactorDef("EC01", "挤压后波动率扩张点火", ARCH_E, _build_ec01, _ALL_TFS, _BREAKOUT_TRAIL_DECAY),
         AtomicFactorDef("EC02", "NR7窄幅突破", ARCH_E, _build_ec02, _ALL_TFS),
+        AtomicFactorDef("EC03", "TNR趋势信噪比降噪窄幅压缩与二阶加速点火", ARCH_E, _build_ec03, _ALL_TFS),
         AtomicFactorDef("FC01", "大级别结构锚定小级别分型扳机", ARCH_F, _build_fc01, ("60m", "30m", "15m", "5m")),
         AtomicFactorDef("FC02", "F01_板块龙头共振补涨补跌", ARCH_F, _build_fc02, _ALL_TFS),
         AtomicFactorDef("FC03", "F02_截面比价超跌超涨背驰反包", ARCH_F, _build_fc03, _ALL_TFS),
@@ -962,7 +1094,7 @@ def compute_family(
             setup, confirm = setup & ctx.cs_available, confirm & ctx.cs_available
         inputs[side] = (setup, np.asarray(setup_q, dtype=np.float64), confirm, np.asarray(confirm_q, dtype=np.float64))
     long, short = inputs[1], inputs[-1]
-    cfg = decay or DecayConfig()
+    cfg = decay or fdef.default_decay or DecayConfig()
     plugin_key = cfg.stop_plugin if (cfg.stop_plugin and cfg.stop_plugin in ctx.structure_anchors) else fdef.archetype
     anchors = ctx.structure_anchors[plugin_key]
     pass_fx = cfg.use_fx_exit or (cfg.reentry_mode not in ("", "none"))
