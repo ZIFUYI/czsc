@@ -2,92 +2,178 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CTA 品种池四层漏斗筛选最优方案净值对比图</title>
-  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
   <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background-color: var(--background, #0f172a);
+      color: var(--foreground, #f8fafc);
+      padding: 12px;
+      line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
+    }
+    html.light body {
+      background-color: var(--background, #f8fafc);
+      color: var(--foreground, #0f172a);
+    }
+    .card {
+      background-color: var(--card, #1e293b);
+      color: var(--foreground, #f8fafc);
+      border: 1px solid var(--border, rgba(148, 163, 184, 0.22));
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    html.light .card {
+      background-color: var(--card, #ffffff);
+      color: var(--foreground, #0f172a);
+      border-color: var(--border, #e2e8f0);
+      box-shadow: 0 1px 4px rgba(15, 23, 42, 0.06);
+    }
+    .header-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .title { font-size: 16px; font-weight: 700; display: flex; align-items: center; gap: 6px; }
+    .subtitle { font-size: 12px; color: var(--muted-foreground, #94a3b8); margin-top: 2px; }
+    .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .btn-group {
+      display: inline-flex;
+      background-color: var(--background, rgba(15, 23, 42, 0.55));
+      padding: 3px;
+      border-radius: 8px;
+      border: 1px solid var(--border, rgba(148, 163, 184, 0.22));
+      gap: 2px;
+    }
+    html.light .btn-group { background-color: #f1f5f9; border-color: #cbd5e1; }
+    .mode-btn {
+      border: none;
+      background: transparent;
+      color: var(--muted-foreground, #94a3b8);
+      font-size: 12px;
+      padding: 5px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
     .mode-btn.active {
-      background-color: var(--primary);
-      color: var(--primary-foreground);
+      background-color: var(--primary, #2563eb);
+      color: var(--primary-foreground, #ffffff);
       font-weight: 600;
     }
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .kpi-box {
+      padding: 10px 12px;
+      border-radius: 8px;
+      background-color: var(--background, rgba(15, 23, 42, 0.45));
+      border: 1px solid var(--border, rgba(148, 163, 184, 0.18));
+    }
+    html.light .kpi-box { background-color: #f8fafc; border-color: #e2e8f0; }
+    .kpi-label { font-size: 12px; color: var(--muted-foreground, #94a3b8); }
+    .kpi-val { font-size: 17px; font-weight: 700; margin-top: 2px; }
+    .kpi-sub { font-size: 12px; color: var(--muted-foreground, #94a3b8); margin-top: 1px; }
+    .text-emerald { color: #10b981; }
+    .text-blue { color: #3b82f6; }
+    .text-rose { color: #f43f5e; }
+    .legend-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+    .legend-items { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+    .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+    .swatch { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
+    .readout { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted-foreground, #94a3b8); }
+    .canvas-wrap {
+      position: relative;
+      width: 100%;
+      height: 290px;
+      background-color: var(--background, rgba(15, 23, 42, 0.45));
+      border: 1px solid var(--border, rgba(148, 163, 184, 0.2));
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    html.light .canvas-wrap { background-color: #ffffff; border-color: #e2e8f0; }
+    #navCanvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
   </style>
 </head>
-<body class="bg-transparent text-[var(--foreground)] antialiased p-2">
-  <div class="bg-[var(--card)] text-[var(--foreground)] border border-[var(--border)] rounded-xl p-4 shadow-sm">
-    <!-- 顶部标题栏与控制按钮 -->
-    <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+<body>
+  <div class="card">
+    <div class="header-row">
       <div>
-        <h2 class="text-[var(--foreground)] font-semibold text-base flex items-center gap-2">
-          <span>📈</span> 四层漏斗精选池 (N=32 / N=35) vs 全品种基准 样本外净值对比
-        </h2>
-        <p class="text-[var(--muted-foreground)] text-xs mt-0.5">
-          样本外区间：2025-01-02 至 2026-09-30 (503 交易日) · 含 Fold1→Fold2 跨期无前视偏差滚动切换
-        </p>
+        <div class="title">📈 四层漏斗精选池 (N=32 / N=35) vs 全品种基准 样本外净值与回撤对比</div>
+        <div class="subtitle">样本外区间：2025-01-02 至 2026-09-30 (503 交易日) · 含 Fold1→Fold2 跨期无前视偏差滚动换池</div>
       </div>
-      <div class="flex items-center gap-2">
-        <div class="flex items-center bg-[var(--background)] p-1 rounded-lg border border-[var(--border)]">
-          <button id="btn-n32" onclick="setFocus('best_n32')" class="mode-btn active px-2.5 py-1 rounded text-xs transition-colors">
-            焦点: N=32 (甜点Calmar)
-          </button>
-          <button id="btn-n35" onclick="setFocus('best_n35')" class="mode-btn px-2.5 py-1 rounded text-xs text-[var(--muted-foreground)] transition-colors">
-            焦点: N=35 (最高Sharpe)
-          </button>
+      <div class="controls">
+        <div class="btn-group">
+          <button id="btn-n32" onclick="setFocus('best_n32')" class="mode-btn active">焦点: N=32 (甜点Calmar)</button>
+          <button id="btn-n35" onclick="setFocus('best_n35')" class="mode-btn">焦点: N=35 (最高Sharpe)</button>
         </div>
-        <div class="flex items-center bg-[var(--background)] p-1 rounded-lg border border-[var(--border)]">
-          <button id="btn-1x" onclick="setScale('s1x')" class="mode-btn active px-2.5 py-1 rounded text-xs transition-colors">
-            1x 基准波动
-          </button>
-          <button id="btn-3x" onclick="setScale('s3x')" class="mode-btn px-2.5 py-1 rounded text-xs text-[var(--muted-foreground)] transition-colors">
-            3x 期货名义杠杆
-          </button>
+        <div class="btn-group">
+          <button id="btn-1x" onclick="setScale('s1x')" class="mode-btn active">1x 基准波动</button>
+          <button id="btn-3x" onclick="setScale('s3x')" class="mode-btn">3x 期货名义杠杆</button>
         </div>
       </div>
     </div>
 
-    <!-- 核心指标对比条 -->
-    <div class="grid grid-cols-2 sm:grid-cols-5 gap-2.5 mb-3">
-      <div class="p-2.5 rounded-lg bg-[var(--background)] border border-[var(--border)]">
-        <div class="text-xs text-[var(--muted-foreground)]">焦点方案净收益</div>
-        <div id="kpi-ret" class="text-base font-bold text-emerald-500 mt-0.5">+8.54%</div>
-        <div id="kpi-ret-sub" class="text-xs text-[var(--muted-foreground)]">超全品种 +2.72%</div>
+    <div class="kpi-grid">
+      <div class="kpi-box">
+        <div class="kpi-label">焦点方案净收益</div>
+        <div id="kpi-ret" class="kpi-val text-emerald">+8.54%</div>
+        <div id="kpi-ret-sub" class="kpi-sub">超全品种 +2.72%</div>
       </div>
-      <div class="p-2.5 rounded-lg bg-[var(--background)] border border-[var(--border)]">
-        <div class="text-xs text-[var(--muted-foreground)]">样本外净夏普</div>
-        <div id="kpi-shp" class="text-base font-bold text-blue-500 mt-0.5">1.97</div>
-        <div id="kpi-shp-sub" class="text-xs text-[var(--muted-foreground)]">全品种: 1.44 (+37%)</div>
+      <div class="kpi-box">
+        <div class="kpi-label">样本外净夏普</div>
+        <div id="kpi-shp" class="kpi-val text-blue">1.97</div>
+        <div id="kpi-shp-sub" class="kpi-sub">全品种: 1.44 (+37%)</div>
       </div>
-      <div class="p-2.5 rounded-lg bg-[var(--background)] border border-[var(--border)]">
-        <div class="text-xs text-[var(--muted-foreground)]">最大回撤 (MDD)</div>
-        <div id="kpi-mdd" class="text-base font-bold text-rose-500 mt-0.5">-1.70%</div>
-        <div id="kpi-mdd-sub" class="text-xs text-[var(--muted-foreground)]">全品种: -1.81%</div>
+      <div class="kpi-box">
+        <div class="kpi-label">最大回撤 (MDD)</div>
+        <div id="kpi-mdd" class="kpi-val text-rose">-1.70%</div>
+        <div id="kpi-mdd-sub" class="kpi-sub">全品种: -1.81%</div>
       </div>
-      <div class="p-2.5 rounded-lg bg-[var(--background)] border border-[var(--border)]">
-        <div class="text-xs text-[var(--muted-foreground)]">卡玛比率 (Calmar)</div>
-        <div id="kpi-calmar" class="text-base font-bold text-[var(--foreground)] mt-0.5">2.99</div>
-        <div id="kpi-calmar-sub" class="text-xs text-[var(--muted-foreground)]">全品种: 1.91 (+57%)</div>
+      <div class="kpi-box">
+        <div class="kpi-label">卡玛比率 (Calmar)</div>
+        <div id="kpi-calmar" class="kpi-val">2.99</div>
+        <div id="kpi-calmar-sub" class="kpi-sub">全品种: 1.91 (+57%)</div>
       </div>
-      <div class="p-2.5 rounded-lg bg-[var(--background)] border border-[var(--border)]">
-        <div class="text-xs text-[var(--muted-foreground)]">交易品种 / 盈亏比</div>
-        <div id="kpi-meta" class="text-base font-bold text-[var(--foreground)] mt-0.5">32个 / R=2.09</div>
-        <div id="kpi-meta-sub" class="text-xs text-[var(--muted-foreground)]">换手率降 13%</div>
+      <div class="kpi-box">
+        <div class="kpi-label">交易品种 / 盈亏比</div>
+        <div id="kpi-meta" class="kpi-val">32个 / R=2.09</div>
+        <div id="kpi-meta-sub" class="kpi-sub">换手率降 13%</div>
       </div>
     </div>
 
-    <!-- 图例与悬停数值提示 -->
-    <div class="flex flex-wrap items-center justify-between gap-2 text-xs mb-1.5 px-1">
-      <div class="flex flex-wrap items-center gap-3">
-        <span class="flex items-center gap-1.5 font-medium"><span class="w-3 h-0.5 bg-emerald-500 inline-block"></span>四层漏斗 N=35 (Sharpe 2.03)</span>
-        <span class="flex items-center gap-1.5 font-medium"><span class="w-3 h-0.5 bg-blue-500 inline-block"></span>四层漏斗 N=32 (Calmar 2.99)</span>
-        <span class="flex items-center gap-1.5 text-[var(--muted-foreground)]"><span class="w-3 h-0.5 bg-purple-500 inline-block"></span>无共线去重 N=32 (1.84)</span>
-        <span class="flex items-center gap-1.5 text-[var(--muted-foreground)]"><span class="w-3 h-0.5 bg-slate-400 inline-block"></span>全品种 N=60 (1.44)</span>
-        <span class="flex items-center gap-1.5 text-[var(--muted-foreground)]"><span class="w-3 h-0.5 bg-rose-500 inline-block"></span>纯流动性前32 (0.38)</span>
+    <div class="legend-bar">
+      <div class="legend-items">
+        <span class="legend-item"><span class="swatch" style="background:#10b981"></span><strong>四层漏斗 N=35 (Sharpe 2.03)</strong></span>
+        <span class="legend-item"><span class="swatch" style="background:#3b82f6"></span><strong>四层漏斗 N=32 (Calmar 2.99)</strong></span>
+        <span class="legend-item"><span class="swatch" style="background:#8b5cf6"></span>无共线去重 N=32 (1.84)</span>
+        <span class="legend-item"><span class="swatch" style="background:#94a3b8"></span>全品种 N=60 (1.44)</span>
+        <span class="legend-item"><span class="swatch" style="background:#f43f5e"></span>纯流动性前32 (0.38)</span>
       </div>
-      <div id="hover-readout" class="font-mono text-xs text-[var(--muted-foreground)]">移动鼠标查看每日净值与回撤对比</div>
+      <div id="hover-readout" class="readout">移动鼠标查看每日净值与回撤对比</div>
     </div>
 
-    <!-- 双层画布：上半部分净值曲线，下半部分水下回撤 -->
-    <div class="relative w-full h-[250px] bg-[var(--background)] rounded-lg border border-[var(--border)] overflow-hidden">
-      <canvas id="navCanvas" class="w-full h-full cursor-crosshair"></canvas>
+    <div class="canvas-wrap" id="canvasContainer">
+      <canvas id="navCanvas"></canvas>
     </div>
   </div>
 
@@ -98,6 +184,7 @@
     let hoverIdx = -1;
 
     const canvas = document.getElementById('navCanvas');
+    const container = document.getElementById('canvasContainer');
     const ctx = canvas.getContext('2d');
 
     function updateKPIs() {
@@ -121,9 +208,7 @@
     function setFocus(key) {
       curFocus = key;
       document.getElementById('btn-n32').classList.toggle('active', key === 'best_n32');
-      document.getElementById('btn-n32').classList.toggle('text-[var(--muted-foreground)]', key !== 'best_n32');
       document.getElementById('btn-n35').classList.toggle('active', key === 'best_n35');
-      document.getElementById('btn-n35').classList.toggle('text-[var(--muted-foreground)]', key !== 'best_n35');
       updateKPIs();
       draw();
     }
@@ -131,23 +216,22 @@
     function setScale(sc) {
       curScale = sc;
       document.getElementById('btn-1x').classList.toggle('active', sc === 's1x');
-      document.getElementById('btn-1x').classList.toggle('text-[var(--muted-foreground)]', sc !== 's1x');
       document.getElementById('btn-3x').classList.toggle('active', sc === 's3x');
-      document.getElementById('btn-3x').classList.toggle('text-[var(--muted-foreground)]', sc !== 's3x');
       updateKPIs();
       draw();
     }
 
     function draw() {
+      const rect = container.getBoundingClientRect();
+      const W = Math.max(rect.width, 320);
+      const H = Math.max(rect.height, 260);
       const dpr = window.devicePixelRatio || 1;
-      const rect = canvas.getBoundingClientRect();
-      canvas.width = rect.width * dpr;
-      canvas.height = rect.height * dpr;
+      canvas.width = W * dpr;
+      canvas.height = H * dpr;
       ctx.save();
       ctx.scale(dpr, dpr);
 
-      const W = rect.width, H = rect.height;
-      const padL = 48, padR = 14, padT = 14, padB = 22;
+      const padL = 52, padR = 16, padT = 16, padB = 24;
       const splitY = Math.floor(H * 0.68);
       const navH = splitY - padT - 8;
       const ddTop = splitY + 8;
@@ -155,7 +239,7 @@
       const plotW = W - padL - padR;
 
       const isLight = document.documentElement.classList.contains('light');
-      const gridColor = isLight ? 'rgba(100,116,139,0.16)' : 'rgba(148,163,184,0.14)';
+      const gridColor = isLight ? 'rgba(100,116,139,0.18)' : 'rgba(148,163,184,0.16)';
       const textColor = isLight ? '#64748b' : '#94a3b8';
 
       const keys = ['naive_liq32', 'flat60', 'step3_sop32', 'best_n32', 'best_n35'];
@@ -185,25 +269,24 @@
         const val = minNav + (g / 3) * (maxNav - minNav);
         const y = yNav(val);
         ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
-        ctx.fillText(val.toFixed(3), 4, y + 3);
+        ctx.fillText(val.toFixed(3), 4, y + 4);
       }
       ctx.beginPath(); ctx.moveTo(padL, ddTop); ctx.lineTo(W - padR, ddTop); ctx.stroke();
-      ctx.fillText('0.0%', 10, ddTop + 8);
+      ctx.fillText('0.0%', 8, ddTop + 10);
       ctx.fillText(`${minDd.toFixed(1)}%`, 4, ddTop + ddH);
 
-      // Fold 1 -> Fold 2 分界线 (2026-01-05)
       const f2Idx = dates.findIndex(d => d >= '2026-01-01');
       if (f2Idx > 0) {
         const fx = xOf(f2Idx);
         ctx.save();
         ctx.setLineDash([4, 4]);
-        ctx.strokeStyle = isLight ? 'rgba(59,130,246,0.45)' : 'rgba(96,165,250,0.45)';
+        ctx.strokeStyle = isLight ? 'rgba(37,99,235,0.45)' : 'rgba(96,165,250,0.45)';
         ctx.beginPath(); ctx.moveTo(fx, padT); ctx.lineTo(fx, H - padB); ctx.stroke();
         ctx.fillStyle = isLight ? '#2563eb' : '#60a5fa';
-        ctx.fillText('Fold2 滚动换池 (2026)', fx + 5, padT + 11);
+        ctx.fillText('Fold2 滚动换池 (2026)', fx + 6, padT + 12);
         ctx.restore();
       }
-      // 焦点方案水下回撤阴影
+
       const focusSeries = PAYLOAD.series[curFocus][curScale];
       ctx.save();
       ctx.beginPath();
@@ -211,11 +294,10 @@
       for (let i = 0; i < N; i++) ctx.lineTo(xOf(i), yDd(focusSeries.dd[i]));
       ctx.lineTo(xOf(N - 1), ddTop);
       ctx.closePath();
-      ctx.fillStyle = curFocus === 'best_n35' ? 'rgba(16,185,129,0.20)' : 'rgba(59,130,246,0.20)';
+      ctx.fillStyle = curFocus === 'best_n35' ? 'rgba(16,185,129,0.22)' : 'rgba(59,130,246,0.22)';
       ctx.fill();
       ctx.restore();
 
-      // 绘制各方案净值与回撤曲线
       keys.forEach(k => {
         const item = PAYLOAD.series[k];
         const s = item[curScale];
@@ -245,24 +327,22 @@
         ctx.restore();
       });
 
-      // X 轴日期刻度
       [0, Math.floor(N * 0.25), Math.floor(N * 0.5), Math.floor(N * 0.75), N - 1].forEach(idx => {
-        const x = Math.min(Math.max(xOf(idx) - 28, padL), W - padR - 62);
-        ctx.fillText(dates[idx], x, H - 5);
+        const x = Math.min(Math.max(xOf(idx) - 32, padL), W - padR - 68);
+        ctx.fillText(dates[idx], x, H - 6);
       });
 
-      // 悬停十字线
       if (hoverIdx >= 0 && hoverIdx < N) {
         const hx = xOf(hoverIdx);
         ctx.save();
-        ctx.strokeStyle = isLight ? 'rgba(15,23,42,0.35)' : 'rgba(248,250,252,0.35)';
+        ctx.strokeStyle = isLight ? 'rgba(15,23,42,0.4)' : 'rgba(248,250,252,0.4)';
         ctx.lineWidth = 1;
         ctx.beginPath(); ctx.moveTo(hx, padT); ctx.lineTo(hx, H - padB); ctx.stroke();
         ['best_n35', 'best_n32', 'flat60'].forEach(k => {
           const item = PAYLOAD.series[k];
           const py = yNav(item[curScale].nav[hoverIdx]);
           ctx.fillStyle = item.color;
-          ctx.beginPath(); ctx.arc(hx, py, 3.5, 0, Math.PI * 2); ctx.fill();
+          ctx.beginPath(); ctx.arc(hx, py, 3.6, 0, Math.PI * 2); ctx.fill();
         });
         ctx.restore();
       }
@@ -271,7 +351,7 @@
 
     canvas.addEventListener('mousemove', e => {
       const rect = canvas.getBoundingClientRect();
-      const padL = 48, padR = 14;
+      const padL = 52, padR = 16;
       const plotW = rect.width - padL - padR;
       const relX = Math.max(0, Math.min(e.clientX - rect.left - padL, plotW));
       const N = PAYLOAD.dates.length;
@@ -292,8 +372,11 @@
     });
 
     window.addEventListener('resize', draw);
+    if (typeof ResizeObserver !== 'undefined') {
+      new ResizeObserver(() => draw()).observe(container);
+    }
     updateKPIs();
-    setTimeout(draw, 30);
+    setTimeout(draw, 16);
   </script>
 </body>
 </html>
