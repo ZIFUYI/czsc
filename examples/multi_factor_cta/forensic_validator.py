@@ -94,6 +94,51 @@ def infer_asset_pool_group(symbol: str, explicit_group: str | None = None) -> st
     return "equity"
 
 
+# Full-60 超大商品板块的物理同质子产业链（按供需链固定先验划分，不随因子/样本期调整）。
+# 键为「宏板块族」中各板块的 pool_group；值为 {子产业链: 品种代码}。仅当宏板块族品种数 > COMMODITY_SUBCHAIN_MIN_FAMILY_SIZE
+# 且每条子链在当前样本内均 >= COMMODITY_SUBCHAIN_FLOOR 个品种时才启用；金属族（10 品种）不拆分。
+# 未收录的品种（如 ec 集运指数、无物理产业链归属者）保持板块级标签，因池规模不足而无法准入（不降级）。
+COMMODITY_SUBCHAIN_MIN_FAMILY_SIZE = 10
+COMMODITY_SUBCHAIN_FLOOR = 5
+COMMODITY_SUBCHAIN_FAMILIES: dict[frozenset[str], dict[str, tuple[str, ...]]] = {
+    frozenset({"commodity:energy_chem"}): {
+        "crude_aromatics_polyester": ("sc", "lu", "fu", "bu", "ta", "px", "eg", "pf", "pr"),
+        "coal_chlor_polyolefin_rubber": ("ma", "ur", "l", "pp", "v", "eb", "pg", "sh", "ru", "br", "nr", "sp"),
+    },
+    frozenset({"commodity:agriculture"}): {
+        "oils_oilseeds": ("m", "y", "p", "oi", "rm", "a", "b"),
+        "softs_grains_livestock": ("sr", "cf", "cy", "ap", "cj", "pk", "lh", "jd", "cs", "c"),
+    },
+    frozenset({"commodity:ferrous", "commodity:new_energy"}): {
+        "ferrous_burden": ("rb", "hc", "i", "j", "jm"),
+        "buildmat_newenergy": ("fg", "sa", "sm", "sf", "si", "lc", "ps"),
+    },
+}
+
+
+def refine_commodity_pool_groups(groups: dict[str, str]) -> dict[str, str]:
+    """Split oversized commodity sector pools into fixed homogeneous sub-chain pools.
+
+    ``groups`` maps asset code to its ``commodity:<sector>`` label. A macro family is refined only when it has more
+    than ``COMMODITY_SUBCHAIN_MIN_FAMILY_SIZE`` assets and every sub-chain keeps at least ``COMMODITY_SUBCHAIN_FLOOR``
+    assets present; otherwise the family keeps its legacy sector labels. Assets outside every sub-chain keep their
+    sector label, so they can never borrow a larger, heterogeneous pool.
+    """
+    refined = dict(groups)
+    for sectors, chains in COMMODITY_SUBCHAIN_FAMILIES.items():
+        members = {asset: group for asset, group in groups.items() if str(group).strip().lower() in sectors}
+        if len(members) <= COMMODITY_SUBCHAIN_MIN_FAMILY_SIZE:
+            continue
+        present = {name: [a for a in codes if a in members] for name, codes in chains.items()}
+        if any(len(assets) < COMMODITY_SUBCHAIN_FLOOR for assets in present.values()):
+            continue
+        for name, assets in present.items():
+            label = f"commodity:chain_{name}"
+            for asset in assets:
+                refined[asset] = label
+    return refined
+
+
 def _resolve_commodity_peer_groups(groups: dict[str, str], target: str, floor: int = 5) -> set[str]:
     """Resolve homogeneous commodity sector/macro-sector peer groups when sub-sectors are small."""
     exact = {target}
@@ -290,6 +335,7 @@ class RuleFactorForensicValidator:
         allow_single_asset_degrade: bool | None = None,
         soft_gate: SoftCrossSectionalGate | bool | None = None,
         allow_pooled_effective_n: bool = False,
+        target_asset: str | None = None,
     ) -> dict[str, Any]:
         """Admit only real, training-only event evidence from the required asset universe.
 
@@ -298,6 +344,8 @@ class RuleFactorForensicValidator:
         Tier 3 additionally requires an explicitly identical trading/liquidity regime.
         Legacy single-asset and pooled-effective-sample flags preserve call compatibility,
         never permission to lower the per-asset evidence floor or missing-regime requirements.
+        When ``target_asset`` is given for an all-commodity pool, oversized sector pools are first split into the
+        fixed homogeneous sub-chains of ``COMMODITY_SUBCHAIN_FAMILIES`` and the target is that asset's sub-chain.
         """
         raw_audits = dict(asset_audits or per_symbol_gate1 or {})
         if not raw_audits and pool_tf_dfs is not None:
@@ -331,6 +379,9 @@ class RuleFactorForensicValidator:
         target = infer_asset_pool_group(target_pool_group, target_pool_group)
         broad_all = {groups[s].split(":", 1)[0] for s in raw_audits}
         commodity_sector_mode = broad_all == {"commodity"} and target.startswith("commodity:")
+        if commodity_sector_mode and target_asset in groups:
+            groups = refine_commodity_pool_groups(groups)
+            target = groups[target_asset]
         if commodity_sector_mode:
             peer_groups = _resolve_commodity_peer_groups(groups, target, floor=5)
             selected = [s for s in raw_audits if groups[s] in peer_groups]
@@ -818,6 +869,8 @@ def summarize_execution_pooled_scores(scores_df: pd.DataFrame) -> pd.DataFrame:
             cutoff = pd.to_datetime(record.get("cutoff"), errors="coerce")
             if pd.notna(cutoff):
                 cutoffs.add(cutoff)
+        # Oversized commodity sectors are pooled by fixed physical sub-chain, never as one heterogeneous sector.
+        asset_groups = refine_commodity_pool_groups(asset_groups)
         cutoff_valid = len(cutoffs) == 1 and "cutoff" in group and group["cutoff"].notna().all()
         cutoff = next(iter(cutoffs)) if cutoff_valid else pd.Timestamp.min
         checker = RuleFactorForensicValidator(is_end_dt=cutoff, soft_gate=False)
