@@ -152,8 +152,21 @@ def test_six_clusters_registered_and_orthogonal():
     assert len(ATOMIC_SIGNAL_IDS) == 2 * len(ATOMIC_FACTOR_DEFS)
 
 
-def test_atomic_metadata_matches_hypothesis_bank():
-    """hypothesis_bank 与 atomic_factors 各登记一份元数据 (避免循环导入)，必须保持一致。"""
+def test_atomic_metadata_matches_hypothesis_bank(built):
+    """ATOMIC_FACTOR_DEFS 作为唯一事实源 (SSOT)，与 hypothesis_bank 及 alpha_lab 保持自动同步。"""
+    import alpha_lab
+    import czsc
+    from examples.multi_factor_cta import atomic_factors as af
+
+    assert not hasattr(czsc, "alpha_lab")
+    assert alpha_lab.ATOMIC_FACTOR_DEFS is ATOMIC_FACTOR_DEFS
+    assert alpha_lab.STATE_SIGNAL_MANIFEST is af.STATE_SIGNAL_MANIFEST
+    assert len(af.STATE_SIGNAL_MANIFEST) >= 49
+    _, ctx, _ = built
+    assert set(ctx.states) == set(af.STATE_SIGNAL_MANIFEST)
+    stages = {d.stage for d in ATOMIC_FACTOR_DEFS.values()}
+    assert stages == {"Stage1_Base", "Stage2_Rust", "Stage3_OI", "Stage4_CE"}
+
     for fam, fdef in ATOMIC_FACTOR_DEFS.items():
         for sfx, direction in (("L", 1), ("S", -1)):
             spec = ALL_SIGNAL_SPECS[f"{fam}{sfx}"]
@@ -161,6 +174,25 @@ def test_atomic_metadata_matches_hypothesis_bank():
             assert spec.direction == direction
             assert spec.eligible_tfs == fdef.eligible_tfs
             assert spec.exit_mode == "continuous"
+
+    # 动态注册与注销测试：无需手改 hypothesis_bank，ALL_SIGNAL_SPECS 与 ATOMIC_SIGNAL_IDS 自动同步
+    dummy_def = af.AtomicFactorDef(
+        "AC99",
+        "动态注册测试因子",
+        ARCH_A,
+        ATOMIC_FACTOR_DEFS["AC01"].build,
+        ("30m", "15m"),
+        stage="Stage4_CE",
+    )
+    af.register_atomic_factor_def(dummy_def)
+    try:
+        assert "AC99L" in ALL_SIGNAL_SPECS and "AC99S" in ALL_SIGNAL_SPECS
+        assert "AC99L" in af.ATOMIC_SIGNAL_IDS and "AC99S" in alpha_lab.ATOMIC_SIGNAL_IDS
+        assert ALL_SIGNAL_SPECS["AC99L"].eligible_tfs == ("30m", "15m")
+    finally:
+        af.unregister_atomic_factor_def("AC99")
+    assert "AC99L" not in ALL_SIGNAL_SPECS and "AC99S" not in ALL_SIGNAL_SPECS
+    assert "AC99L" not in af.ATOMIC_SIGNAL_IDS
 
 
 def test_legacy_d_cluster_members_moved_by_mechanism():

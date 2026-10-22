@@ -565,56 +565,14 @@ CANDIDATE_HYPOTHESIS_POOL: list[SignalSpec] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Round 6 (Issue #3)：六簇连续强度原子因子 S = d · Q · D ∈ [-1, 1]
-# Q 来自 Rust `strength_*` 信号的 Signal.score/100，D 为动态结构衰减机；实现见
-# examples/multi_factor_cta/atomic_factors.py (这里只登记元数据，避免循环导入；单测保证两处一致)。
+# Round 6 (Issue #3 & Issue #19)：六簇连续强度原子因子 S = d · Q · D ∈ [-1, 1]
+# 以 examples/multi_factor_cta/atomic_factors.py::ATOMIC_FACTOR_DEFS 为唯一事实源 (SSOT)，
+# 通过 sync_atomic_specs_to_hypothesis_bank() 自动生成双向 SignalSpec 并注入本模块。
 # ---------------------------------------------------------------------------
 _TFS_ALL = ("1d", "60m", "30m", "15m", "5m")
 _TFS_RESONANCE = ("60m", "30m", "15m", "5m")
-_ATOMIC_SPEC_ROWS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
-    ("AC01", "三买卖中枢脱离安全边际突破确认", ARCH_A, _TFS_ALL),
-    ("AC02", "均线斜率动量唐奇安突破", ARCH_A, _TFS_ALL),
-    ("AC03", "多均线共振双均线蓄势与斜率加速突破", ARCH_A, _TFS_ALL),
-    ("AC04", "中枢重叠支撑压力与SAR长实体突破", ARCH_A, _TFS_ALL),
-    ("AC05", "双顺中枢中线突破与布林强势量仓共振", ARCH_A, _TFS_ALL),
-    ("BC01", "笔背驰衰竭分型确认", ARCH_B, _TFS_ALL),
-    ("BC02", "TD九转极值2B假突破", ARCH_B, _TFS_ALL),
-    ("BC03", "MACD背驰缩柱蓄势与笔终点反转确认", ARCH_B, _TFS_ALL),
-    ("BC04", "持仓量急降砍仓逼空出清与高量柱背驰反转", ARCH_B, _TFS_ALL),
-    ("CC01", "中枢偏离回归", ARCH_C, _TFS_ALL),
-    ("CC02", "KC轨道刺破收回", ARCH_C, _TFS_ALL),
-    ("CC03", "DIF分层远离超跌超涨与二阶拟合减速回归", ARCH_C, _TFS_ALL),
-    ("CC04", "顺势二买卖对称中枢回踩缩量洗盘与停顿分型回流回归", ARCH_C, _TFS_ALL),
-    ("CC05", "布林弱势箱体支撑压力双中枢九转减仓与验证分型回归", ARCH_C, _TFS_ALL),
-    ("DC01", "量价资金流CLV共振", ARCH_D, _TFS_ALL),
-    ("DC02", "NTMDK-KCATR多空共振放量突破", ARCH_D, _TFS_ALL),
-    ("DC03", "PLR分段线性回归与DIF动量放量脉冲", ARCH_D, _TFS_ALL),
-    ("DC04", "CVOLP筹码扩张黄金柱蓄势与增仓梯量突破", ARCH_D, _TFS_ALL),
-    ("DC05", "支撑压力位缩量减仓洗盘与双顺中线筹码回流", ARCH_D, _TFS_ALL),
-    ("EC01", "挤压后波动率扩张点火", ARCH_E, _TFS_ALL),
-    ("EC02", "NR7窄幅突破", ARCH_E, _TFS_ALL),
-    ("EC03", "TNR趋势信噪比降噪窄幅压缩与二阶加速点火", ARCH_E, _TFS_ALL),
-    ("EC04", "多笔中枢空间收敛蓄势与三买卖增仓扩张点火", ARCH_E, _TFS_ALL),
-    ("EC05", "十字孕线窄幅缩量极度压缩与W10五笔颈线增仓破局", ARCH_E, _TFS_ALL),
-    ("FC01", "大级别结构锚定小级别分型扳机", ARCH_F, _TFS_RESONANCE),
-    ("FC02", "F01_板块龙头共振补涨补跌", ARCH_F, _TFS_ALL),
-    ("FC03", "F02_截面比价超跌超涨背驰反包", ARCH_F, _TFS_ALL),
-    ("FC04", "F03_截面TopK斜率时序突破双共振", ARCH_F, _TFS_ALL),
-)
+_ATOMIC_SPEC_ROWS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = ()
 ATOMIC_EXIT_MODE = "continuous"
-CANDIDATE_HYPOTHESIS_POOL += [
-    SignalSpec(
-        f"{fam}{'L' if direction > 0 else 'S'}",
-        f"{fam}{'L' if direction > 0 else 'S'}_{name}{'做多' if direction > 0 else '做空'}",
-        arch,
-        direction,
-        0.26,
-        tfs,
-        ATOMIC_EXIT_MODE,
-    )
-    for fam, name, arch, tfs in _ATOMIC_SPEC_ROWS
-    for direction in (1, -1)
-]
 
 ALL_SIGNAL_SPECS: dict[str, SignalSpec] = {s.sig_id: s for s in (BASE_SEED_SIGNALS + CANDIDATE_HYPOTHESIS_POOL)}
 
@@ -2243,3 +2201,19 @@ def compute_signal_triggers_and_weights(
         triggers[start_bar:] = cz_trig_arr[start_bar:]
 
     return triggers, weights
+
+
+def _bootstrap_atomic_ssot() -> None:
+    """在 hypothesis_bank 独立导入时触发 atomic_factors 的 SSOT 自动同步。"""
+    import sys
+
+    af_mod = sys.modules.get("examples.multi_factor_cta.atomic_factors")
+    if af_mod is None:
+        from examples.multi_factor_cta.atomic_factors import sync_atomic_specs_to_hypothesis_bank
+
+        sync_atomic_specs_to_hypothesis_bank()
+    elif hasattr(af_mod, "sync_atomic_specs_to_hypothesis_bank"):
+        af_mod.sync_atomic_specs_to_hypothesis_bank()
+
+
+_bootstrap_atomic_ssot()

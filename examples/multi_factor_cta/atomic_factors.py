@@ -397,6 +397,65 @@ def _native_state(df: pd.DataFrame, suffix: str, part: int = 0) -> np.ndarray:
     return np.full(len(df), "其他", dtype=object)
 
 
+# state_key -> (column_suffix, part_idx, stage_added, description)
+STATE_SIGNAL_MANIFEST: dict[str, tuple[str, int, str, str]] = {
+    # Stage 1: 基础信号状态
+    "ma_cls": ("分类V221203", 0, "Stage1_Base", "SMA20均线多空分类"),
+    "td_v2": ("TD_BS辅助V221111", 1, "Stage1_Base", "TD九转序列顶底状态"),
+    "clv": ("CLV多空V230605", 0, "Stage1_Base", "CLV收盘位置资金流多空"),
+    "ntmdk": ("NTMDK多空V230824", 0, "Stage1_Base", "NTMDK多空动量状态"),
+    "kcatr": ("KCATR多空V230823", 0, "Stage1_Base", "Keltner-ATR通道多空状态"),
+    "fake_break": ("假突破", 0, "Stage1_Base", "N10M3箱体2B假突破"),
+    # Stage 2: 182 未开发信号普查筛出的高信噪比且 100% 严格价格镜像对称 (exact_mirror=True) 原生状态
+    "ma_joint": ("均线粘合发散V260520", 0, "Stage2_Rust", "多均线粘合发散看多看空"),
+    "double_ma": ("双均线_BS辅助V240208", 0, "Stage2_Rust", "双均线多空排列辅助"),
+    "dif_layer": ("完全分类V241010", 0, "Stage2_Rust", "MACD DIF完全分层分类"),
+    "dif_zero": ("DIF靠近零轴T50_BS辅助V240612", 0, "Stage2_Rust", "DIF靠近零轴买卖点"),
+    "macd_bc_ubi": ("MACD背驰_UBI观察V230804", 0, "Stage2_Rust", "未完成笔MACD背驰观察"),
+    "macd_bc": ("柱子背驰_BS辅助V240307", 0, "Stage2_Rust", "MACD红绿柱背驰辅助"),
+    "bar_acc": ("加速V240428", 0, "Stage2_Rust", "K线二阶动量加速"),
+    "polyfit": ("分类V240428", 0, "Stage2_Rust", "二次多项式拟合加减速分类"),
+    "plr_long": ("M多头_盈亏比V240427", 0, "Stage2_Rust", "分段线性回归多头盈亏比满足"),
+    "plr_short": ("M空头_盈亏比V240427", 0, "Stage2_Rust", "分段线性回归空头盈亏比满足"),
+    "tnr": ("趋势V230630", 0, "Stage2_Rust", "TNR趋势信噪比噪音减少"),
+    "zfzd": ("形态V241013", 0, "Stage2_Rust", "窄幅震荡压缩形态"),
+    "overlap": ("支撑压力V240612", 0, "Stage2_Rust", "中枢重叠区间支撑压力"),
+    "bi_end_618": ("BE辅助V230618", 0, "Stage2_Rust", "笔终点0.618黄金分割辅助"),
+    "zdy_dif": ("DIF远离V230528", 0, "Stage2_Rust", "DIF远离零轴多空分类"),
+    "macd_shrink": ("MACD缩柱_BS辅助V230519", 0, "Stage2_Rust", "MACD连续缩柱衰竭辅助"),
+    "xl_candle": ("形态V240412", 0, "Stage2_Rust", "长蜡烛实体突破形态"),
+    "xl_trend": ("突破信号V240623", 0, "Stage2_Rust", "通道突破做多做空信号"),
+    "xl_trend_v2": ("突破信号V240623", 1, "Stage2_Rust", "通道连续上涨下跌计数"),
+    "sar": ("SAR_BS辅助V230325", 0, "Stage2_Rust", "抛物线SAR多空状态"),
+    # Stage 3: 量仓微结构与双顺中线 (CVOLP / Pressure / 量柱 / 布林强弱 / 双顺中线)
+    "cvolp": ("CVOLP动量变化率V230612", 0, "Stage3_OI", "CVOLP筹码动量变化率"),
+    "pressure": ("支撑压力V240222", 0, "Stage3_OI", "滚动窗口支撑位压力位"),
+    "vol_ts_v1": ("量柱V221216", 0, "Stage3_OI", "梯量柱与缩量柱形态"),
+    "vol_ts_v2": ("量柱V221216", 1, "Stage3_OI", "量柱伴随价升价跌状态"),
+    "vol_gd": ("量柱V221218", 0, "Stage3_OI", "高量柱低量柱黄金柱形态"),
+    "boll_pwr_v1": ("强弱V221112", 0, "Stage3_OI", "布林带多空方向划分"),
+    "boll_pwr_v2": ("强弱V221112", 1, "Stage3_OI", "布林带超强强势弱势分层"),
+    "ds_mid_v1": ("双顺中线突破V260521", 0, "Stage3_OI", "双顺中枢中线突破多空"),
+    "ds_mid_v2": ("双顺中线突破V260521", 1, "Stage3_OI", "双顺中枢中线突破子状态"),
+    # Stage 4: C/E 簇中枢空间形态、二三买卖点、停顿验证分型、双中枢/五笔/九转与十字孕线
+    "sym_zs_v1": ("对称中枢", 0, "Stage4_CE", "对称中枢是否成立"),
+    "sym_zs_v2": ("对称中枢", 1, "Stage4_CE", "对称中枢向上向下方向"),
+    "bs2_sma": ("BS2辅助V230320", 0, "Stage4_CE", "SMA均线二买二卖辅助"),
+    "bs2_macd": ("BS2辅助V230324", 0, "Stage4_CE", "MACD回抽零轴二买卖辅助"),
+    "bs3_18": ("BS3辅助V230318", 0, "Stage4_CE", "三买三卖辅助V230318"),
+    "bs3_19": ("BS3辅助V230319", 0, "Stage4_CE", "三买三卖均线新高新低辅助"),
+    "be_pause_v1": ("停顿分型_BE辅助V230106", 0, "Stage4_CE", "笔终点停顿分型确认"),
+    "be_verif_v1": ("验证分型_BE辅助V230107", 0, "Stage4_CE", "笔终点验证分型确认"),
+    "five_bi": ("五笔_形态V230619", 0, "Stage4_CE", "五笔形态颈线突破与背驰"),
+    "double_zs": ("双中枢_BS1辅助V230311", 0, "Stage4_CE", "双中枢趋势背驰一买卖辅助"),
+    "td9_v1": ("神奇九转N9_BS辅助V240616", 0, "Stage4_CE", "神奇九转N9买卖点辅助"),
+    "zs_sp_v1": ("中枢空间_BS辅助V230421", 0, "Stage4_CE", "多笔中枢空间收敛方向"),
+    "zs_fm_v1": ("中枢形态_BS辅助V230423", 0, "Stage4_CE", "多笔中枢形态演化方向"),
+    "acc_w10": ("W10_加速V221110", 0, "Stage4_CE", "10窗口动量加速突破"),
+    "doji_rev": ("十字线反转V240329", 0, "Stage4_CE", "顶部底部十字孕线反转"),
+}
+
+
 def attach_causal_oi_features(df_tf: pd.DataFrame, df_5m: pd.DataFrame | None = None) -> dict[str, np.ndarray]:
     """将 5m 真实持仓量 open_interest (或本周期 open_interest) 严格因果对齐至目标周期收盘时刻，提取无量纲量仓特征。"""
     n = len(df_tf)
@@ -552,59 +611,8 @@ class FactorContext:
             strength={k: decode_strength(df, k) for k in STRENGTH_SIGNAL_KINDS},
         )
         ctx.states = {
-            "ma_cls": _native_state(df, "分类V221203"),
-            "td_v2": _native_state(df, "TD_BS辅助V221111", part=1),
-            "clv": _native_state(df, "CLV多空V230605"),
-            "ntmdk": _native_state(df, "NTMDK多空V230824"),
-            "kcatr": _native_state(df, "KCATR多空V230823"),
-            "fake_break": _native_state(df, "假突破"),
-            # Stage 2 新增：182 未开发信号普查筛出的高信噪比且 100% 严格价格镜像对称 (exact_mirror=True) 原生状态
-            "ma_joint": _native_state(df, "均线粘合发散V260520"),
-            "double_ma": _native_state(df, "双均线_BS辅助V240208"),
-            "dif_layer": _native_state(df, "完全分类V241010"),
-            "dif_zero": _native_state(df, "DIF靠近零轴T50_BS辅助V240612"),
-            "macd_bc_ubi": _native_state(df, "MACD背驰_UBI观察V230804"),
-            "macd_bc": _native_state(df, "柱子背驰_BS辅助V240307"),
-            "bar_acc": _native_state(df, "加速V240428"),
-            "polyfit": _native_state(df, "分类V240428"),
-            "plr_long": _native_state(df, "M多头_盈亏比V240427"),
-            "plr_short": _native_state(df, "M空头_盈亏比V240427"),
-            "tnr": _native_state(df, "趋势V230630"),
-            "zfzd": _native_state(df, "形态V241013"),
-            "overlap": _native_state(df, "支撑压力V240612"),
-            "bi_end_618": _native_state(df, "BE辅助V230618"),
-            "zdy_dif": _native_state(df, "DIF远离V230528"),
-            "macd_shrink": _native_state(df, "MACD缩柱_BS辅助V230519"),
-            "xl_candle": _native_state(df, "形态V240412"),
-            "xl_trend": _native_state(df, "突破信号V240623"),
-            "xl_trend_v2": _native_state(df, "突破信号V240623", part=1),
-            "sar": _native_state(df, "SAR_BS辅助V230325"),
-            # Stage 3 新增：量仓微结构与双顺中线 (CVOLP / Pressure / 量柱 / 布林强弱 / 双顺中线)
-            "cvolp": _native_state(df, "CVOLP动量变化率V230612"),
-            "pressure": _native_state(df, "支撑压力V240222"),
-            "vol_ts_v1": _native_state(df, "量柱V221216"),
-            "vol_ts_v2": _native_state(df, "量柱V221216", part=1),
-            "vol_gd": _native_state(df, "量柱V221218"),
-            "boll_pwr_v1": _native_state(df, "强弱V221112"),
-            "boll_pwr_v2": _native_state(df, "强弱V221112", part=1),
-            "ds_mid_v1": _native_state(df, "双顺中线突破V260521"),
-            "ds_mid_v2": _native_state(df, "双顺中线突破V260521", part=1),
-            # Stage 4 新增：C/E 簇中枢空间形态、二三买卖点、停顿验证分型、双中枢/五笔/九转与十字孕线
-            "sym_zs_v1": _native_state(df, "对称中枢", part=0),
-            "sym_zs_v2": _native_state(df, "对称中枢", part=1),
-            "bs2_sma": _native_state(df, "BS2辅助V230320", part=0),
-            "bs2_macd": _native_state(df, "BS2辅助V230324", part=0),
-            "bs3_18": _native_state(df, "BS3辅助V230318", part=0),
-            "bs3_19": _native_state(df, "BS3辅助V230319", part=0),
-            "be_pause_v1": _native_state(df, "停顿分型_BE辅助V230106", part=0),
-            "be_verif_v1": _native_state(df, "验证分型_BE辅助V230107", part=0),
-            "five_bi": _native_state(df, "五笔_形态V230619", part=0),
-            "double_zs": _native_state(df, "双中枢_BS1辅助V230311", part=0),
-            "td9_v1": _native_state(df, "神奇九转N9_BS辅助V240616", part=0),
-            "zs_sp_v1": _native_state(df, "中枢空间_BS辅助V230421", part=0),
-            "zs_fm_v1": _native_state(df, "中枢形态_BS辅助V230423", part=0),
-            "acc_w10": _native_state(df, "W10_加速V221110", part=0),
-            "doji_rev": _native_state(df, "十字线反转V240329", part=0),
+            state_key: _native_state(df, suffix, part=part_idx)
+            for state_key, (suffix, part_idx, _, _) in STATE_SIGNAL_MANIFEST.items()
         }
         oi_feats = attach_causal_oi_features(df, _unbox(df, "oi_5m"))
         ctx.oi_avail = oi_feats["oi_avail"]
@@ -1306,6 +1314,7 @@ class AtomicFactorDef:
     build: Callable
     eligible_tfs: tuple[str, ...]
     default_decay: DecayConfig | None = None
+    stage: str = "Stage1_Base"
 
 
 _ALL_TFS = ("1d", "60m", "30m", "15m", "5m")
@@ -1336,60 +1345,174 @@ _SPREAD_REVERT_DECAY = DecayConfig(
     trailing=0.012,
     ratchet_stop=True,
 )
-ATOMIC_FACTOR_DEFS: dict[str, AtomicFactorDef] = {
-    d.family: d
-    for d in (
-        AtomicFactorDef("AC01", "三买卖中枢脱离安全边际突破确认", ARCH_A, _build_ac01, _ALL_TFS),
-        AtomicFactorDef("AC02", "均线斜率动量唐奇安突破", ARCH_A, _build_ac02, _ALL_TFS, _BREAKOUT_TRAIL_DECAY),
-        AtomicFactorDef("AC03", "多均线共振双均线蓄势与斜率加速突破", ARCH_A, _build_ac03, _ALL_TFS),
-        AtomicFactorDef("AC04", "中枢重叠支撑压力与SAR长实体突破", ARCH_A, _build_ac04, _ALL_TFS),
-        AtomicFactorDef(
-            "AC05", "双顺中枢中线突破与布林强势量仓共振", ARCH_A, _build_ac05, _ALL_TFS, _BREAKOUT_TRAIL_DECAY
-        ),
-        AtomicFactorDef("BC01", "笔背驰衰竭分型确认", ARCH_B, _build_bc01, _ALL_TFS),
-        AtomicFactorDef("BC02", "TD九转极值2B假突破", ARCH_B, _build_bc02, _ALL_TFS),
-        AtomicFactorDef("BC03", "MACD背驰缩柱蓄势与笔终点反转确认", ARCH_B, _build_bc03, _ALL_TFS),
-        AtomicFactorDef("BC04", "持仓量急降砍仓逼空出清与高量柱背驰反转", ARCH_B, _build_bc04, _ALL_TFS),
-        AtomicFactorDef("CC01", "中枢偏离回归", ARCH_C, _build_cc01, _ALL_TFS),
-        AtomicFactorDef("CC02", "KC轨道刺破收回", ARCH_C, _build_cc02, _ALL_TFS),
-        AtomicFactorDef("CC03", "DIF分层远离超跌超涨与二阶拟合减速回归", ARCH_C, _build_cc03, _ALL_TFS),
-        AtomicFactorDef("CC04", "顺势二买卖对称中枢回踩缩量洗盘与停顿分型回流回归", ARCH_C, _build_cc04, _ALL_TFS),
-        AtomicFactorDef("CC05", "布林弱势箱体支撑压力双中枢九转减仓与验证分型回归", ARCH_C, _build_cc05, _ALL_TFS),
-        AtomicFactorDef("DC01", "量价资金流CLV共振", ARCH_D, _build_dc01, _ALL_TFS),
-        AtomicFactorDef("DC02", "NTMDK-KCATR多空共振放量突破", ARCH_D, _build_dc02, _ALL_TFS),
-        AtomicFactorDef("DC03", "PLR分段线性回归与DIF动量放量脉冲", ARCH_D, _build_dc03, _ALL_TFS),
-        AtomicFactorDef("DC04", "CVOLP筹码扩张黄金柱蓄势与增仓梯量突破", ARCH_D, _build_dc04, _ALL_TFS),
-        AtomicFactorDef("DC05", "支撑压力位缩量减仓洗盘与双顺中线筹码回流", ARCH_D, _build_dc05, _ALL_TFS),
-        AtomicFactorDef("EC01", "挤压后波动率扩张点火", ARCH_E, _build_ec01, _ALL_TFS),
-        AtomicFactorDef("EC02", "NR7窄幅突破", ARCH_E, _build_ec02, _ALL_TFS),
-        AtomicFactorDef(
-            "EC03", "TNR趋势信噪比降噪窄幅压缩与二阶加速点火", ARCH_E, _build_ec03, _ALL_TFS, _SQUEEZE_ACCEL_DECAY
-        ),
-        AtomicFactorDef(
-            "EC04", "多笔中枢空间收敛蓄势与三买卖增仓扩张点火", ARCH_E, _build_ec04, _ALL_TFS, _SQUEEZE_ACCEL_DECAY
-        ),
-        AtomicFactorDef(
-            "EC05", "十字孕线窄幅缩量极度压缩与W10五笔颈线增仓破局", ARCH_E, _build_ec05, _ALL_TFS, _SQUEEZE_ACCEL_DECAY
-        ),
-        AtomicFactorDef(
-            "FC01",
-            "大级别结构锚定小级别分型扳机",
-            ARCH_F,
-            _build_fc01,
-            ("60m", "30m", "15m", "5m"),
-            _HTF_RESONANCE_DECAY,
-        ),
-        AtomicFactorDef("FC02", "F01_板块龙头共振补涨补跌", ARCH_F, _build_fc02, _ALL_TFS),
-        AtomicFactorDef("FC03", "F02_截面比价超跌超涨背驰反包", ARCH_F, _build_fc03, _ALL_TFS, _SPREAD_REVERT_DECAY),
-        AtomicFactorDef("FC04", "F03_截面TopK斜率时序突破双共振", ARCH_F, _build_fc04, _ALL_TFS),
-    )
-}
+_INITIAL_ATOMIC_FACTOR_DEFS: tuple[AtomicFactorDef, ...] = (
+    AtomicFactorDef("AC01", "三买卖中枢脱离安全边际突破确认", ARCH_A, _build_ac01, _ALL_TFS, stage="Stage1_Base"),
+    AtomicFactorDef(
+        "AC02", "均线斜率动量唐奇安突破", ARCH_A, _build_ac02, _ALL_TFS, _BREAKOUT_TRAIL_DECAY, stage="Stage1_Base"
+    ),
+    AtomicFactorDef("AC03", "多均线共振双均线蓄势与斜率加速突破", ARCH_A, _build_ac03, _ALL_TFS, stage="Stage2_Rust"),
+    AtomicFactorDef("AC04", "中枢重叠支撑压力与SAR长实体突破", ARCH_A, _build_ac04, _ALL_TFS, stage="Stage2_Rust"),
+    AtomicFactorDef(
+        "AC05",
+        "双顺中枢中线突破与布林强势量仓共振",
+        ARCH_A,
+        _build_ac05,
+        _ALL_TFS,
+        _BREAKOUT_TRAIL_DECAY,
+        stage="Stage3_OI",
+    ),
+    AtomicFactorDef("BC01", "笔背驰衰竭分型确认", ARCH_B, _build_bc01, _ALL_TFS, stage="Stage1_Base"),
+    AtomicFactorDef("BC02", "TD九转极值2B假突破", ARCH_B, _build_bc02, _ALL_TFS, stage="Stage1_Base"),
+    AtomicFactorDef("BC03", "MACD背驰缩柱蓄势与笔终点反转确认", ARCH_B, _build_bc03, _ALL_TFS, stage="Stage2_Rust"),
+    AtomicFactorDef("BC04", "持仓量急降砍仓逼空出清与高量柱背驰反转", ARCH_B, _build_bc04, _ALL_TFS, stage="Stage3_OI"),
+    AtomicFactorDef("CC01", "中枢偏离回归", ARCH_C, _build_cc01, _ALL_TFS, stage="Stage1_Base"),
+    AtomicFactorDef("CC02", "KC轨道刺破收回", ARCH_C, _build_cc02, _ALL_TFS, stage="Stage1_Base"),
+    AtomicFactorDef(
+        "CC03", "DIF分层远离超跌超涨与二阶拟合减速回归", ARCH_C, _build_cc03, _ALL_TFS, stage="Stage2_Rust"
+    ),
+    AtomicFactorDef(
+        "CC04", "顺势二买卖对称中枢回踩缩量洗盘与停顿分型回流回归", ARCH_C, _build_cc04, _ALL_TFS, stage="Stage4_CE"
+    ),
+    AtomicFactorDef(
+        "CC05", "布林弱势箱体支撑压力双中枢九转减仓与验证分型回归", ARCH_C, _build_cc05, _ALL_TFS, stage="Stage4_CE"
+    ),
+    AtomicFactorDef("DC01", "量价资金流CLV共振", ARCH_D, _build_dc01, _ALL_TFS, stage="Stage1_Base"),
+    AtomicFactorDef("DC02", "NTMDK-KCATR多空共振放量突破", ARCH_D, _build_dc02, _ALL_TFS, stage="Stage1_Base"),
+    AtomicFactorDef("DC03", "PLR分段线性回归与DIF动量放量脉冲", ARCH_D, _build_dc03, _ALL_TFS, stage="Stage2_Rust"),
+    AtomicFactorDef("DC04", "CVOLP筹码扩张黄金柱蓄势与增仓梯量突破", ARCH_D, _build_dc04, _ALL_TFS, stage="Stage3_OI"),
+    AtomicFactorDef(
+        "DC05", "支撑压力位缩量减仓洗盘与双顺中线筹码回流", ARCH_D, _build_dc05, _ALL_TFS, stage="Stage3_OI"
+    ),
+    AtomicFactorDef("EC01", "挤压后波动率扩张点火", ARCH_E, _build_ec01, _ALL_TFS, stage="Stage1_Base"),
+    AtomicFactorDef("EC02", "NR7窄幅突破", ARCH_E, _build_ec02, _ALL_TFS, stage="Stage1_Base"),
+    AtomicFactorDef(
+        "EC03",
+        "TNR趋势信噪比降噪窄幅压缩与二阶加速点火",
+        ARCH_E,
+        _build_ec03,
+        _ALL_TFS,
+        _SQUEEZE_ACCEL_DECAY,
+        stage="Stage2_Rust",
+    ),
+    AtomicFactorDef(
+        "EC04",
+        "多笔中枢空间收敛蓄势与三买卖增仓扩张点火",
+        ARCH_E,
+        _build_ec04,
+        _ALL_TFS,
+        _SQUEEZE_ACCEL_DECAY,
+        stage="Stage4_CE",
+    ),
+    AtomicFactorDef(
+        "EC05",
+        "十字孕线窄幅缩量极度压缩与W10五笔颈线增仓破局",
+        ARCH_E,
+        _build_ec05,
+        _ALL_TFS,
+        _SQUEEZE_ACCEL_DECAY,
+        stage="Stage4_CE",
+    ),
+    AtomicFactorDef(
+        "FC01",
+        "大级别结构锚定小级别分型扳机",
+        ARCH_F,
+        _build_fc01,
+        ("60m", "30m", "15m", "5m"),
+        _HTF_RESONANCE_DECAY,
+        stage="Stage1_Base",
+    ),
+    AtomicFactorDef("FC02", "F01_板块龙头共振补涨补跌", ARCH_F, _build_fc02, _ALL_TFS, stage="Stage1_Base"),
+    AtomicFactorDef(
+        "FC03", "F02_截面比价超跌超涨背驰反包", ARCH_F, _build_fc03, _ALL_TFS, _SPREAD_REVERT_DECAY, stage="Stage1_Base"
+    ),
+    AtomicFactorDef("FC04", "F03_截面TopK斜率时序突破双共振", ARCH_F, _build_fc04, _ALL_TFS, stage="Stage1_Base"),
+)
 F_CLUSTER_FAMILY_ALIASES: dict[str, str] = {
     "F01": "FC02",
     "F02": "FC03",
     "F03": "FC04",
 }
+
+
+class _AtomicFactorDefRegistry(dict[str, AtomicFactorDef]):
+    """支持动态注册/删除并自动同步至 hypothesis_bank 与 ATOMIC_SIGNAL_IDS 的字典容器。"""
+
+    def __setitem__(self, key: str, value: AtomicFactorDef) -> None:
+        super().__setitem__(key, value)
+        sync_atomic_specs_to_hypothesis_bank()
+
+    def __delitem__(self, key: str) -> None:
+        super().__delitem__(key)
+        sync_atomic_specs_to_hypothesis_bank()
+
+    def pop(self, key: str, *args):
+        res = super().pop(key, *args)
+        sync_atomic_specs_to_hypothesis_bank()
+        return res
+
+    def update(self, *args, **kwargs) -> None:
+        super().update(*args, **kwargs)
+        sync_atomic_specs_to_hypothesis_bank()
+
+
+ATOMIC_FACTOR_DEFS: dict[str, AtomicFactorDef] = _AtomicFactorDefRegistry(
+    {d.family: d for d in _INITIAL_ATOMIC_FACTOR_DEFS}
+)
 ATOMIC_SIGNAL_IDS: tuple[str, ...] = tuple(f"{fam}{side}" for fam in ATOMIC_FACTOR_DEFS for side in ("L", "S"))
+
+
+def sync_atomic_specs_to_hypothesis_bank() -> tuple[str, ...]:
+    """以 ATOMIC_FACTOR_DEFS 为唯一事实源，自动同步双向 SignalSpec 至 hypothesis_bank。"""
+    import sys
+
+    global ATOMIC_SIGNAL_IDS
+    ATOMIC_SIGNAL_IDS = tuple(f"{fam}{side}" for fam in ATOMIC_FACTOR_DEFS for side in ("L", "S"))
+    for mod_name in ("examples.multi_factor_cta", "alpha_lab"):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "ATOMIC_SIGNAL_IDS"):
+            mod.ATOMIC_SIGNAL_IDS = ATOMIC_SIGNAL_IDS
+
+    hb = sys.modules.get("examples.alpha_mining_agent.hypothesis_bank")
+    if hb is None or not hasattr(hb, "ALL_SIGNAL_SPECS"):
+        return ATOMIC_SIGNAL_IDS
+
+    exit_mode = getattr(hb, "ATOMIC_EXIT_MODE", "continuous")
+    atomic_specs = [
+        hb.SignalSpec(
+            f"{fdef.family}{'L' if direction > 0 else 'S'}",
+            f"{fdef.family}{'L' if direction > 0 else 'S'}_{fdef.name}{'做多' if direction > 0 else '做空'}",
+            fdef.archetype,
+            direction,
+            0.26,
+            fdef.eligible_tfs,
+            exit_mode,
+        )
+        for fdef in ATOMIC_FACTOR_DEFS.values()
+        for direction in (1, -1)
+    ]
+    hb._ATOMIC_SPEC_ROWS = tuple((d.family, d.name, d.archetype, d.eligible_tfs) for d in ATOMIC_FACTOR_DEFS.values())
+    non_atomic = [s for s in hb.CANDIDATE_HYPOTHESIS_POOL if s.exit_mode != exit_mode]
+    hb.CANDIDATE_HYPOTHESIS_POOL[:] = non_atomic + atomic_specs
+    desired = {s.sig_id: s for s in (hb.BASE_SEED_SIGNALS + hb.CANDIDATE_HYPOTHESIS_POOL)}
+    for k in list(hb.ALL_SIGNAL_SPECS):
+        if k not in desired:
+            del hb.ALL_SIGNAL_SPECS[k]
+    hb.ALL_SIGNAL_SPECS.update(desired)
+    return ATOMIC_SIGNAL_IDS
+
+
+def register_atomic_factor_def(fdef: AtomicFactorDef) -> AtomicFactorDef:
+    """动态注册连续原子因子族定义并自动同步至 hypothesis_bank。"""
+    ATOMIC_FACTOR_DEFS[fdef.family] = fdef
+    return fdef
+
+
+def unregister_atomic_factor_def(family: str) -> AtomicFactorDef | None:
+    """移除连续原子因子族定义并自动同步至 hypothesis_bank。"""
+    return ATOMIC_FACTOR_DEFS.pop(family, None)
+
+
+sync_atomic_specs_to_hypothesis_bank()
 
 
 # ---------------------------------------------------------------------------
