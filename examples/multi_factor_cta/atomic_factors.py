@@ -589,6 +589,22 @@ class FactorContext:
             "boll_pwr_v2": _native_state(df, "强弱V221112", part=1),
             "ds_mid_v1": _native_state(df, "双顺中线突破V260521"),
             "ds_mid_v2": _native_state(df, "双顺中线突破V260521", part=1),
+            # Stage 4 新增：C/E 簇中枢空间形态、二三买卖点、停顿验证分型、双中枢/五笔/九转与十字孕线
+            "sym_zs_v1": _native_state(df, "对称中枢", part=0),
+            "sym_zs_v2": _native_state(df, "对称中枢", part=1),
+            "bs2_sma": _native_state(df, "BS2辅助V230320", part=0),
+            "bs2_macd": _native_state(df, "BS2辅助V230324", part=0),
+            "bs3_18": _native_state(df, "BS3辅助V230318", part=0),
+            "bs3_19": _native_state(df, "BS3辅助V230319", part=0),
+            "be_pause_v1": _native_state(df, "停顿分型_BE辅助V230106", part=0),
+            "be_verif_v1": _native_state(df, "验证分型_BE辅助V230107", part=0),
+            "five_bi": _native_state(df, "五笔_形态V230619", part=0),
+            "double_zs": _native_state(df, "双中枢_BS1辅助V230311", part=0),
+            "td9_v1": _native_state(df, "神奇九转N9_BS辅助V240616", part=0),
+            "zs_sp_v1": _native_state(df, "中枢空间_BS辅助V230421", part=0),
+            "zs_fm_v1": _native_state(df, "中枢形态_BS辅助V230423", part=0),
+            "acc_w10": _native_state(df, "W10_加速V221110", part=0),
+            "doji_rev": _native_state(df, "十字线反转V240329", part=0),
         }
         oi_feats = attach_causal_oi_features(df, _unbox(df, "oi_5m"))
         ctx.oi_avail = oi_feats["oi_avail"]
@@ -965,6 +981,68 @@ def _build_cc03(ctx, side):  # C: DIF 分层远离/靠近零轴蓄势 × 二阶�
     return setup, setup_q, confirm, confirm_q, 4
 
 
+def _build_cc04(ctx, side):  # C: 顺势二买卖/对称中枢回踩缩量洗盘 + 停顿验证分型与量仓回流锚定回归 (Stage 4)
+    bs2_label = "二买" if side > 0 else "二卖"
+    dir_label = "看多" if side > 0 else "看空"
+    sym_dir = "向上" if side > 0 else "向下"
+    ov_label = "支撑" if side > 0 else "压力"
+    rev_ok, rev_q = _dir_eq(ctx, "zs_revert", side)
+    flow_ok, fq = _dir_eq(ctx, "flow", side)
+    vr = np.divide(ctx.v, ctx.vma20, out=np.ones(ctx.n), where=ctx.vma20 > EPS)
+    pullback_anchor = (
+        (ctx.states["bs2_macd"] == dir_label)
+        | ((ctx.states["bs2_sma"] == bs2_label) & ((ctx.states["overlap"] == ov_label) | rev_ok))
+        | ((ctx.states["sym_zs_v1"] == "是") & (ctx.states["sym_zs_v2"] == sym_dir) & rev_ok)
+    )
+    wash_dry = (
+        (ctx.states["vol_ts_v1"] == "缩量")
+        | (ctx.states["vol_gd"] == "低量柱")
+        | (ctx.oi_flow3_z < -0.12)
+        | (vr < 0.88)
+    )
+    setup = pullback_anchor & wash_dry & (ctx.er20 < 0.52)
+    setup_q = np.clip(np.maximum(rev_q, 0.50 + 0.50 * np.tanh(np.maximum(-ctx.oi_flow3_z, 0.2))), 0.22, 1.0)
+    brk, brk_q = _break_confirm(ctx, side)
+    c_s, o_s, _, _ = _adj(ctx, side)
+    re_inflow = (ctx.oi_chg_z > 0.05) | (ctx.states["cvolp"] == "看多") | flow_ok | (ctx.states["clv"] == dir_label)
+    fx_confirm = (ctx.states["be_pause_v1"] == dir_label) | (ctx.states["be_verif_v1"] == dir_label) | brk
+    confirm = fx_confirm & re_inflow & (c_s > o_s)
+    confirm_q = np.clip(0.55 * np.maximum(brk_q, np.where(flow_ok, fq, 0.45)) + 0.45 * np.tanh(vr), 0.22, 1.0)
+    return setup, setup_q, confirm, confirm_q, 5
+
+
+def _build_cc05(ctx, side):  # C: 布林弱势箱体支撑压力/双中枢九转减仓衰竭 + 停顿验证分型假突破回归 (Stage 4)
+    pr_label = "支撑位" if side > 0 else "压力位"
+    ov_label = "支撑" if side > 0 else "压力"
+    td_label = "买点" if side > 0 else "卖点"
+    dir_label = "看多" if side > 0 else "看空"
+    five_div = ["aAb式底背驰", "类趋势底背驰"] if side > 0 else ["aAb式顶背驰", "类趋势顶背驰"]
+    rev_ok, rev_q = _dir_eq(ctx, "zs_revert", side)
+    fx_ok, fx_q = _dir_eq(ctx, "fx", side)
+    stretch = np.nan_to_num(np.maximum(side * (ctx.ma20 - ctx.c), 0.0) / (1.5 * _safe_atr(ctx)), nan=0.0)
+    at_boundary = (
+        (ctx.states["pressure"] == pr_label)
+        | (ctx.states["overlap"] == ov_label)
+        | (ctx.states["double_zs"] == dir_label)
+        | np.isin(ctx.states["five_bi"], five_div)
+        | ((ctx.states["td9_v1"] == td_label) & (stretch > 0.60))
+    )
+    oi_exhaust = (ctx.oi_flow3_z < -0.18) | (ctx.states["cvolp"] == "看空") | (ctx.states["vol_gd"] == "低量柱")
+    setup = (ctx.er20 < 0.45) & (ctx.states["boll_pwr_v2"] == "弱势") & at_boundary & oi_exhaust
+    setup_q = np.clip(np.maximum(rev_q, 0.45 + 0.55 * np.tanh(stretch)), 0.22, 1.0)
+    c_s, o_s, _, _ = _adj(ctx, side)
+    body = np.maximum(c_s - o_s, 0.0)
+    rev_confirm = (
+        (ctx.states["be_pause_v1"] == dir_label)
+        | (ctx.states["be_verif_v1"] == dir_label)
+        | (ctx.states["fake_break"] == dir_label)
+        | (fx_ok & (fx_q >= 0.35))
+    )
+    confirm = rev_confirm & (c_s > o_s) & (c_s > _shift(c_s))
+    confirm_q = np.clip(np.maximum(fx_q, np.tanh(body / _safe_atr(ctx)) + 0.15), 0.20, 1.0)
+    return setup, setup_q, confirm, confirm_q, 5
+
+
 def _build_dc01(ctx, side):  # D: 量价资金流 + CLV 同向 + 放量阳线
     label = "看多" if side > 0 else "看空"
     flow_ok, q = _dir_eq(ctx, "flow", side)
@@ -1066,6 +1144,60 @@ def _build_ec03(ctx, side):  # E: TNR 趋势信噪比噪音减少 + 窄幅震荡
     setup_q = np.clip(0.55 * (1.0 - ctx.atr_rank) + 0.45 * np.clip(1.0 - ctx.er20, 0.2, 1.0), 0.15, 1.0)
     confirm = ((ctx.states["polyfit"] == poly_acc) & brk) | ((ctx.states["xl_trend"] == xl_label) & brk) | sq_ok
     confirm_q = np.clip(np.maximum(brk_q, sq_q), 0.15, 1.0)
+    return setup, setup_q, confirm, confirm_q, 6
+
+
+def _build_ec04(ctx, side):  # E: 多笔中枢空间收敛蓄势 + 均线三买卖/中枢脱离增仓扩张点火 (Stage 4)
+    zs_dir = "上涨" if side > 0 else "下跌"
+    sym_dir = "向上" if side > 0 else "向下"
+    bs3_label = "三买" if side > 0 else "三卖"
+    dir_label = "看多" if side > 0 else "看空"
+    sq_ok, sq_q = _dir_eq(ctx, "squeeze", side)
+    zs_ok, zs_q = _dir_eq(ctx, "zs_break", side)
+    brk, brk_q = _break_confirm(ctx, side)
+    vr = np.divide(ctx.v, ctx.vma20, out=np.ones(ctx.n), where=ctx.vma20 > EPS)
+    zs_compress = (
+        (ctx.states["zs_sp_v1"] == zs_dir)
+        | (ctx.states["zs_fm_v1"] == zs_dir)
+        | ((ctx.states["sym_zs_v1"] == "是") & (ctx.states["sym_zs_v2"] == sym_dir) & (ctx.atr_rank <= 0.48))
+    )
+    setup = zs_compress & ((ctx.atr_rank <= 0.55) | ctx.in_squeeze | (ctx.states["zfzd"] == "满足"))
+    setup_q = np.clip(0.55 * (1.0 - ctx.atr_rank) + 0.45 * np.clip(1.0 - ctx.er20, 0.20, 1.0), 0.22, 1.0)
+    bs3_ok = (ctx.states["bs3_18"] == bs3_label) | (ctx.states["bs3_19"] == bs3_label) | zs_ok | sq_ok
+    oi_vol_push = (
+        (ctx.oi_flow3_z > 0.15) | ((ctx.states["cvolp"] == "看多") & (vr >= 1.10)) | (ctx.states["clv"] == dir_label)
+    )
+    confirm = brk & bs3_ok & oi_vol_push
+    confirm_q = np.clip(
+        0.55 * np.maximum(brk_q, np.maximum(zs_q, sq_q)) + 0.45 * np.tanh(np.maximum(vr - 0.8, 0.1)), 0.22, 1.0
+    )
+    return setup, setup_q, confirm, confirm_q, 6
+
+
+def _build_ec05(ctx, side):  # E: 十字孕线/窄幅缩量极度压缩 + W10动量加速与五笔颈线增仓破局 (Stage 4)
+    doji_label = "底部十字孕线" if side > 0 else "顶部十字孕线"
+    acc_label = "上涨" if side > 0 else "下跌"
+    neck_brk = ["上颈线突破", "类三买"] if side > 0 else ["下颈线突破", "类三卖"]
+    dir_label = "看多" if side > 0 else "看空"
+    bp_label = "多头" if side > 0 else "空头"
+    sq_ok, sq_q = _dir_eq(ctx, "squeeze", side)
+    brk, brk_q = _break_confirm(ctx, side)
+    c_s, o_s, _, _ = _adj(ctx, side)
+    body = np.maximum(c_s - o_s, 0.0)
+    quiet_setup = (ctx.states["doji_rev"] == doji_label) | (
+        (ctx.atr_rank <= 0.42) & ((ctx.states["vol_gd"] == "低量柱") | (ctx.states["vol_ts_v1"] == "缩量"))
+    )
+    dir_align = (ctx.states["ds_mid_v1"] == dir_label) | (
+        (ctx.states["boll_pwr_v1"] == bp_label) & (side * (ctx.c - ctx.ma20) > 0)
+    )
+    setup = quiet_setup & dir_align
+    setup_q = np.clip(
+        0.60 * (1.0 - ctx.atr_rank) + 0.40 * np.clip(1.0 - ctx.rng / (2.0 * _safe_atr(ctx)), 0.15, 1.0), 0.22, 1.0
+    )
+    oi_push = (ctx.oi_flow3_z > 0.15) | (ctx.states["cvolp"] == "看多")
+    ignition = (ctx.states["acc_w10"] == acc_label) | np.isin(ctx.states["five_bi"], neck_brk) | (sq_ok & oi_push)
+    confirm = brk & ignition & (body >= 0.30 * _safe_atr(ctx))
+    confirm_q = np.clip(0.55 * np.maximum(sq_q, brk_q) + 0.45 * np.tanh(body / _safe_atr(ctx)), 0.22, 1.0)
     return setup, setup_q, confirm, confirm_q, 6
 
 
@@ -1221,6 +1353,8 @@ ATOMIC_FACTOR_DEFS: dict[str, AtomicFactorDef] = {
         AtomicFactorDef("CC01", "中枢偏离回归", ARCH_C, _build_cc01, _ALL_TFS),
         AtomicFactorDef("CC02", "KC轨道刺破收回", ARCH_C, _build_cc02, _ALL_TFS),
         AtomicFactorDef("CC03", "DIF分层远离超跌超涨与二阶拟合减速回归", ARCH_C, _build_cc03, _ALL_TFS),
+        AtomicFactorDef("CC04", "顺势二买卖对称中枢回踩缩量洗盘与停顿分型回流回归", ARCH_C, _build_cc04, _ALL_TFS),
+        AtomicFactorDef("CC05", "布林弱势箱体支撑压力双中枢九转减仓与验证分型回归", ARCH_C, _build_cc05, _ALL_TFS),
         AtomicFactorDef("DC01", "量价资金流CLV共振", ARCH_D, _build_dc01, _ALL_TFS),
         AtomicFactorDef("DC02", "NTMDK-KCATR多空共振放量突破", ARCH_D, _build_dc02, _ALL_TFS),
         AtomicFactorDef("DC03", "PLR分段线性回归与DIF动量放量脉冲", ARCH_D, _build_dc03, _ALL_TFS),
@@ -1230,6 +1364,12 @@ ATOMIC_FACTOR_DEFS: dict[str, AtomicFactorDef] = {
         AtomicFactorDef("EC02", "NR7窄幅突破", ARCH_E, _build_ec02, _ALL_TFS),
         AtomicFactorDef(
             "EC03", "TNR趋势信噪比降噪窄幅压缩与二阶加速点火", ARCH_E, _build_ec03, _ALL_TFS, _SQUEEZE_ACCEL_DECAY
+        ),
+        AtomicFactorDef(
+            "EC04", "多笔中枢空间收敛蓄势与三买卖增仓扩张点火", ARCH_E, _build_ec04, _ALL_TFS, _SQUEEZE_ACCEL_DECAY
+        ),
+        AtomicFactorDef(
+            "EC05", "十字孕线窄幅缩量极度压缩与W10五笔颈线增仓破局", ARCH_E, _build_ec05, _ALL_TFS, _SQUEEZE_ACCEL_DECAY
         ),
         AtomicFactorDef(
             "FC01",

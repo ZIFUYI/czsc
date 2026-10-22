@@ -306,7 +306,7 @@ def test_long_short_mirror_symmetry(family, built, mirrored):
         np.testing.assert_allclose(stop_a, mirror_sum - stop_b, atol=1e-9, rtol=0)
 
 
-@pytest.mark.parametrize("family", ["AC05", "BC04", "DC04", "DC05"])
+@pytest.mark.parametrize("family", ["AC05", "BC04", "CC04", "CC05", "DC04", "DC05", "EC04", "EC05"])
 def test_oi_microstructure_factors_with_open_interest_mirror_and_causality(family, built, mirrored):
     """验证挂载真实 open_interest 时，AC05/BC04/DC04/DC05 保持严格镜像对称与截断因果一致。"""
     from examples.multi_factor_cta.atomic_factors import set_factor_context
