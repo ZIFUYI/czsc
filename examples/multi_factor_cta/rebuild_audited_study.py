@@ -105,7 +105,7 @@ def _compute_asset_evidence(args):
         for uid, weight in unit.items():
             sid, tf = uid.split("@")
             evaluation = evaluate_candidate_on_fold(
-                training, weight[mask], "15m", spec.fee_rate, pd.Timestamp(fold["cutoff"])
+                training, weight[mask], tf, spec.fee_rate, pd.Timestamp(fold["cutoff"])
             )
             rows.append(
                 {
@@ -116,9 +116,9 @@ def _compute_asset_evidence(args):
                     "tf": tf,
                     "archetype": ALL_SIGNAL_SPECS[sid].archetype,
                     "sector": spec.sector,
+                    **{key: value for key, value in evaluation.items() if key != "event_returns"},
                     "pool_group": f"commodity:{spec.sector.lower()}",
                     "microstructure_group": "commodity_futures",
-                    **{key: value for key, value in evaluation.items() if key != "event_returns"},
                 }
             )
     return spec.name, unit, rows
@@ -133,7 +133,8 @@ def prepare_study_inputs(specs: list[AssetSpec], *, source_dir: Path, output_dir
     study.register_hetero_signal_specs()
     # Candidate inventory is frozen without reading historical performance columns.
     base_uids = tuple(sorted(pd.read_csv(source_dir / "multitf_factor_scores.csv", usecols=["uid"]).uid.unique()))
-    candidates = tuple(sorted(set(base_uids) | set(study.HETERO_SIGNAL_META)))
+    core_hetero = {u for u in study.HETERO_SIGNAL_META if u.split("@")[0] not in getattr(study, "STAGE2_SIG_IDS", ())}
+    candidates = tuple(sorted(set(base_uids) | core_hetero))
     protocol = FrozenResearchProtocol(
         candidates=candidates,
         variants=(

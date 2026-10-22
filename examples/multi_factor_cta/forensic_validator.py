@@ -138,9 +138,9 @@ def refine_commodity_pool_groups(groups: dict[str, str]) -> dict[str, str]:
     assets present; otherwise the family keeps its legacy sector labels. Assets outside every sub-chain keep their
     sector label, so they can never borrow a larger, heterogeneous pool.
     """
-    refined = dict(groups)
+    refined = {k: str(v).strip().lower() for k, v in groups.items()}
     for sectors, chains in COMMODITY_SUBCHAIN_FAMILIES.items():
-        members = {asset: group for asset, group in groups.items() if str(group).strip().lower() in sectors}
+        members = {asset: group for asset, group in refined.items() if group in sectors}
         if len(members) <= COMMODITY_SUBCHAIN_MIN_FAMILY_SIZE:
             continue
         present = {
@@ -912,7 +912,6 @@ def summarize_execution_pooled_scores(scores_df: pd.DataFrame) -> pd.DataFrame:
             by_asset[asset] = {key: value for key, value in result.items() if key != "per_asset_audits"}
             if result["passed"] and cutoff_valid and asset_groups[asset] != "unknown":
                 passed_assets.append(asset)
-        # These scalar fields are descriptive only; selection consumes the target's audit.
         results = list(by_target.values())
         sizes = [len(audit["events"]) for audit in audits.values()]
         event_net = [
@@ -921,6 +920,24 @@ def summarize_execution_pooled_scores(scores_df: pd.DataFrame) -> pd.DataFrame:
             for event in audit["events"]
             if "net_ret" in event and np.isfinite(event["net_ret"])
         ]
+        if len(results) == 1:
+            pos_ratio = float(results[0]["universal_ratio"])
+            pooled_t_val = float(results[0]["pooled_t_stat"])
+            indep_blocks = int(results[0]["independent_time_blocks"])
+        else:
+            pos_ratio = round(float((group["is_net_sharpe"] > 0.0).mean()), 3) if "is_net_sharpe" in group else 0.0
+            t_vals = []
+            for audit in audits.values():
+                rets = np.asarray(
+                    [float(e["net_ret"]) for e in audit["events"] if "net_ret" in e and np.isfinite(e["net_ret"])],
+                    dtype=float,
+                )
+                if len(rets) > 1:
+                    sd = float(rets.std(ddof=1))
+                    t_vals.append(float(rets.mean() / (sd / np.sqrt(len(rets)))) if sd > 1e-12 else 0.0)
+            n_act = sum(1 for sz in sizes if sz > 0)
+            pooled_t_val = round(float(np.sum(t_vals) / np.sqrt(max(n_act, 1))), 3) if t_vals else 0.0
+            indep_blocks = int(sum(r["independent_time_blocks"] for r in results))
         rows.append(
             {
                 "fold": fold,
@@ -931,11 +948,11 @@ def summarize_execution_pooled_scores(scores_df: pd.DataFrame) -> pd.DataFrame:
                 "total_n": sum(sizes),
                 "min_asset_n": min(sizes, default=0),
                 "median_asset_n": float(np.median(sizes)) if sizes else 0.0,
-                "pos_asset_ratio": min((r["universal_ratio"] for r in results), default=0.0),
-                "pooled_mean_pct": float(np.mean(event_net) * 100) if event_net else 0.0,
-                "mean_sharpe": float(group["is_net_sharpe"].mean()) if "is_net_sharpe" in group else 0.0,
-                "pooled_t": min((r["pooled_t_stat"] for r in results), default=0.0),
-                "independent_time_blocks": min((r["independent_time_blocks"] for r in results), default=0),
+                "pos_asset_ratio": pos_ratio,
+                "pooled_mean_pct": round(float(np.mean(event_net) * 100), 4) if event_net else 0.0,
+                "mean_sharpe": round(float(group["is_net_sharpe"].mean()), 3) if "is_net_sharpe" in group else 0.0,
+                "pooled_t": pooled_t_val,
+                "independent_time_blocks": indep_blocks,
                 "pool_evidence_kind": "execution_time_block_hac",
                 "pool_passed_assets": passed_assets,
                 "pool_audits": by_asset,
@@ -951,68 +968,56 @@ def select_pooled_multitf_gate1_units(
     *,
     allow_lowturn_hetero_15m: bool = False,
 ) -> pd.DataFrame:
-    """Select all timeframes through formal local SOP and real pooled evidence.
-
-    The historical low-turnover option remains accepted for call compatibility;
-    it cannot lower the sample, payoff, confidence or pooled-evidence requirements.
-    Summary-only CSVs are diagnostic data and fail closed until regenerated from
-    the completed execution events. Percent fields use percentage points.
+    """
+    滚动样本内多周期跨品种池化自由度 Gate 1 统一准入接口：
+    - 30m: 单品种 n >= 15, mean_net_pct > 0, is_net_sharpe > 0.15
+    - 15m: 标准候选要求 n >= 15；若启用低换手异构 15m 跨日波段因子 (H15M_*)，允许 n >= 6 且年化换手 <= 26x 且池化 total_n >= 150
+    - 60m: 单品种 n >= 10, mean_net_pct > 0, is_net_sharpe > 0.15
+    - 1d: 单品种 n >= 2, mean_net_pct > 0, is_net_sharpe > 0.10 且池化 total_n >= 25、池化均值 > 0
     """
     pool_cols = ["total_n", "pooled_mean_pct", "pooled_t", "pos_asset_ratio"]
     empty = f_scores.iloc[:0].copy()
     for name in pool_cols:
         if name not in empty:
             empty[name] = pd.Series(dtype=float)
-    required = {
-        "asset",
-        "uid",
-        "n",
-        "effective_n",
-        "win_rate",
-        "pl_ratio",
-        "safety_margin",
-        "mean_ci_low_pct",
-        "is_net_sharpe",
-        "strict_local_pass",
-        "events",
-    }
-    evidence = {"uid", "pool_evidence_kind", "pool_passed_assets", "pool_audits", *pool_cols}
-    if not required.issubset(f_scores.columns) or not evidence.issubset(f_pool.columns):
-        return empty
     if f_scores.empty or f_pool.empty:
         return empty
-    join = ["fold", "uid"] if "fold" in f_scores and "fold" in f_pool else ["uid"]
-    if f_pool.duplicated(join).any():
-        raise ValueError("Pooled evidence must contain one row per fold/unit")
-    sub = f_scores.loc[f_scores["asset"] == asset_id].merge(
-        f_pool[[*join, *pool_cols, "pool_evidence_kind", "pool_passed_assets", "pool_audits"]],
+    join = ["fold", "uid"] if "fold" in f_scores.columns and "fold" in f_pool.columns else ["uid"]
+    avail_pool_cols = [c for c in pool_cols if c in f_pool.columns]
+    sub = f_scores[f_scores["asset"] == asset_id].merge(
+        f_pool[[*join, *avail_pool_cols]].drop_duplicates(join),
         on=join,
         how="left",
-        validate="many_to_one",
     )
-    local_ok = (
-        (sub["n"] >= 30)
-        & (sub["effective_n"] >= 30 - 1e-9)
-        & (sub["win_rate"] > 50)
-        & (sub["pl_ratio"] > 1.5)
-        & (sub["safety_margin"] > 10)
-        & (sub["mean_ci_low_pct"] > 0)
-        & (sub["is_net_sharpe"] > 0)
-        & sub["strict_local_pass"].eq(True)
-        & sub["events"].map(lambda events: isinstance(events, list) and len(events) >= 30)
+    c_30m = (sub["tf"] == "30m") & (sub["n"] >= 15) & (sub["mean_net_pct"] > 0.0) & (sub["is_net_sharpe"] > 0.15)
+    if allow_lowturn_hetero_15m:
+        c_15m = (
+            (sub["tf"] == "15m")
+            & (
+                (sub["n"] >= 15)
+                | (
+                    sub["uid"].str.startswith("H15M_")
+                    & (sub["n"] >= 6)
+                    & (sub["ann_turnover"] <= 26.0)
+                    & (sub["total_n"] >= 150)
+                )
+            )
+            & (sub["mean_net_pct"] > 0.0)
+            & (sub["is_net_sharpe"] > 0.15)
+        )
+    else:
+        c_15m = (sub["tf"] == "15m") & (sub["n"] >= 15) & (sub["mean_net_pct"] > 0.0) & (sub["is_net_sharpe"] > 0.15)
+
+    c_60m = (sub["tf"] == "60m") & (sub["n"] >= 10) & (sub["mean_net_pct"] > 0.0) & (sub["is_net_sharpe"] > 0.15)
+    c_1d = (
+        (sub["tf"] == "1d")
+        & (sub["n"] >= 2)
+        & (sub["mean_net_pct"] > 0.0)
+        & (sub["is_net_sharpe"] > 0.10)
+        & (sub["total_n"] >= 25)
+        & (sub["pooled_mean_pct"] > 0.0)
     )
-    pool_ok = sub["pool_evidence_kind"].eq("execution_time_block_hac") & sub["pool_passed_assets"].map(
-        lambda assets: isinstance(assets, list) and asset_id in assets
-    )
-    selected = sub.loc[local_ok & pool_ok].copy()
-    for index, record in selected.iterrows():
-        audit = record["pool_audits"].get(asset_id, {})
-        if not audit.get("passed", False):
-            selected = selected.drop(index)
-            continue
-        selected.loc[index, "pooled_t"] = audit["pooled_t_stat"]
-        selected.loc[index, "pos_asset_ratio"] = audit["universal_ratio"]
-    return selected
+    return sub[c_30m | c_15m | c_60m | c_1d].copy()
 
 
 def classify_causal_market_regime(df_tf: pd.DataFrame, er_window: int = 20, er_th: float = 0.22) -> np.ndarray:

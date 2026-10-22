@@ -161,10 +161,11 @@ def evaluate_candidate_on_fold(
         for event in events:
             event["regime"] = int(regimes[int(event["trigger_idx"])])
     returns = np.asarray([event["net_ret"] for event in events], dtype=np.float64)
+    unweighted_mean_pct = round(float(returns.mean()) * 100.0, 4) if len(returns) else 0.0
     result = {
         "n": audit["is_n_purged"],
         "effective_n": audit["is_effective_n"],
-        "mean_net_pct": audit.get("is_mean_pct", 0.0),
+        "mean_net_pct": unweighted_mean_pct,
         "q_mean_net_pct": audit.get("is_mean_pct", 0.0),
         "win_rate": audit.get("is_win_rate_pct", 0.0),
         "pl_ratio": audit.get("is_pl_ratio", 0.0),

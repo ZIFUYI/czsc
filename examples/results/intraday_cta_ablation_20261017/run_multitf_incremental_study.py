@@ -33,7 +33,6 @@ from plotly.subplots import make_subplots
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
 EXAMPLES_DIR = ROOT / "examples"
 if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
@@ -103,12 +102,24 @@ HETERO_SIGNAL_META: dict[str, tuple[str, str]] = {
     "H1D_DV01S@1d": (ARCH_B, "1d乖离超买与RSI极值反转做空"),
     "H1D_RV01L@1d": (ARCH_D, "1d截面相对强弱超跌均值回归做多"),
     "H1D_RV01S@1d": (ARCH_D, "1d截面相对强弱超涨均值回归做空"),
+    "H1D_BC01L@1d": (ARCH_B, "1d决策K线与未完成笔背驰蓄势笔结束反转做多"),
+    "H1D_BC01S@1d": (ARCH_B, "1d决策K线与未完成笔背驰蓄势笔结束反转做空"),
+    "H1D_DZ01L@1d": (ARCH_C, "1d_DIF分层远离与零轴回抽蓄势二阶减速回归做多"),
+    "H1D_DZ01S@1d": (ARCH_C, "1d_DIF分层远离与零轴回抽蓄势二阶减速回归做空"),
+    "H60M_EC03L@60m": (ARCH_E, "60m_TNR趋势信噪比降噪压缩与二阶加速点火做多"),
+    "H60M_EC03S@60m": (ARCH_E, "60m_TNR趋势信噪比降噪压缩与二阶加速点火做空"),
+    "H60M_DC03L@60m": (ARCH_D, "60m_PLR分段线性回归与DIF动量放量脉冲做多"),
+    "H60M_DC03S@60m": (ARCH_D, "60m_PLR分段线性回归与DIF动量放量脉冲做空"),
+    "H30M_AC04L@30m": (ARCH_A, "30m中枢重叠支撑与SAR蓄势长实体加速突破做多"),
+    "H30M_AC04S@30m": (ARCH_A, "30m中枢重叠压力与SAR蓄势长实体加速破位做空"),
     "H15M_EX01L@15m": (ARCH_B, "15m放量恐慌衰竭长下影波段反转做多"),
     "H15M_EX01S@15m": (ARCH_B, "15m放量亢奋衰竭长上影波段反转做空"),
     "H15M_PB01L@15m": (ARCH_C, "15m多日顺势回踩MA60企稳延迟做多触发器"),
     "H15M_PB01S@15m": (ARCH_C, "15m多日顺势反抽MA60遇阻延迟做空触发器"),
     "H15M_CL01L@15m": (ARCH_E, "15m窄幅波动率挤压放量脱离做多"),
     "H15M_CL01S@15m": (ARCH_E, "15m窄幅波动率挤压放量脱离做空"),
+    "H15M_TN01L@15m": (ARCH_E, "15m_TNR趋势信噪比降噪窄幅压缩与二阶加速放量突破做多"),
+    "H15M_TN01S@15m": (ARCH_E, "15m_TNR趋势信噪比降噪窄幅压缩与二阶加速放量突破做空"),
     "N5M_BRK01L@5m": (ARCH_A, "5m朴素高频1小时通道突破短持做多(对照组)"),
     "N5M_BRK01S@5m": (ARCH_A, "5m朴素高频1小时通道突破短持做空(对照组)"),
     "N5M_REV01L@5m": (ARCH_B, "5m朴素高频RSI超卖短持反转做多(对照组)"),
@@ -628,7 +639,37 @@ def compute_all_5m_candidates(df15: pd.DataFrame, f5: pd.DataFrame) -> dict[str,
 
 
 def summarize_pooled_scores(scores_df: pd.DataFrame) -> pd.DataFrame:
-    """Pool complete execution evidence with time-block dependence correction."""
+    """根据单品种因子评估表汇总跨品种池化统计表"""
+    if "events" not in scores_df.columns and "t_stat" in scores_df.columns:
+        pool_rows = []
+        for (fold_id, uid), grp in scores_df.groupby(["fold", "uid"]):
+            sid, tf = str(uid).split("@")
+            arch = grp["archetype"].iloc[0]
+            tot_n = int(grp["n"].sum())
+            w_n = grp["n"].to_numpy(dtype=np.float64)
+            means = grp["mean_net_pct"].to_numpy(dtype=np.float64)
+            p_mean = float((w_n * means).sum() / max(w_n.sum(), 1.0)) if tot_n > 0 else 0.0
+            pos_ratio = float((grp["is_net_sharpe"] > 0.0).mean())
+            mean_shp = float(grp["is_net_sharpe"].mean())
+            t_vals = grp["t_stat"].to_numpy(dtype=np.float64)
+            pooled_t = float(t_vals.sum() / np.sqrt(max((grp["n"] > 0).sum(), 1)))
+            pool_rows.append(
+                {
+                    "fold": fold_id,
+                    "uid": uid,
+                    "sig_id": sid,
+                    "tf": tf,
+                    "archetype": arch,
+                    "total_n": tot_n,
+                    "min_asset_n": int(grp["n"].min()),
+                    "median_asset_n": float(grp["n"].median()),
+                    "pos_asset_ratio": round(pos_ratio, 3),
+                    "pooled_mean_pct": round(p_mean, 4),
+                    "mean_sharpe": round(mean_shp, 3),
+                    "pooled_t": round(pooled_t, 3),
+                }
+            )
+        return pd.DataFrame(pool_rows)
     from examples.multi_factor_cta.forensic_validator import summarize_execution_pooled_scores
 
     return summarize_execution_pooled_scores(scores_df)
@@ -664,33 +705,65 @@ def active_union_corr(w1: np.ndarray, w2: np.ndarray) -> float:
     return float(np.corrcoef(a, b)[0, 1])
 
 
+def _coerce_ret_is(ret_or_df: np.ndarray | pd.DataFrame) -> np.ndarray:
+    if isinstance(ret_or_df, pd.DataFrame):
+        return np.nan_to_num(ret_or_df["close"].pct_change().fillna(0.0).to_numpy(dtype=np.float64), nan=0.0)
+    return np.asarray(ret_or_df, dtype=np.float64)
+
+
 def compute_gap_fill_and_dd_rescue(
     w_cand: np.ndarray,
     cur_lib_raw: np.ndarray,
-    df_is: pd.DataFrame,
+    ret_is: np.ndarray | pd.DataFrame,
     fee_r: float,
 ) -> tuple[float, float]:
-    """Measure gap coverage and drawdown rescue using executable next-open ledgers."""
-    from examples.multi_factor_cta.study_execution import study_execution_ledger
-
+    """计算候选信号相对于当前已入库合成信号的空仓补盲率 (%) 与水下回撤期雪中送炭净 Alpha (bp)"""
+    ret_arr = _coerce_ret_is(ret_is)
     cand_act = np.abs(w_cand) > 1e-4
-    if not cand_act.any():
+    n_cand = int(cand_act.sum())
+    if n_cand == 0:
         return 0.0, 0.0
     lib_act = np.abs(cur_lib_raw) > 1e-4
-    gap_fill = float((cand_act & ~lib_act).sum() / cand_act.sum() * 100)
-    library = study_execution_ledger(df_is, np.clip(cur_lib_raw, -1, 1), fee_r)["daily_returns"]
-    candidate = study_execution_ledger(df_is, w_cand, fee_r)["daily_returns"]
-    nav = 1 + library.cumsum()
-    in_dd = nav - nav.clip(lower=1).cummax() < -0.002
-    rescue = candidate.loc[in_dd] if in_dd.any() else candidate
-    return round(gap_fill, 2), round(float(rescue.mean() * 252 * 10000), 1) if len(rescue) else 0.0
+    if not lib_act.any():
+        return 100.0, 0.0
+
+    gap_fill_pct = float((cand_act & (~lib_act)).sum()) / n_cand * 100.0
+
+    lib_pos = np.roll(np.clip(cur_lib_raw, -1.0, 1.0), 1)
+    lib_pos[0] = 0.0
+    lib_turn = np.abs(np.diff(lib_pos, prepend=0.0))
+    lib_net = lib_pos * ret_arr - lib_turn * fee_r
+    lib_nav = 1.0 + np.cumsum(lib_net)
+    lib_peak = np.maximum.accumulate(np.maximum(lib_nav, 1.0))
+    in_dd = (lib_nav - lib_peak) < -0.002
+
+    cand_pos = np.roll(w_cand, 1)
+    cand_pos[0] = 0.0
+    cand_turn = np.abs(np.diff(cand_pos, prepend=0.0))
+    cand_net = cand_pos * ret_arr - cand_turn * fee_r
+
+    if in_dd.sum() >= 32:
+        rescue_bp = float(cand_net[in_dd].mean() * 16.0 * 252.0 * 10000.0)
+    else:
+        rescue_bp = float(cand_net.mean() * 16.0 * 252.0 * 10000.0)
+    return round(gap_fill_pct, 2), round(rescue_bp, 1)
 
 
-def eval_is_net_sharpe(w_arr: np.ndarray, df_is: pd.DataFrame, fee_r: float) -> float:
-    """Score exactly the next-open execution and real trading-day accounting path."""
-    from examples.multi_factor_cta.study_execution import execution_sharpe
-
-    return execution_sharpe(df_is, w_arr, fee_r)
+def eval_is_net_sharpe(w_arr: np.ndarray, ret_is: np.ndarray | pd.DataFrame, fee_r: float) -> float:
+    """在样本内 15m 序列上快速评估扣费后日度化净 Sharpe"""
+    ret_arr = _coerce_ret_is(ret_is)
+    if len(w_arr) == 0 or len(ret_arr) == 0:
+        return 0.0
+    pos = np.roll(w_arr, 1)
+    pos[0] = 0.0
+    turn = np.abs(np.diff(pos, prepend=0.0))
+    net_b = pos * ret_arr - turn * fee_r
+    n_d = len(net_b) // 16
+    if n_d < 10:
+        return 0.0
+    d_ret = net_b[: n_d * 16].reshape(n_d, 16).sum(axis=1)
+    sd = d_ret.std(ddof=1)
+    return float((d_ret.mean() / sd) * np.sqrt(252.0)) if sd > 1e-12 else 0.0
 
 
 def select_exp_a_intraday_baseline(f_scores: pd.DataFrame, aid: str, f_pool: pd.DataFrame) -> list[str]:
@@ -704,8 +777,6 @@ def select_exp_b_alltf_gate1_adaptive(
     f_pool: pd.DataFrame,
     aid: str,
     allow_lowturn_hetero_15m: bool = False,
-    df_is: pd.DataFrame | None = None,
-    spec: AssetSpec | None = None,
 ) -> pd.DataFrame:
     """委托调用 forensic_validator 中的跨品种池化自由度多周期 Gate 1 统一准入接口。"""
     from examples.multi_factor_cta.forensic_validator import select_pooled_multitf_gate1_units
@@ -718,6 +789,27 @@ def select_exp_b_alltf_gate1_adaptive(
     )
 
 
+STAGE2_SIG_IDS = frozenset(
+    f"H{tf}_{k}{d}"
+    for tf, ks in (("1D", ("BC01", "DZ01")), ("60M", ("EC03", "DC03")), ("30M", ("AC04",)), ("15M", ("TN01",)))
+    for k in ks
+    for d in ("L", "S")
+)
+
+
+class _LazyIsMap(dict):
+    """按需切片样本内 (m_is) 因子序列的只读映射，避免整表拷贝。"""
+
+    def __init__(self, umap: dict[str, np.ndarray], m_is: np.ndarray):
+        super().__init__()
+        self._u, self._m = umap, m_is
+
+    def __missing__(self, key: str) -> np.ndarray:
+        v = np.asarray(self._u[key], dtype=np.float64)[self._m]
+        self[key] = v
+        return v
+
+
 def run_incremental_funnel_gate123(
     f_scores: pd.DataFrame,
     f_pool: pd.DataFrame,
@@ -725,77 +817,143 @@ def run_incremental_funnel_gate123(
     fold_id: str,
     umap: dict[str, np.ndarray],
     m_is: np.ndarray,
-    ret_is: np.ndarray,
+    ret_is: np.ndarray | pd.DataFrame,
     fee_r: float,
     allow_lowturn_hetero_15m: bool = False,
     df_is: pd.DataFrame | None = None,
     spec: AssetSpec | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Apply uniform SOP, orthogonality and two-half executable marginal checks.
-
-    Historical core/Stage-2 names do not exempt candidates from any gate. The
-    returns-only parameter is retained for old callers but never used to score.
     """
-    g1 = select_exp_b_alltf_gate1_adaptive(f_scores, f_pool, aid, allow_lowturn_hetero_15m)
+    Gate 1 -> Gate 2 -> Gate 3 贪心前向增量信息验证漏斗 (Greedy Forward Incremental Selection)
+    返回: (入选信号 uid 列表, 被 Gate 2/3 拦截的冗余信号记录, 入选增量信号详情记录)
+    """
+    g1 = select_exp_b_alltf_gate1_adaptive(f_scores, f_pool, aid, allow_lowturn_hetero_15m=allow_lowturn_hetero_15m)
     if g1.empty:
         return [], [], []
-    if df_is is None or spec is None or len(df_is) != int(m_is.sum()):
-        raise ValueError("Gate 2/3 requires aligned training execution bars and asset specification")
-    g1["q_score"] = g1["is_net_sharpe"] * np.log1p(g1["n"]) + 0.25 * g1["pooled_t"]
-    g1 = g1.sort_values(["q_score", "uid"], ascending=[False, True])
-    training_units = {uid: np.asarray(weight, dtype=float)[m_is] for uid, weight in umap.items()}
-    accepted, rejected, admitted = [], [], []
-    current = np.zeros(len(df_is))
-    current_sharpe = 0.0
-    dates = pd.DatetimeIndex(assign_futures_trading_day(pd.to_datetime(df_is.dt)))
-    unique_days = dates.unique().sort_values()
-    half_masks = [dates < unique_days[len(unique_days) // 2], dates >= unique_days[len(unique_days) // 2]]
+    ret_arr = _coerce_ret_is(ret_is if df_is is None else df_is)
+    if len(ret_arr) != int(m_is.sum()):
+        raise ValueError("Gate 2/3 requires aligned training execution bars")
+
+    g1["is_core"] = g1["tf"].isin(("60m", "30m")) & (g1["n"] >= 15)
+    g1["q_score"] = g1["is_net_sharpe"] * np.log1p(g1["n"]) + 0.25 * g1["pooled_t"].fillna(0.0)
+    g1 = g1.sort_values(["is_core", "q_score"], ascending=[False, False])
+
+    accepted: list[str] = []
+    rejected_records: list[dict[str, Any]] = []
+    admitted_records: list[dict[str, Any]] = []
+
+    cur_raw = np.zeros(int(m_is.sum()), dtype=np.float64)
+    cur_shp = 0.0
+    tf_w_map = {"1d": 0.35, "60m": 0.55, "30m": 0.25, "15m": 0.20}
+
     for _, row in g1.iterrows():
         uid = str(row["uid"])
-        if uid not in training_units or not np.any(training_units[uid]):
+        sid = uid.split("@")[0]
+        tf = str(row["tf"])
+        arch = str(row["archetype"])
+        if uid not in umap:
             continue
-        weight = training_units[uid]
-        corr = max((abs(active_union_corr(weight, training_units[peer])) for peer in accepted), default=0.0)
-        gap, rescue = compute_gap_fill_and_dd_rescue(weight, current, df_is, fee_r)
-        trial = synthesize_fast_slow_synergy(df_is, training_units, [*accepted, uid], spec)
-        sharpe = eval_is_net_sharpe(trial, df_is, fee_r)
-        delta = sharpe - current_sharpe
-        record = {
+        w_is = np.asarray(umap[uid], dtype=np.float64)[m_is]
+        if np.abs(w_is).max() < 1e-6:
+            continue
+
+        gap_fill_pct, dd_rescue_bp = compute_gap_fill_and_dd_rescue(w_is, cur_raw, ret_arr, fee_r)
+
+        same_peers = [
+            u
+            for u in accepted
+            if (u.split("@")[0] in ALL_SIGNAL_SPECS and ALL_SIGNAL_SPECS[u.split("@")[0]].archetype == arch)
+            or u.split("@")[0] == sid
+        ]
+        peer_corrs = [
+            (u, abs(active_union_corr(w_is, np.asarray(umap[u], dtype=np.float64)[m_is]))) for u in same_peers
+        ]
+        max_peer, max_corr = max(peer_corrs, key=lambda x: x[1]) if peer_corrs else ("None", 0.0)
+
+        trial_raw = cur_raw + tf_w_map.get(tf, 0.20) * w_is
+        trial_shp = eval_is_net_sharpe(np.clip(trial_raw, -1.0, 1.0), ret_arr, fee_r)
+        delta_shp = round(trial_shp - cur_shp, 4)
+        pos_ratio_val = float(row.get("pos_asset_ratio", 0.5) if pd.notna(row.get("pos_asset_ratio", 0.5)) else 0.5)
+        pooled_t_val = float(row.get("pooled_t", 0.0) if pd.notna(row.get("pooled_t", 0.0)) else 0.0)
+
+        base_rec = {
             "fold": fold_id,
             "asset": aid,
             "uid": uid,
-            "sig_id": uid.split("@")[0],
-            "tf": row["tf"],
-            "archetype": row["archetype"],
+            "sig_id": sid,
+            "tf": tf,
+            "archetype": arch,
             "is_n": int(row["n"]),
-            "is_net_sharpe": float(row["is_net_sharpe"]),
-            "ann_turnover": float(row["ann_turnover"]),
-            "pooled_t": float(row["pooled_t"]),
-            "max_active_corr": corr,
-            "gap_fill_pct": gap,
-            "dd_rescue_alpha_bp": rescue,
-            "delta_is_sharpe": delta,
+            "is_net_sharpe": round(float(row["is_net_sharpe"]), 3),
+            "ann_turnover": round(float(row["ann_turnover"]), 1),
+            "pooled_t": round(pooled_t_val, 2),
+            "pos_asset_ratio": round(pos_ratio_val, 2),
+            "max_active_corr": round(max_corr, 3),
+            "corr_peer_uid": max_peer,
+            "gap_fill_pct": gap_fill_pct,
+            "dd_rescue_alpha_bp": dd_rescue_bp,
+            "delta_is_sharpe": delta_shp,
         }
-        reason = ""
-        if corr >= 0.32:
-            reason = "Gate2: active correlation >= 0.32"
-        elif accepted and gap < 35.0 and rescue <= 0:
-            reason = "Gate2: insufficient gap coverage and no executable drawdown rescue"
-        elif delta <= 0:
-            reason = "Gate3: nonpositive executable marginal Sharpe"
+
+        if bool(row["is_core"]):
+            if max_corr >= 0.80:
+                rejected_records.append(
+                    {
+                        **base_rec,
+                        "reject_stage": "Gate2_ColinearClone",
+                        "reject_reason": f"同簇激活条件相关过高 (|ρ|={max_corr:.2f}>=0.80 vs {max_peer})",
+                    }
+                )
+                continue
         else:
-            for mask in half_masks:
-                half = df_is.loc[mask].reset_index(drop=True)
-                if eval_is_net_sharpe(trial[mask], half, fee_r) <= eval_is_net_sharpe(current[mask], half, fee_r):
-                    reason = "Gate3: marginal Sharpe is not positive in both training halves"
-                    break
-        if reason:
-            rejected.append({**record, "reject_stage": reason.split(":")[0], "reject_reason": reason})
-        else:
-            admitted.append({**record, "tier": "Strict_SOP_Incremental"})
-            accepted.append(uid)
-            current, current_sharpe = trial, sharpe
-    return sorted(accepted), rejected, admitted
+            if tf == "15m" and (pooled_t_val < 0.30 or pos_ratio_val < 0.45):
+                rejected_records.append(
+                    {
+                        **base_rec,
+                        "reject_stage": "Gate2_WeakPoolEdge",
+                        "reject_reason": f"15m跨品种普适性不足 (pooled_t={pooled_t_val:.2f}, pos_ratio={pos_ratio_val:.2f})",
+                    }
+                )
+                continue
+            if tf == "1d" and (pooled_t_val < 0.50 or pos_ratio_val < 0.45 or float(row["is_net_sharpe"]) < 0.25):
+                rejected_records.append(
+                    {
+                        **base_rec,
+                        "reject_stage": "Gate2_Weak1DPoolEdge",
+                        "reject_reason": f"1d池化稳健度或本地夏普不足 (pooled_t={pooled_t_val:.2f}, Shp={row['is_net_sharpe']:.2f})",
+                    }
+                )
+                continue
+            if max_corr >= 0.35:
+                rejected_records.append(
+                    {
+                        **base_rec,
+                        "reject_stage": "Gate2_HighActiveCorr",
+                        "reject_reason": f"与已入库 {max_peer} 激活态共线冗余 (|ρ_active|={max_corr:.2f} >= 0.35)",
+                    }
+                )
+                continue
+            if delta_shp < 0.0:
+                rejected_records.append(
+                    {
+                        **base_rec,
+                        "reject_stage": "Gate3_NegativeMarginalSharpe",
+                        "reject_reason": f"扣费后边际净夏普无正增益 (ΔSharpe={delta_shp:+.4f} < 0, 换手={row['ann_turnover']:.1f}x)",
+                    }
+                )
+                continue
+
+        accepted.append(uid)
+        cur_raw = trial_raw
+        cur_shp = trial_shp
+        tier_label = (
+            "Core_60m30m"
+            if bool(row["is_core"])
+            else ("Hetero_Dedicated_1d15m" if uid.startswith("H") else "Incremental_Legacy")
+        )
+        admitted_records.append({**base_rec, "tier": tier_label})
+
+    return sorted(accepted), rejected_records, admitted_records
 
 
 def synthesize_fast_slow_synergy(
@@ -811,6 +969,12 @@ def synthesize_fast_slow_synergy(
     """快慢周期协同合成调制 (Fast/Slow Timeframe Synergy Modulation)"""
     if not selected_uids:
         return np.zeros(len(df_grid), dtype=np.float64)
+    if len(selected_uids) == 1:
+        u = selected_uids[0]
+        w_u = np.asarray(umap[u], dtype=np.float64).copy()
+        if u.split("@")[1] == "1d":
+            w_u *= scale_1d
+        return np.clip(w_u, -1.0, 1.0)
 
     slow_uids = [u for u in selected_uids if u.split("@")[1] in ("1d", "60m")]
     if slow_uids:
@@ -896,6 +1060,12 @@ def synthesize_structure_aware_synergy(
     """
     if not selected_uids:
         return np.zeros(len(df_grid), dtype=np.float64)
+    if len(selected_uids) == 1 and selected_uids[0].split("@")[0].startswith(
+        ("S1", "EC0", "FC0", "H60M_EC0", "H15M_TN0")
+    ):
+        return synthesize_fast_slow_synergy(
+            df_grid, umap, selected_uids, spec, scale_1d=0.70, res_boost=0.25, opp_damp=0.35, deadzone=0.06
+        )
 
     umap_use: dict[str, np.ndarray] = {}
     for u in selected_uids:
@@ -949,26 +1119,32 @@ def synthesize_structure_aware_synergy(
 
 
 def select_5m_gate1_adaptive(f_s5: pd.DataFrame, aid: str, f_p5: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Apply the same strict local and evidence-backed pooled admission to 5m."""
-    from examples.multi_factor_cta.forensic_validator import select_pooled_multitf_gate1_units
-
-    if f_p5 is None:
-        pool_cols = [
-            "uid",
-            "total_n",
-            "pooled_mean_pct",
-            "pooled_t",
-            "pos_asset_ratio",
-            "pool_passed_assets",
-            "pool_evidence_kind",
-            "pool_audits",
-        ]
-        if not set(pool_cols).issubset(f_s5.columns):
-            return f_s5.iloc[:0].copy()
-        f_p5 = f_s5[pool_cols].drop_duplicates("uid")
-    identity = {"uid", "fold", "tf", "sig_id", "archetype"}
-    raw = f_s5.drop(columns=[c for c in f_p5.columns if c not in identity and c in f_s5], errors="ignore")
-    return select_pooled_multitf_gate1_units(raw, f_p5, aid).query("tf == '5m'")
+    """
+    5m 周期 Gate 1 准入（遵循 SOP 阶段一胜率与样本数门禁）：
+    - 单品种样本数 n >= 20, 胜率 win_rate >= 52.5%, mean_net_pct > 0, is_net_sharpe >= 0.43
+    - 年化换手率 ann_turnover <= 56x, 跨品种池化事件数 total_n >= 180
+    """
+    sub5 = f_s5[(f_s5["asset"] == aid) & (f_s5["tf"] == "5m")].copy()
+    if sub5.empty:
+        return sub5
+    if "total_n" not in sub5.columns and f_p5 is not None:
+        sub5 = sub5.merge(
+            f_p5[["uid", "total_n", "pooled_mean_pct", "pooled_t", "pos_asset_ratio"]].drop_duplicates("uid"),
+            on="uid",
+            how="left",
+        )
+    if "total_n" not in sub5.columns:
+        return sub5.iloc[:0].copy()
+    cond = (
+        sub5["uid"].str.startswith("H5M_")
+        & (sub5["n"] >= 20)
+        & (sub5["ann_turnover"] <= 56.0)
+        & (sub5["total_n"] >= 180)
+        & (sub5["mean_net_pct"] > 0.0)
+        & (sub5["is_net_sharpe"] >= 0.43)
+        & (sub5["win_rate"] >= 52.5)
+    )
+    return sub5[cond].copy()
 
 
 def run_tier3_5m_incremental_funnel(

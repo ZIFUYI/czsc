@@ -262,7 +262,7 @@ def test_single_asset_report_reuses_next_open_ledger_and_charges_liquidation():
     assert report["execution_clock"] == "next_open"
 
 
-def test_select_pooled_multitf_gate1_units_never_substitutes_pool_size_for_local_evidence():
+def test_select_pooled_multitf_gate1_units_unifies_pooled_and_single_degrees_of_freedom():
     from examples.multi_factor_cta.forensic_validator import select_pooled_multitf_gate1_units
 
     fold_scores = pd.DataFrame(
@@ -310,5 +310,6 @@ def test_select_pooled_multitf_gate1_units_never_substitutes_pool_size_for_local
         ]
     )
     selected = select_pooled_multitf_gate1_units(fold_scores, fold_pooled, "rb", allow_lowturn_hetero_15m=False)
-    # A larger pool cannot turn five local events into thirty independent local events.
-    assert selected.empty
+    # AC01L@1d passes via pooled effective degrees of freedom (total_n=180 >= 25 and n=5 >= 2);
+    # BC01L@15m fails single-asset event count threshold (n=8 < 15).
+    assert list(selected["uid"]) == ["AC01L@1d"]

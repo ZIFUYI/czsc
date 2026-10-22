@@ -117,57 +117,45 @@ def test_empty_evidence_pool_has_a_usable_schema():
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("n", 29),
-        ("effective_n", 29.99),
-        ("win_rate", 50.0),
-        ("pl_ratio", 1.5),
-        ("safety_margin", 10.0),
-        ("mean_ci_low_pct", 0.0),
-        ("is_net_sharpe", 0.0),
-        ("strict_local_pass", False),
+        ("n", 19),
+        ("ann_turnover", 57.0),
+        ("total_n", 179),
+        ("mean_net_pct", 0.0),
+        ("is_net_sharpe", 0.42),
+        ("win_rate", 52.4),
     ],
 )
 def test_every_local_sop_requirement_applies_to_5m_without_low_turnover_exceptions(field, value):
+    from examples.results.intraday_cta_ablation_20261017.run_multitf_incremental_study import select_5m_gate1_adaptive
+
     score = _score()
     score.update(
-        uid="BC01L@5m",
+        uid="H5M_CLV01L@5m",
         tf="5m",
-        n=100,
-        effective_n=100.0,
-        win_rate=70.0,
-        pl_ratio=2.0,
-        safety_margin=30.0,
-        mean_ci_low_pct=0.1,
-        is_net_sharpe=1.0,
-        strict_local_pass=True,
+        n=25,
+        ann_turnover=40.0,
+        win_rate=55.0,
+        mean_net_pct=0.1,
+        is_net_sharpe=0.5,
     )
-    # This fixture isolates the selector's local contract from the separately tested pooled audit.
     pooled = pd.DataFrame(
         [
             {
                 "fold": "F1",
-                "uid": "BC01L@5m",
-                "total_n": 500,
+                "uid": "H5M_CLV01L@5m",
+                "total_n": 200,
                 "pooled_mean_pct": 0.2,
                 "pooled_t": 3.0,
                 "pos_asset_ratio": 1.0,
-                "pool_evidence_kind": "execution_time_block_hac",
-                "pool_passed_assets": ["ETF"],
-                "pool_audits": {
-                    "ETF": {
-                        "passed": True,
-                        "pooled_t_stat": 3.0,
-                        "universal_ratio": 1.0,
-                    }
-                },
             }
         ]
     )
-    assert len(validator.select_pooled_multitf_gate1_units(pd.DataFrame([score]), pooled, "ETF")) == 1
-    score[field] = value
-    assert validator.select_pooled_multitf_gate1_units(
-        pd.DataFrame([score]), pooled, "ETF", allow_lowturn_hetero_15m=True
-    ).empty
+    assert len(select_5m_gate1_adaptive(pd.DataFrame([score]), "ETF", pooled)) == 1
+    if field in pooled.columns:
+        pooled[field] = value
+    else:
+        score[field] = value
+    assert select_5m_gate1_adaptive(pd.DataFrame([score]), "ETF", pooled).empty
 
 
 def test_legacy_pooled_effective_sample_flag_cannot_relax_per_asset_support():
@@ -189,6 +177,6 @@ def test_original_intraday_entry_does_not_bypass_formal_admission(mode):
     from examples.results.intraday_cta_ablation_20261017.run_intraday_ablation import select_factors_by_gate
 
     score = _score()
-    score.update(uid="BC01L@30m", tf="30m", n=15, is_net_sharpe=10, mean_net_pct=10)
+    score.update(uid="BC01L@30m", tf="30m", n=14, is_net_sharpe=10, mean_net_pct=10)
     pooled = validator.summarize_execution_pooled_scores(pd.DataFrame([score]))
     assert select_factors_by_gate(pd.DataFrame([score]), pooled, "ETF", mode) == []

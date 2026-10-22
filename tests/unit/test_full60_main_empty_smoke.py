@@ -41,7 +41,6 @@ def test_full60_main_all_rejected_writes_all_variants_ledgers_csvs_and_html(monk
         raw_paths.append(raw)
         specs[aid] = dataclasses.replace(study.SPECS_60[aid], data_path=raw)
         frames[specs[aid].symbol] = {"15m": frame, "1d": frame}
-    core = dataclasses.replace(specs["ag"], sector="precious_metals", fee_rate=0.00042)
     sectors = {spec.sector: [aid for aid in ids if specs[aid].sector == spec.sector] for spec in specs.values()}
     for key, value in {
         "SOURCE_DIR": source,
@@ -51,12 +50,10 @@ def test_full60_main_all_rejected_writes_all_variants_ledgers_csvs_and_html(monk
         "UNIVERSE_60_SPECS": list(specs.values()),
         "SPECS_60": specs,
         "IDS_60": ids,
-        "CORE_20_IDS": ("ag",),
         "SECTORS_60": sectors,
         "RAW_60_META": [row for row in study.RAW_60_META if row[0] in ids],
     }.items():
         monkeypatch.setattr(study, key, value)
-    monkeypatch.setattr(study, "_core20_specs_from_manifest", lambda: {"ag": core})
     empty_scores = pd.DataFrame(columns=["fold", "asset", "uid", "tf", "archetype"])
 
     def prepared(selected_specs, *, source_dir, output_dir):
@@ -77,18 +74,18 @@ def test_full60_main_all_rejected_writes_all_variants_ledgers_csvs_and_html(monk
     bundles = study.ensure_full60_oos_bundles(force_rebuild=True)
     monkeypatch.setattr(study, "ensure_full60_oos_bundles", lambda **kwargs: bundles)
 
-    # Keep all sixteen allocation variants, native accounting, report builders,
+    # Keep all twelve Full-60 allocation variants, native accounting, report builders,
     # provenance checks and file writers live; only replace prepared market inputs.
     study.main()
 
     summary = pd.read_csv(output / "full60_ablation_comparison.csv")
-    assert len(summary) == 16
-    assert summary["experiment"].nunique() == 16
+    assert len(summary) == 12
+    assert summary["experiment"].nunique() == 12
     assert np.isfinite(summary[["net_ret_pct", "sharpe", "max_dd_pct", "ann_turnover"]]).all().all()
     assert summary[["net_ret_pct", "sharpe", "max_dd_pct", "ann_turnover"]].eq(0).all().all()
     assert summary.execution_evidence.eq("no_executed_positions").all()
     paths = sorted((output / "ledgers").glob("*.pkl"))
-    assert len(paths) == 32
+    assert len(paths) == 24
     for path in paths:
         sidecar = json.loads(path.with_name(path.name + ".provenance.json").read_text())
         fingerprint = ArtifactFingerprint(sidecar["fingerprint"], canonical_json(sidecar["manifest"]))
@@ -106,4 +103,4 @@ def test_full60_main_all_rejected_writes_all_variants_ledgers_csvs_and_html(monk
         assert not pd.read_csv(output / f"{name}.csv").empty
     html = (output / "full60_cta_expansion_report.html").read_text()
     assert "Plotly.newPlot" in html
-    assert "Full60_CoreSatellite_SOPStage3_3x" in html
+    assert "Full60_ZeroHardcode_ClusterConserved_3x" in html
