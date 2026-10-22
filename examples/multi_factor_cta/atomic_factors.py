@@ -397,6 +397,46 @@ def _native_state(df: pd.DataFrame, suffix: str, part: int = 0) -> np.ndarray:
     return np.full(len(df), "其他", dtype=object)
 
 
+def attach_causal_oi_features(df_tf: pd.DataFrame, df_5m: pd.DataFrame | None = None) -> dict[str, np.ndarray]:
+    """将 5m 真实持仓量 open_interest (或本周期 open_interest) 严格因果对齐至目标周期收盘时刻，提取无量纲量仓特征。"""
+    n = len(df_tf)
+    if df_5m is None or df_5m.empty or "open_interest" not in df_5m.columns:
+        if "open_interest" in df_tf.columns:
+            oi = df_tf["open_interest"].to_numpy(dtype=np.float64)
+        else:
+            return {
+                "oi_avail": np.zeros(n, dtype=bool),
+                "oi_ratio": np.ones(n, dtype=np.float64),
+                "oi_chg_z": np.zeros(n, dtype=np.float64),
+                "oi_flow3_z": np.zeros(n, dtype=np.float64),
+            }
+    else:
+        left = pd.DataFrame({"dt": pd.to_datetime(df_tf["dt"]).to_numpy(), "_ord": np.arange(n)})
+        right = pd.DataFrame(
+            {
+                "dt": pd.to_datetime(df_5m["dt"]).to_numpy(),
+                "oi": df_5m["open_interest"].to_numpy(dtype=np.float64),
+            }
+        ).sort_values("dt")
+        merged = pd.merge_asof(left.sort_values("dt"), right, on="dt", direction="backward")
+        oi = merged.sort_values("_ord")["oi"].ffill().fillna(0.0).to_numpy(dtype=np.float64)
+
+    s_oi = pd.Series(oi)
+    oi_ma20 = s_oi.rolling(20, min_periods=3).mean().replace(0.0, np.nan).to_numpy(dtype=np.float64)
+    oi_ratio = np.nan_to_num(oi / oi_ma20, nan=1.0)
+    oi_diff = s_oi.diff().fillna(0.0)
+    oi_std = oi_diff.rolling(20, min_periods=5).std().replace(0.0, np.nan).to_numpy(dtype=np.float64)
+    oi_chg_z = np.clip(np.nan_to_num(oi_diff.to_numpy(dtype=np.float64) / oi_std, nan=0.0), -4.0, 4.0)
+    oi_sum3 = oi_diff.rolling(3, min_periods=1).sum().to_numpy(dtype=np.float64)
+    oi_flow3_z = np.clip(np.nan_to_num(oi_sum3 / (oi_std * np.sqrt(3.0)), nan=0.0), -4.0, 4.0)
+    return {
+        "oi_avail": oi > 0,
+        "oi_ratio": np.clip(oi_ratio, 0.5, 2.0),
+        "oi_chg_z": oi_chg_z,
+        "oi_flow3_z": oi_flow3_z,
+    }
+
+
 @dataclass
 class FactorContext:
     n: int
@@ -435,6 +475,10 @@ class FactorContext:
     zs_zg: np.ndarray | None = None
     zs_zd: np.ndarray | None = None
     snapshots: list = field(default_factory=list)
+    oi_avail: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    oi_ratio: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    oi_chg_z: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    oi_flow3_z: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
 
     @classmethod
     def from_df(
@@ -535,7 +579,22 @@ class FactorContext:
             "xl_trend": _native_state(df, "突破信号V240623"),
             "xl_trend_v2": _native_state(df, "突破信号V240623", part=1),
             "sar": _native_state(df, "SAR_BS辅助V230325"),
+            # Stage 3 新增：量仓微结构与双顺中线 (CVOLP / Pressure / 量柱 / 布林强弱 / 双顺中线)
+            "cvolp": _native_state(df, "CVOLP动量变化率V230612"),
+            "pressure": _native_state(df, "支撑压力V240222"),
+            "vol_ts_v1": _native_state(df, "量柱V221216"),
+            "vol_ts_v2": _native_state(df, "量柱V221216", part=1),
+            "vol_gd": _native_state(df, "量柱V221218"),
+            "boll_pwr_v1": _native_state(df, "强弱V221112"),
+            "boll_pwr_v2": _native_state(df, "强弱V221112", part=1),
+            "ds_mid_v1": _native_state(df, "双顺中线突破V260521"),
+            "ds_mid_v2": _native_state(df, "双顺中线突破V260521", part=1),
         }
+        oi_feats = attach_causal_oi_features(df, _unbox(df, "oi_5m"))
+        ctx.oi_avail = oi_feats["oi_avail"]
+        ctx.oi_ratio = oi_feats["oi_ratio"]
+        ctx.oi_chg_z = oi_feats["oi_chg_z"]
+        ctx.oi_flow3_z = oi_feats["oi_flow3_z"]
         if htf is not None:
             ctx.htf_dir, ctx.htf_q = _align_htf_state(df, htf)
 
@@ -788,6 +847,26 @@ def _build_ac04(ctx, side):  # A: 中枢重叠支撑压力 + SAR 同向蓄势 ×
     return setup, setup_q, confirm, confirm_q, 5
 
 
+def _build_ac05(ctx, side):  # A: 双顺中枢中线突破 + 布林强势与 CVOLP/增仓动量共振 (Stage 3)
+    ds_label = "看多" if side > 0 else "看空"
+    bp_label = "多头" if side > 0 else "空头"
+    slope_s = np.nan_to_num(side * (ctx.ma20 - _shift(ctx.ma20, 5)) / (5.0 * _safe_atr(ctx)), nan=0.0)
+    setup = (
+        (ctx.states["ds_mid_v1"] == ds_label)
+        & (ctx.states["boll_pwr_v1"] == bp_label)
+        & np.isin(ctx.states["boll_pwr_v2"], ["强势", "超强"])
+        & (ctx.er20 >= 0.22)
+        & (slope_s > 0.03)
+    )
+    setup_q = np.clip(0.55 + 0.45 * np.tanh(2.5 * np.maximum(slope_s, 0.0)), 0.25, 1.0)
+    brk, brk_q = _break_confirm(ctx, side)
+    c_s, o_s, _, _ = _adj(ctx, side)
+    vol_oi_push = (ctx.oi_flow3_z > 0.15) | ((ctx.states["cvolp"] == "看多") & (ctx.states["vol_ts_v1"] == "梯量"))
+    confirm = brk & vol_oi_push & (c_s > o_s)
+    confirm_q = np.clip(0.60 * brk_q + 0.40 * np.tanh(np.maximum(ctx.oi_ratio - 0.8, 0.2)), 0.20, 1.0)
+    return setup, setup_q, confirm, confirm_q, 5
+
+
 def _build_bc01(ctx, side):  # B: 笔背驰 Q_div + 分型确认
     setup, q = _dir_eq(ctx, "bi_div", side)
     fx_ok, fx_q = _dir_eq(ctx, "fx", side)
@@ -823,6 +902,28 @@ def _build_bc03(ctx, side):  # B: MACD 柱子背驰/UBI背驰 + 连续缩柱蓄�
     body = np.maximum(c_s - o_s, 0.0)
     confirm = (ctx.states["bi_end_618"] == be_label) & ((c_s > o_s) | fx_ok)
     confirm_q = np.clip(np.maximum(fx_q, np.tanh(body / _safe_atr(ctx))), 0.15, 1.0)
+    return setup, setup_q, confirm, confirm_q, 5
+
+
+def _build_bc04(ctx, side):  # B: 持仓量急降砍仓/逼空出清与天量派发背驰反转 (Stage 3)
+    bc_label = "底背驰" if side > 0 else "顶背驰"
+    be_label = "看多" if side > 0 else "看空"
+    div_ok, div_q = _dir_eq(ctx, "bi_div", side)
+    fx_ok, fx_q = _dir_eq(ctx, "fx", side)
+    depth = np.nan_to_num(np.maximum(side * (ctx.ma20 - ctx.c), 0.0) / (1.6 * _safe_atr(ctx)), nan=0.0)
+    oi_exhaust = (
+        (ctx.oi_flow3_z < -0.25)
+        | (ctx.states["vol_gd"] == "高量柱")
+        | ((ctx.states["cvolp"] == "看空") & (ctx.oi_chg_z < -0.10))
+    )
+    setup = ((div_ok | (ctx.states["macd_bc"] == bc_label)) & oi_exhaust) | (
+        (depth > 1.25) & ((ctx.states["vol_gd"] == "高量柱") | (ctx.oi_flow3_z < -0.45))
+    )
+    setup_q = np.clip(np.maximum(div_q, 0.45 + 0.55 * np.tanh(depth)), 0.20, 1.0)
+    c_s, o_s, _, _ = _adj(ctx, side)
+    body = np.maximum(c_s - o_s, 0.0)
+    confirm = ((fx_ok & (fx_q >= 0.30)) | (ctx.states["bi_end_618"] == be_label)) & (c_s > o_s)
+    confirm_q = np.clip(np.maximum(fx_q, np.tanh(body / _safe_atr(ctx))), 0.20, 1.0)
     return setup, setup_q, confirm, confirm_q, 5
 
 
@@ -894,6 +995,50 @@ def _build_dc03(ctx, side):  # D: PLR 分段线性回归盈亏比满足 + DIF �
     confirm = brk & ((vr >= 1.10) | (ctx.states["clv"] == clv_label))
     confirm_q = np.clip(0.5 * brk_q + 0.5 * np.tanh(np.maximum(vr - 0.85, 0.0)), 0.15, 1.0)
     return setup, setup_q, confirm, confirm_q, 5
+
+
+def _build_dc04(ctx, side):  # D: 筹码动量 CVOLP/黄金柱蓄势 + 持仓量增仓梯量突破共振 (Stage 3)
+    ov_label = "支撑" if side > 0 else "压力"
+    bp_label = "多头" if side > 0 else "空头"
+    clv_label = "看多" if side > 0 else "看空"
+    ts_v2_label = "价升" if side > 0 else "价跌"
+    flow_ok, fq = _dir_eq(ctx, "flow", side)
+    vr = np.divide(ctx.v, ctx.vma20, out=np.ones(ctx.n), where=ctx.vma20 > EPS)
+    oi_acc = np.where(ctx.oi_avail, ctx.oi_flow3_z > 0.20, vr >= 1.05)
+    vol_setup = (ctx.states["cvolp"] == "看多") & (np.isin(ctx.states["vol_gd"], ["高量黄金柱", "低量柱"]) | flow_ok)
+    dir_setup = (ctx.states["overlap"] == ov_label) | (ctx.states["boll_pwr_v1"] == bp_label)
+    setup = vol_setup & dir_setup & oi_acc
+    setup_q = np.clip(
+        0.50 * np.maximum(np.where(flow_ok, fq, 0.35), 0.40) + 0.50 * np.tanh(np.maximum(ctx.oi_flow3_z, 0.2)),
+        0.20,
+        1.0,
+    )
+    brk, brk_q = _break_confirm(ctx, side)
+    ti_confirm = (ctx.states["vol_ts_v1"] == "梯量") & (ctx.states["vol_ts_v2"] == ts_v2_label)
+    oi_push = np.where(ctx.oi_avail, ctx.oi_chg_z > 0.10, vr >= 1.15)
+    confirm = brk & (ti_confirm | (oi_push & (vr >= 1.15) & (ctx.states["clv"] == clv_label)))
+    confirm_q = np.clip(0.55 * np.maximum(brk_q, 0.50) + 0.45 * np.tanh(np.maximum(vr - 0.8, 0.1)), 0.20, 1.0)
+    return setup, setup_q, confirm, confirm_q, 5
+
+
+def _build_dc05(ctx, side):  # D: 支撑压力位缩量减仓洗盘出清 + 双顺中线/筹码回流脉冲 (Stage 3)
+    pr_label = "支撑位" if side > 0 else "压力位"
+    ov_label = "支撑" if side > 0 else "压力"
+    ds_label = "看多" if side > 0 else "看空"
+    clv_label = "看多" if side > 0 else "看空"
+    flow_ok, fq = _dir_eq(ctx, "flow", side)
+    vr = np.divide(ctx.v, ctx.vma20, out=np.ones(ctx.n), where=ctx.vma20 > EPS)
+    at_level = (ctx.states["pressure"] == pr_label) | (ctx.states["overlap"] == ov_label)
+    vol_dry = (ctx.states["vol_ts_v1"] == "缩量") | (ctx.states["vol_gd"] == "低量柱") | (vr < 0.82)
+    oi_wash = (ctx.oi_flow3_z < -0.15) | (ctx.states["cvolp"] == "看空")
+    setup = at_level & vol_dry & oi_wash
+    wash_q = np.clip(0.55 + 0.45 * np.tanh(np.maximum(-ctx.oi_flow3_z, 0.2)), 0.25, 1.0)
+    brk, brk_q = _break_confirm(ctx, side)
+    c_s, o_s, _, _ = _adj(ctx, side)
+    re_inflow = (ctx.oi_chg_z > 0.05) | (ctx.states["cvolp"] == "看多") | flow_ok | (ctx.states["clv"] == clv_label)
+    confirm = ((ctx.states["ds_mid_v1"] == ds_label) & (c_s > o_s) & re_inflow) | (brk & re_inflow & (vr >= 0.95))
+    confirm_q = np.clip(0.50 * np.maximum(brk_q, np.where(flow_ok, fq, 0.45)) + 0.50 * np.tanh(vr), 0.20, 1.0)
+    return setup, wash_q, confirm, confirm_q, 5
 
 
 def _build_ec01(ctx, side):  # E: KC/BOLL 挤压 -> 波动率扩张点火
@@ -1066,15 +1211,21 @@ ATOMIC_FACTOR_DEFS: dict[str, AtomicFactorDef] = {
         AtomicFactorDef("AC02", "均线斜率动量唐奇安突破", ARCH_A, _build_ac02, _ALL_TFS, _BREAKOUT_TRAIL_DECAY),
         AtomicFactorDef("AC03", "多均线共振双均线蓄势与斜率加速突破", ARCH_A, _build_ac03, _ALL_TFS),
         AtomicFactorDef("AC04", "中枢重叠支撑压力与SAR长实体突破", ARCH_A, _build_ac04, _ALL_TFS),
+        AtomicFactorDef(
+            "AC05", "双顺中枢中线突破与布林强势量仓共振", ARCH_A, _build_ac05, _ALL_TFS, _BREAKOUT_TRAIL_DECAY
+        ),
         AtomicFactorDef("BC01", "笔背驰衰竭分型确认", ARCH_B, _build_bc01, _ALL_TFS),
         AtomicFactorDef("BC02", "TD九转极值2B假突破", ARCH_B, _build_bc02, _ALL_TFS),
         AtomicFactorDef("BC03", "MACD背驰缩柱蓄势与笔终点反转确认", ARCH_B, _build_bc03, _ALL_TFS),
+        AtomicFactorDef("BC04", "持仓量急降砍仓逼空出清与高量柱背驰反转", ARCH_B, _build_bc04, _ALL_TFS),
         AtomicFactorDef("CC01", "中枢偏离回归", ARCH_C, _build_cc01, _ALL_TFS),
         AtomicFactorDef("CC02", "KC轨道刺破收回", ARCH_C, _build_cc02, _ALL_TFS),
         AtomicFactorDef("CC03", "DIF分层远离超跌超涨与二阶拟合减速回归", ARCH_C, _build_cc03, _ALL_TFS),
         AtomicFactorDef("DC01", "量价资金流CLV共振", ARCH_D, _build_dc01, _ALL_TFS),
         AtomicFactorDef("DC02", "NTMDK-KCATR多空共振放量突破", ARCH_D, _build_dc02, _ALL_TFS),
         AtomicFactorDef("DC03", "PLR分段线性回归与DIF动量放量脉冲", ARCH_D, _build_dc03, _ALL_TFS),
+        AtomicFactorDef("DC04", "CVOLP筹码扩张黄金柱蓄势与增仓梯量突破", ARCH_D, _build_dc04, _ALL_TFS),
+        AtomicFactorDef("DC05", "支撑压力位缩量减仓洗盘与双顺中线筹码回流", ARCH_D, _build_dc05, _ALL_TFS),
         AtomicFactorDef("EC01", "挤压后波动率扩张点火", ARCH_E, _build_ec01, _ALL_TFS),
         AtomicFactorDef("EC02", "NR7窄幅突破", ARCH_E, _build_ec02, _ALL_TFS),
         AtomicFactorDef(
@@ -1204,14 +1355,17 @@ def set_factor_context(
     htf: pd.DataFrame | None = None,
     cross_section: CrossSectionProvider | None = None,
     soft_gate: SoftCrossSectionalGate | bool | None = None,
+    oi_5m: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """给周期 K 线挂载 F 簇所需的外部上下文 (大级别 K 线 / 截面强弱提供者 / 软空间门控)，原地修改并返回。"""
+    """给周期 K 线挂载所需的外部上下文 (大级别 K 线 / 截面强弱提供者 / 软空间门控 / 5m 持仓量)，原地修改并返回。"""
     if htf is not None:
         df.attrs["htf_df"] = _AttrBox(htf)
     if cross_section is not None:
         df.attrs["cross_section"] = _AttrBox(cross_section)
     if soft_gate is not None:
         df.attrs["soft_gate"] = _AttrBox(soft_gate)
+    if oi_5m is not None:
+        df.attrs["oi_5m"] = _AttrBox(oi_5m)
     return df
 
 
@@ -1221,8 +1375,11 @@ def link_higher_timeframes(tf_dfs: dict[str, pd.DataFrame]) -> dict[str, pd.Data
     大级别状态在 `compute_atomic_signal` 内按其收盘时刻因果对齐。原地修改并返回。
     """
     present = [tf for tf in TF_ORDER if tf in tf_dfs]
+    oi_src = tf_dfs.get("5m") if ("5m" in tf_dfs and "open_interest" in tf_dfs["5m"].columns) else None
     for tf in present:
         tf_dfs[tf].attrs["factor_timeframe"] = tf
+        if oi_src is not None and tf != "5m" and "open_interest" not in tf_dfs[tf].columns:
+            set_factor_context(tf_dfs[tf], oi_5m=oi_src)
     for i, tf in enumerate(present[:-1]):
         set_factor_context(tf_dfs[tf], htf=tf_dfs[present[i + 1]])
     return tf_dfs
@@ -1252,6 +1409,7 @@ def compute_atomic_signal(
     if family not in ATOMIC_FACTOR_DEFS or side_char not in ("L", "S"):
         raise KeyError(f"unknown atomic factor: {sig_id}")
     htf = _unbox(df, "htf_df")
+    oi_5m = _unbox(df, "oi_5m")
     cs_prov = _unbox(df, "cross_section")
     cs_fp = cs_prov.cache_fingerprint() if hasattr(cs_prov, "cache_fingerprint") else None
     import os
@@ -1262,6 +1420,7 @@ def compute_atomic_signal(
         "atomic-context-v3-native-structures",
         _frame_fingerprint(df),
         _frame_fingerprint(htf),
+        _frame_fingerprint(oi_5m),
         cs_fp,
         df.attrs.get("factor_timeframe"),
         tuple(

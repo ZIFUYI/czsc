@@ -306,6 +306,37 @@ def test_long_short_mirror_symmetry(family, built, mirrored):
         np.testing.assert_allclose(stop_a, mirror_sum - stop_b, atol=1e-9, rtol=0)
 
 
+@pytest.mark.parametrize("family", ["AC05", "BC04", "DC04", "DC05"])
+def test_oi_microstructure_factors_with_open_interest_mirror_and_causality(family, built, mirrored):
+    """验证挂载真实 open_interest 时，AC05/BC04/DC04/DC05 保持严格镜像对称与截断因果一致。"""
+    from examples.multi_factor_cta.atomic_factors import set_factor_context
+
+    base_a, _, _ = built
+    base_b, _, _ = mirrored
+    rng = np.random.default_rng(20261022)
+    oi_series = 100000.0 + np.cumsum(rng.normal(0.0, 250.0, size=len(base_a)))
+    oi_df = pd.DataFrame({"dt": base_a["dt"], "open_interest": np.maximum(oi_series, 1000.0)})
+    df_a = set_factor_context(base_a.copy(), oi_5m=oi_df)
+    df_b = set_factor_context(base_b.copy(), oi_5m=oi_df)
+    ctx_a = FactorContext.from_df(df_a)
+    ctx_b = FactorContext.from_df(df_b)
+    definition = ATOMIC_FACTOR_DEFS[family]
+    for side in (1, -1):
+        s_a, sq_a, c_a, cq_a, w_a = definition.build(ctx_a, side)
+        s_b, sq_b, c_b, cq_b, w_b = definition.build(ctx_b, -side)
+        assert w_a == w_b
+        np.testing.assert_array_equal(s_a, s_b)
+        np.testing.assert_array_equal(c_a, c_b)
+        np.testing.assert_allclose(sq_a[s_a], sq_b[s_b], atol=0.011, rtol=0)
+        np.testing.assert_allclose(cq_a[c_a], cq_b[c_b], atol=0.011, rtol=0)
+    t = 2500
+    df_t = set_factor_context(base_a.iloc[:t].copy(), oi_5m=oi_df.iloc[:t].copy())
+    ctx_t = FactorContext.from_df(df_t)
+    sig_full, _ = compute_family(ctx_a, family)
+    sig_trunc, _ = compute_family(ctx_t, family)
+    np.testing.assert_allclose(sig_full[:t], sig_trunc, atol=1e-12, rtol=0.0)
+
+
 # ---------------------------------------------------------------------------
 # 4. 动态结构衰减机与两阶段状态机
 # ---------------------------------------------------------------------------
