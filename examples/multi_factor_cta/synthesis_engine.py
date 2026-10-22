@@ -834,19 +834,98 @@ def _project_capped_simplex_row(
     return out
 
 
+def detect_contract_roll_mask(
+    df_grid: pd.DataFrame,
+    *,
+    has_night_session: bool = True,
+    gap_atr_mult: float = 3.5,
+) -> np.ndarray:
+    """识别期货主连合约换月切换时刻 `roll_mask`（严格因果、无未来函数）。"""
+    n = len(df_grid)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    if "roll_mask" in df_grid.columns:
+        return df_grid["roll_mask"].fillna(False).to_numpy(dtype=bool)
+    for col in ("underlying_symbol", "dominant_contract", "contract"):
+        if col in df_grid.columns:
+            usym = df_grid[col].ffill()
+            known_pair = usym.notna() & usym.shift(1).notna()
+            return (known_pair & usym.ne(usym.shift(1))).to_numpy(dtype=bool)
+    for col in ("factor", "adj_factor"):
+        if col in df_grid.columns:
+            fac = pd.to_numeric(df_grid[col], errors="coerce").ffill()
+            known_pair = fac.notna() & fac.shift(1).notna()
+            return (known_pair & ((fac - fac.shift(1)).abs() > 1e-8)).to_numpy(dtype=bool)
+
+    tday = (
+        assign_futures_trading_day(df_grid["dt"])
+        if has_night_session
+        else pd.DatetimeIndex(pd.to_datetime(df_grid["dt"])).normalize()
+    )
+    day_switch = np.zeros(n, dtype=bool)
+    day_switch[1:] = tday[1:].to_numpy() != tday[:-1].to_numpy()
+    o = df_grid["open"].to_numpy(dtype=np.float64)
+    c = df_grid["close"].to_numpy(dtype=np.float64)
+
+    if "open_interest" in df_grid.columns:
+        oi = df_grid["open_interest"].to_numpy(dtype=np.float64)
+        gap_pct = np.zeros(n, dtype=np.float64)
+        gap_pct[1:] = np.abs(o[1:] / np.maximum(c[:-1], 1e-6) - 1.0)
+        oi_chg_pct = np.zeros(n, dtype=np.float64)
+        oi_chg_pct[1:] = np.abs(oi[1:] - oi[:-1]) / np.maximum(oi[:-1], 1.0)
+        open_idx = np.where(day_switch)[0]
+        roll_mask = np.zeros(n, dtype=bool)
+        if len(open_idx) > 0:
+            open_gap_med = (
+                pd.Series(gap_pct[open_idx], index=open_idx)
+                .rolling(40, min_periods=1)
+                .median()
+                .shift(1)
+                .fillna(0.002)
+                .to_numpy()
+            )
+            open_oi_med = (
+                pd.Series(oi_chg_pct[open_idx], index=open_idx)
+                .rolling(40, min_periods=1)
+                .median()
+                .shift(1)
+                .fillna(0.015)
+                .to_numpy()
+            )
+            is_roll_open = (oi_chg_pct[open_idx] > np.maximum(0.06, 3.5 * open_oi_med)) & (
+                gap_pct[open_idx] > np.maximum(0.002, 1.2 * open_gap_med)
+            )
+            roll_mask[open_idx[is_roll_open]] = True
+        return roll_mask
+
+    h = df_grid["high"].to_numpy(dtype=np.float64) if "high" in df_grid.columns else np.maximum(o, c)
+    low_arr = df_grid["low"].to_numpy(dtype=np.float64) if "low" in df_grid.columns else np.minimum(o, c)
+    tr = np.maximum(h - low_arr, np.abs(c - np.roll(c, 1)))
+    tr[0] = h[0] - low_arr[0]
+    atr = pd.Series(tr).rolling(20, min_periods=1).mean().shift(1).fillna(tr[0]).to_numpy()
+    overnight_gap = np.zeros(n, dtype=np.float64)
+    overnight_gap[1:] = np.abs(o[1:] - c[:-1])
+    return day_switch & (overnight_gap > float(gap_atr_mult) * np.maximum(atr, 1e-6))
+
+
 def build_asset_execution_inputs(
     df_grid: pd.DataFrame,
     signed_targets: np.ndarray,
     *,
     execution_clock: str = "next_open",
     liquidate_at_end: bool = True,
+    roll_mask: np.ndarray | pd.Series | list[bool] | None = None,
+    detect_rolls: bool = False,
+    roll_gap_atr_mult: float = 3.5,
+    has_night_session: bool = True,
 ) -> tuple[pd.Series, pd.Series]:
     """Align close decisions to next-open fills, then mark/liquidate at the last close.
 
     Bar labels identify their opening executions; the last close is an accounting
     mark one microsecond after the final label, with no invented future price.
-    A live target snapshot may explicitly request ``close`` and no liquidation;
-    those targets are prospective and must not be used to claim next-open PnL.
+    When ``roll_mask`` is supplied or ``detect_rolls=True``, non-trading contract
+    rollover price gaps are stripped from ``returns`` and ``roll_mask`` is attached
+    to ``returns.attrs['roll_mask']`` for downstream rollover friction accounting.
     """
     index = pd.DatetimeIndex(pd.to_datetime(df_grid["dt"]))
     if index.has_duplicates or not index.is_monotonic_increasing or len(index) != len(signed_targets):
@@ -870,6 +949,25 @@ def build_asset_execution_inputs(
         price.loc[terminal] = last_close
         targets.loc[terminal] = 0.0
     returns = price.pct_change(fill_method=None).fillna(0.0)
+    raw_roll: np.ndarray | None = None
+    if roll_mask is not None:
+        raw_roll = np.asarray(roll_mask, dtype=bool)
+    elif detect_rolls or "roll_mask" in df_grid.columns:
+        raw_roll = detect_contract_roll_mask(
+            df_grid, has_night_session=has_night_session, gap_atr_mult=roll_gap_atr_mult
+        )
+    if raw_roll is not None:
+        if len(raw_roll) == len(index):
+            roll_series = pd.Series(raw_roll, index=index, dtype=bool)
+            if len(index) and liquidate_at_end:
+                roll_series.loc[terminal] = False
+        elif len(raw_roll) == len(returns):
+            roll_series = pd.Series(raw_roll, index=returns.index, dtype=bool)
+        else:
+            raise ValueError("roll_mask length must match df_grid or execution marks")
+        returns.loc[roll_series] = 0.0
+        returns.attrs["roll_mask"] = roll_series
+        targets.attrs["roll_mask"] = roll_series
     returns.attrs["execution_clock"] = targets.attrs["execution_clock"] = execution_clock
     return returns, targets
 
@@ -880,6 +978,8 @@ def account_portfolio_execution(
     asset_fee_rates: dict[str, float],
     *,
     tradable_mask: pd.DataFrame | None = None,
+    roll_mask: pd.DataFrame | dict[str, Any] | pd.Series | np.ndarray | list[bool] | None = None,
+    fee_multiplier: float = 1.0,
 ) -> dict[str, Any]:
     """Convert labeled panels to the shared Rust fixed-initial-capital execution ledger.
 
@@ -888,10 +988,9 @@ def account_portfolio_execution(
     against initial capital. Unchanged targets can therefore require real trades after
     a price move. Rust charges fees on the absolute traded quantity at the execution price.
     ``tradable_mask=False`` freezes quantity; missing quotes must carry zero price return
-    and preserve the previously executed weight. Rust rejects inconsistent targets.
-    A zero target liquidates at that timestamp and still pays its exit fee. A nonzero
-    final target remains open unless the caller supplies an explicit liquidation mark.
-    Calendar-day aggregation keeps the original timestamps (including night sessions).
+    and preserve the previously executed weight. When ``roll_mask`` is supplied (or attached
+    via ``build_asset_execution_inputs``), non-trading rollover price jumps are stripped to
+    zero and open positions (`|w_{t-1}| > 0`) incur ``2.0 * |w_{t-1}|`` rollover turnover.
     """
     from czsc import executed_weight_ledger
 
@@ -901,13 +1000,41 @@ def account_portfolio_execution(
         not tradable_mask.index.equals(price_returns.index) or not tradable_mask.columns.equals(price_returns.columns)
     ):
         raise ValueError("Tradable mask and price returns must be exactly aligned")
-    fees = pd.Series(asset_fee_rates, dtype=float).reindex(price_returns.columns)
+    if not np.isfinite(fee_multiplier) or fee_multiplier < 0.0:
+        raise ValueError("fee_multiplier must be finite and nonnegative")
+    if roll_mask is None:
+        roll_mask = price_returns.attrs.get("roll_mask", signed_weights.attrs.get("roll_mask"))
+    roll_df: pd.DataFrame | None = None
+    if roll_mask is not None:
+        if isinstance(roll_mask, pd.DataFrame):
+            if not roll_mask.index.equals(price_returns.index) or not roll_mask.columns.equals(price_returns.columns):
+                raise ValueError("Roll mask and price returns must be exactly aligned")
+            roll_df = roll_mask.fillna(False).astype(bool)
+        elif isinstance(roll_mask, dict):
+            roll_df = pd.DataFrame(False, index=price_returns.index, columns=price_returns.columns, dtype=bool)
+            for sym, m_val in roll_mask.items():
+                if sym not in roll_df.columns:
+                    continue
+                if isinstance(m_val, pd.Series):
+                    roll_df[sym] = m_val.reindex(price_returns.index, fill_value=False).fillna(False).astype(bool)
+                else:
+                    arr = np.asarray(m_val, dtype=bool)
+                    if len(arr) != len(price_returns):
+                        raise ValueError("Roll mask length must match price_returns")
+                    roll_df[sym] = arr
+        else:
+            arr = np.asarray(roll_mask, dtype=bool)
+            if len(arr) != len(price_returns):
+                raise ValueError("Roll mask length must match price_returns")
+            roll_df = pd.DataFrame(dict.fromkeys(price_returns.columns, arr), index=price_returns.index, dtype=bool)
+    fees = pd.Series(asset_fee_rates, dtype=float).reindex(price_returns.columns) * float(fee_multiplier)
     ledgers = {
         symbol: executed_weight_ledger(
             price_returns[symbol].to_list(),
             signed_weights[symbol].to_list(),
             fee_rate=float(fees[symbol]),
             tradable=None if tradable_mask is None else tradable_mask[symbol].to_list(),
+            roll_mask=None if roll_df is None else roll_df[symbol].to_list(),
         )
         for symbol in price_returns.columns
     }
@@ -1650,6 +1777,7 @@ __all__ = [
     "compute_continuous_cluster_risk_shares",
     "compute_empirical_bayes_shrinkage_weight",
     "compute_rolling_empirical_bayes_weights",
+    "detect_contract_roll_mask",
     "evaluate_single_asset_backtest",
     "govern_position_with_hysteresis_runner",
     "gram_schmidt_cluster_orthogonalize",

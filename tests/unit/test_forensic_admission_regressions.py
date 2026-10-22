@@ -313,3 +313,42 @@ def test_select_pooled_multitf_gate1_units_unifies_pooled_and_single_degrees_of_
     # AC01L@1d passes via pooled effective degrees of freedom (total_n=180 >= 25 and n=5 >= 2);
     # BC01L@15m fails single-asset event count threshold (n=8 < 15).
     assert list(selected["uid"]) == ["AC01L@1d"]
+
+
+def test_roll_mask_strips_fake_roll_gap_and_charges_two_sided_rollover_cost():
+    from examples.multi_factor_cta.synthesis_engine import (
+        account_portfolio_execution,
+        build_asset_execution_inputs,
+        detect_contract_roll_mask,
+    )
+
+    df = _bars().iloc[:6].copy().reset_index(drop=True)
+    p0 = float(df["open"].iloc[0])
+    df[["open", "high", "low", "close"]] = p0
+    # Simulate a +12% non-trading contract rollover gap at bar 3 onwards
+    df.loc[3:, ["open", "high", "low", "close"]] = p0 * 1.12
+    df["underlying_symbol"] = ["RB2501", "RB2501", "RB2501", "RB2505", "RB2505", "RB2505"]
+    roll_mask = detect_contract_roll_mask(df, has_night_session=False)
+    assert roll_mask.tolist() == [False, False, False, True, False, False]
+
+    # Hold +0.5 across the roll bar (bar 3), then liquidate
+    signed_targets = np.array([0.5, 0.5, 0.5, 0.5, 0.0, 0.0])
+    ret_s, pos_s = build_asset_execution_inputs(df, signed_targets, roll_mask=roll_mask)
+    assert float(ret_s.iloc[3]) == 0.0
+    ledger = account_portfolio_execution(ret_s.to_frame("RB"), pos_s.to_frame("RB"), {"RB": 0.001})
+    # Zero fake roll-gap gross PnL across the entire path
+    assert float(ledger["gross_returns_df"]["RB"].sum()) == pytest.approx(0.0, abs=1e-15)
+    # Entry at bar 1 (0.5), rollover at bar 3 (2 * 0.5 = 1.0), exit at bar 5 (0.5) => total turnover 2.0
+    np.testing.assert_allclose(
+        ledger["turnover_df"]["RB"].to_numpy(),
+        [0.0, 0.5, 0.0, 1.0, 0.0, 0.5, 0.0],
+        atol=1e-14,
+    )
+    assert float(ledger["cost_returns_df"]["RB"].iloc[3]) == pytest.approx(2.0 * 0.5 * 0.001)
+    assert float(ledger["bar_net_returns"].sum()) == pytest.approx(-2.0 * 0.001)
+
+    # Also verify 2.0x fee_multiplier stress scales rollover and trade costs linearly
+    ledger_2x = account_portfolio_execution(
+        ret_s.to_frame("RB"), pos_s.to_frame("RB"), {"RB": 0.001}, fee_multiplier=2.0
+    )
+    assert float(ledger_2x["bar_net_returns"].sum()) == pytest.approx(-4.0 * 0.001)

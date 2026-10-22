@@ -151,3 +151,14 @@ def test_research_report_rejects_invalid_execution_order(invalid_clock):
         frame.loc[frame.index[1], "dt"] = frame.dt.iloc[0]
     with pytest.raises(ValueError, match="unique and ordered"):
         backtest_slice(frame, np.ones(len(frame)))
+
+
+def test_native_executed_weight_ledger_roll_mask_parity():
+    returns = [0.0, 0.0, 0.15, 0.02, 0.0]
+    weights = [0.0, 0.5, 0.5, 0.5, 0.0]
+    roll_mask = [False, False, True, False, False]
+    ledger = czsc.executed_weight_ledger(returns, weights, fee_rate=0.001, roll_mask=roll_mask)
+    np.testing.assert_allclose(ledger.gross_returns, [0.0, 0.0, 0.0, 0.01, 0.0], atol=1e-14)
+    np.testing.assert_allclose(ledger.turnover, [0.0, 0.5, 1.0, 0.01, 0.5], atol=1e-14)
+    np.testing.assert_allclose(ledger.cost_returns, [0.0, 0.0005, 0.001, 0.00001, 0.0005], atol=1e-14)
+    np.testing.assert_allclose(ledger.net_returns, [0.0, -0.0005, -0.001, 0.00999, -0.0005], atol=1e-14)

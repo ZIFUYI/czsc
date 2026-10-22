@@ -174,3 +174,63 @@ def test_full60_rebuilds_from_complete_prepared_evidence_and_only_reuses_verifie
     )
     reused_full = study.ensure_full60_oos_bundles()
     assert reused_full["fingerprint"] == full["fingerprint"]
+
+
+def test_build_roll_and_cost_stress_tables_strips_roll_gaps_and_reports_cost_multipliers(monkeypatch):
+    frame = _frame()
+    returns, _positions = build_asset_execution_inputs(frame, np.ones(len(frame)))
+    ret = returns.copy()
+    ret.iloc[5] = 0.25  # 模拟换月跳空虚增收益
+    ret_df = ret.to_frame("ag")
+    roll_df = pd.DataFrame({"ag": False}, index=ret_df.index)
+    roll_df.iloc[5, 0] = True
+    prices = pd.Series(frame.open.to_numpy(), index=pd.DatetimeIndex(frame.dt))
+    prices.loc[prices.index[-1] + pd.Timedelta(microseconds=1)] = frame.close.iloc[-1]
+    fold = {
+        "id": "F1",
+        "train_start": "2024-01-01",
+        "cutoff": "2024-06-30",
+        "oos_start": "2024-07-01",
+        "oos_end": "2025-02-01",
+    }
+    monkeypatch.setattr(study, "FOLDS", (fold,))
+    monkeypatch.setattr(study, "IDS_60", ["ag"])
+    monkeypatch.setattr(study, "SECTORS_60", {"PRECIOUS_METALS": ["ag"]})
+    fc = {
+        "ret_oos": ret_df,
+        "mask_oos": ret_df.notna(),
+        "roll_mask_oos": roll_df,
+        "roll_vol_oos": ret_df * 0 + 0.15,
+        "sec_vol_oos": {"PRECIOUS_METALS": pd.Series(0.12, index=ret_df.index)},
+        "pos_oos_map": {"hr": pd.DataFrame({"ag": 1.0}, index=ret_df.index)},
+        "execution_prices_df": prices.to_frame("ag"),
+    }
+    daily_ret = pd.DataFrame({"ag": 0.002}, index=pd.DatetimeIndex(frame.dt.dt.normalize().unique()))
+    meta = {
+        ("F1", "ag"): {
+            "is_execution_passed": True,
+            "is_ep_count": 25,
+            "is_effective_n": 25.0,
+            "is_win_rate": 58.0,
+            "is_payoff_r": 1.85,
+            "is_safety_margin": 12.0,
+            "is_mean_ci_low_pct": 0.05,
+            "is_shp_fs": 1.1,
+            "is_shp_hr": 1.2,
+            "n_factors": 6,
+        }
+    }
+    roll_comp, cost_stress, deadzone = study.build_roll_and_cost_stress_tables(
+        oos_fast_cache={"F1": fc},
+        sleeve_daily_ret={"F1": daily_ret},
+        is_meta_stats=meta,
+        pit_assets={"F1": ["ag"]},
+        ep_hr={("F1", "ag"): [0.01, 0.02, -0.005]},
+        is_liq_stats={("F1", "ag"): {"is_vol_wan": 10.0, "is_amt_yi": 50.0}},
+        price_ret_df=daily_ret,
+    )
+    assert len(roll_comp) == 4
+    assert (roll_comp["roll_gap_fake_pnl_pct"] > 0.0).all()
+    assert (roll_comp["roll_friction_cost_pct"] > 0.0).all()
+    assert set(cost_stress["cost_multiplier"]) == {"1.0x", "1.5x", "2.0x", "3.0x"}
+    assert set(deadzone["symmetric_deadzone"]) == {"2.0%", "3.0%", "4.0%"}

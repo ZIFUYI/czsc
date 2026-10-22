@@ -148,10 +148,18 @@ pub fn executed_weight_ledger(
     weights: &[f64],
     fee_rate: f64,
     tradable: Option<&[bool]>,
+    roll_mask: Option<&[bool]>,
 ) -> Result<ExecutionLedger, String> {
     let n = price_returns.len();
     validate_execution_inputs(n, weights, fee_rate, tradable)?;
-    if price_returns.iter().any(|r| !r.is_finite() || *r <= -1.) {
+    if roll_mask.is_some_and(|mask| mask.len() != n) {
+        return Err("execution input lengths must match".into());
+    }
+    if price_returns
+        .iter()
+        .enumerate()
+        .any(|(t, r)| !r.is_finite() || (!roll_mask.is_some_and(|m| m[t]) && *r <= -1.))
+    {
         return Err("price_returns must be finite and greater than -1".into());
     }
     let mut ledger = ExecutionLedger {
@@ -167,13 +175,20 @@ pub fn executed_weight_ledger(
     let mut previous = 0.;
     for (t, (&price_return, &target)) in price_returns.iter().zip(weights).enumerate() {
         let can_trade = tradable.is_none_or(|mask| mask[t]);
-        if !can_trade && (price_return != 0. || target != previous) {
+        let is_roll = roll_mask.is_some_and(|mask| mask[t]);
+        let eff_return = if is_roll { 0. } else { price_return };
+        if !can_trade && (eff_return != 0. || target != previous) {
             return Err("missing quotes require zero return and unchanged executed weight".into());
         }
-        let gross = previous * price_return;
+        let gross = previous * eff_return;
         let before = previous + gross;
+        let roll_turnover = if can_trade && is_roll {
+            2. * previous.abs()
+        } else {
+            0.
+        };
         let turnover = if can_trade {
-            (target - before).abs()
+            (target - before).abs() + roll_turnover
         } else {
             0.
         };
@@ -245,7 +260,7 @@ pub fn execution_ledger(
         previous_quantity = quantity;
         previous_price = Some(price);
     }
-    let mut ledger = executed_weight_ledger(&returns, weights, fee_rate, tradable)?;
+    let mut ledger = executed_weight_ledger(&returns, weights, fee_rate, tradable, None)?;
     ledger.quantities = Some(quantities);
     ledger.trade_quantities = Some(trade_quantities);
     Ok(ledger)
@@ -293,7 +308,7 @@ pub fn decision_interval_ledger(
         return Err("first decision interval return must be zero".into());
     }
     if interval_returns.is_empty() {
-        return executed_weight_ledger(&[], &[], fee_rate, None);
+        return executed_weight_ledger(&[], &[], fee_rate, None, None);
     }
     let mut returns = Vec::with_capacity(weights.len() + 1);
     returns.push(0.);
@@ -302,7 +317,7 @@ pub fn decision_interval_ledger(
     filled.push(0.);
     filled.extend_from_slice(&weights[..weights.len() - 1]);
     filled.push(0.);
-    executed_weight_ledger(&returns, &filled, fee_rate, None)
+    executed_weight_ledger(&returns, &filled, fee_rate, None, None)
 }
 
 /// Per-bar net ledger for close-time targets filled at subsequent observed opens,
@@ -445,19 +460,31 @@ fn py_execution_net_returns(
 
 #[cfg(feature = "python")]
 #[gen_stub_pyfunction]
-#[pyfunction(name = "executed_weight_ledger", signature = (price_returns, weights, fee_rate=0.0002, tradable=None))]
+#[pyfunction(
+    name = "executed_weight_ledger",
+    signature = (price_returns, weights, fee_rate=0.0002, tradable=None, roll_mask=None)
+)]
 /// Account already executed finite target weights against mark-to-mark price returns.
 /// Every tradable mark rebalances on fixed initial capital and charges actual traded
-/// notional. Missing marks require zero return and unchanged weight. Results are
-/// initial-capital fractions; quantity fields are None. No terminal exit is inserted.
+/// notional. Missing marks require zero return and unchanged weight. On contract roll
+/// marks (`roll_mask=True`), non-trading price gaps are stripped to zero and open
+/// inventory adds `2 * |previous|` rollover turnover. Results are initial-capital
+/// fractions; quantity fields are None. No terminal exit is inserted.
 fn py_executed_weight_ledger(
     price_returns: Vec<f64>,
     weights: Vec<f64>,
     fee_rate: f64,
     tradable: Option<Vec<bool>>,
+    roll_mask: Option<Vec<bool>>,
 ) -> PyResult<ExecutionLedger> {
-    executed_weight_ledger(&price_returns, &weights, fee_rate, tradable.as_deref())
-        .map_err(pyo3::exceptions::PyValueError::new_err)
+    executed_weight_ledger(
+        &price_returns,
+        &weights,
+        fee_rate,
+        tradable.as_deref(),
+        roll_mask.as_deref(),
+    )
+    .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 #[cfg(feature = "python")]

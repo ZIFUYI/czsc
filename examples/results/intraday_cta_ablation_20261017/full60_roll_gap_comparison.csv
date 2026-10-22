@@ -1,0 +1,5 @@
+experiment,total_roll_events,active_roll_crossings,unadj_gross_pct,roll_adj_gross_pct,roll_gap_fake_pnl_pct,unadj_cost_pct,roll_adj_cost_pct,roll_friction_cost_pct,unadj_net_pct,strip_only_net_pct,roll_adj_net_pct,unadj_sharpe,strip_only_sharpe,roll_adj_sharpe,sharpe_delta,roll_adj_max_dd_pct,roll_adj_calmar
+Full60_FlatHRP_HysteresisRunner,535,157,8.13,8.59,-0.46,3.61,3.66,0.05,4.52,4.98,4.93,1.15,1.29,1.28,0.13,1.84,1.34
+Full60_SecConserved_SymDZ_HR,535,157,7.58,8.17,-0.59,2.37,2.43,0.06,5.21,5.81,5.74,1.21,1.39,1.37,0.16,1.75,1.65
+Full60_ZeroHardcode_SOPStage3,535,104,10.54,10.17,0.37,2.32,2.37,0.05,8.21,7.85,7.8,1.88,1.86,1.85,-0.03,1.7,2.3
+Full60_ZeroHardcode_ClusterConserved_Optimal,535,97,10.55,10.23,0.32,2.32,2.37,0.05,8.23,7.91,7.86,1.86,1.86,1.85,-0.01,1.74,2.26

@@ -64,6 +64,7 @@ from examples.multi_factor_cta.synthesis_engine import (  # noqa: E402
     account_portfolio_execution,
     assign_futures_trading_day,
     compute_continuous_cluster_risk_shares,
+    detect_contract_roll_mask,
 )
 
 OUT_DIR = Path(os.environ.get("CZSC_CTA_OUTPUT_DIR", str(ROOT / "examples/results/cta_research/full60"))).resolve()
@@ -589,6 +590,44 @@ def _portfolio_execution_evidence(fc: dict) -> dict:
     }
 
 
+def attach_oos_roll_masks(oos_fast_cache: dict) -> dict[str, pd.DataFrame]:
+    """为每个折次的 5m OOS 执行网格因果识别主连合约换月跳空掩码 `roll_mask_oos`。"""
+    roll_masks_by_fold: dict[str, pd.DataFrame] = {}
+    df5_loaded: dict[str, pd.DataFrame] = {}
+    for fold in FOLDS:
+        f_id = fold["id"]
+        fc = oos_fast_cache[f_id]
+        ret_oos = fc["ret_oos"][IDS_60]
+        if "roll_mask_oos" in fc and isinstance(fc["roll_mask_oos"], pd.DataFrame):
+            roll_masks_by_fold[f_id] = fc["roll_mask_oos"].reindex_like(ret_oos).fillna(False).astype(bool)
+            continue
+        oos_e = pd.Timestamp(fold.get("oos_end", ret_oos.index.max()))
+        fold_rolls: dict[str, pd.Series] = {}
+        for aid in IDS_60:
+            p5 = SOURCE_DIR / "data_5m" / f"{aid}_5m.parquet"
+            if not p5.exists():
+                fold_rolls[aid] = pd.Series(False, index=ret_oos.index, dtype=bool)
+                continue
+            if aid not in df5_loaded:
+                df5 = pd.read_parquet(p5)
+                df5["dt"] = pd.to_datetime(df5["dt"])
+                df5_loaded[aid] = df5.sort_values("dt").reset_index(drop=True)
+            grid5 = df5_loaded[aid]
+            sub_grid = grid5.loc[grid5["dt"] <= oos_e].reset_index(drop=True)
+            spec = SPECS_60[aid]
+            r_arr = detect_contract_roll_mask(
+                sub_grid,
+                has_night_session=spec.has_night_session,
+                gap_atr_mult=spec.roll_gap_threshold_atr,
+            )
+            r_ser = pd.Series(r_arr, index=pd.DatetimeIndex(sub_grid["dt"]), dtype=bool)
+            fold_rolls[aid] = r_ser.reindex(ret_oos.index, fill_value=False).fillna(False).astype(bool)
+        roll_df = pd.DataFrame(fold_rolls, index=ret_oos.index, columns=IDS_60, dtype=bool)
+        fc["roll_mask_oos"] = roll_df
+        roll_masks_by_fold[f_id] = roll_df
+    return roll_masks_by_fold
+
+
 def _execute_sector_conserved_allocation(
     fc: dict,
     pos_df: pd.DataFrame,
@@ -600,10 +639,16 @@ def _execute_sector_conserved_allocation(
     max_single_asset_weight: float,
     min_effective_assets: int,
     target_portfolio_vol: float,
+    adjust_roll_gaps: bool = False,
+    charge_roll_fee: bool = True,
+    fee_multiplier: float = 1.0,
 ) -> dict:
     """统一跨品种板块风险预算守恒、因果波动率预热缩放、死区防抖与期末闭合清算内核。"""
     ret_oos = fc["ret_oos"][IDS_60]
     mask_oos = fc["mask_oos"][IDS_60]
+    roll_mask_oos: pd.DataFrame | None = None
+    if adjust_roll_gaps and "roll_mask_oos" in fc:
+        roll_mask_oos = fc["roll_mask_oos"][IDS_60].reindex_like(ret_oos).fillna(False).astype(bool)
 
     sector_active_counts = {}
     sector_inv_vol = {}
@@ -696,9 +741,20 @@ def _execute_sector_conserved_allocation(
         w_oos[col] = w_col
 
     fees = {c: float(SPECS_60[c].fee_rate) for c in IDS_60}
-    ledger = account_portfolio_execution(ret_oos, w_oos, fees, tradable_mask=mask_oos)
+    exec_ret_oos = ret_oos.mask(roll_mask_oos, 0.0) if roll_mask_oos is not None else ret_oos
+    ledger = account_portfolio_execution(
+        exec_ret_oos,
+        w_oos,
+        fees,
+        tradable_mask=mask_oos,
+        roll_mask=roll_mask_oos if (adjust_roll_gaps and charge_roll_fee) else None,
+        fee_multiplier=fee_multiplier,
+    )
+    ev = _portfolio_execution_evidence(fc)
+    if roll_mask_oos is not None:
+        ev["returns_df"] = exec_ret_oos
     return {
-        **_portfolio_execution_evidence(fc),
+        **ev,
         "daily_returns": ledger["daily_returns"],
         "bar_net_returns": ledger["bar_net_returns"],
         "gross_returns_df": ledger["gross_returns_df"],
@@ -719,6 +775,9 @@ def run_flat_60_alloc(
     max_single_asset_weight: float = 0.25,
     min_effective_assets: int = 4,
     target_portfolio_vol: float = 0.14,
+    adjust_roll_gaps: bool = False,
+    charge_roll_fee: bool = True,
+    fee_multiplier: float = 1.0,
 ) -> tuple[dict, list[dict]]:
     """运行全量 60 品种扁平化跨资产 HRP 配置（对比朴素等权 vs 板块预算守恒+对称死区）。"""
     ledgers = []
@@ -748,6 +807,9 @@ def run_flat_60_alloc(
             max_single_asset_weight=max_single_asset_weight,
             min_effective_assets=min_effective_assets,
             target_portfolio_vol=target_portfolio_vol,
+            adjust_roll_gaps=adjust_roll_gaps,
+            charge_roll_fee=charge_roll_fee,
+            fee_multiplier=fee_multiplier,
         )
         ledgers.append(led)
         w_oos = led["weights_df"]
@@ -779,6 +841,9 @@ def run_zero_hardcode_sop_stage3(
     max_single_asset_weight: float = 0.25,
     min_effective_assets: int = 4,
     target_portfolio_vol: float = 0.14,
+    adjust_roll_gaps: bool = False,
+    charge_roll_fee: bool = True,
+    fee_multiplier: float = 1.0,
 ) -> tuple[dict, list[dict], dict[str, list[str]]]:
     """
     运行 100% 零先验硬编码 (Zero Hardcoded Core-20) 的全市场 60 品种统一 SOP Stage-3 门禁配置（留存约 30 品种）。
@@ -835,6 +900,9 @@ def run_zero_hardcode_sop_stage3(
             max_single_asset_weight=max_single_asset_weight,
             min_effective_assets=min_effective_assets,
             target_portfolio_vol=target_portfolio_vol,
+            adjust_roll_gaps=adjust_roll_gaps,
+            charge_roll_fee=charge_roll_fee,
+            fee_multiplier=fee_multiplier,
         )
         ledgers.append(led)
         w_oos = led["weights_df"]
@@ -916,6 +984,9 @@ def run_zero_hardcode_cluster_conserved(
     max_single_asset_weight: float = 0.25,
     min_effective_assets: int = 4,
     target_portfolio_vol: float = 0.14,
+    adjust_roll_gaps: bool = False,
+    charge_roll_fee: bool = True,
+    fee_multiplier: float = 1.0,
 ) -> tuple[dict, list[dict], dict[str, list[str]]]:
     """
     运行 100% 零先验硬编码 (Zero Hardcoded CORE_20_IDS) 的全市场 60 品种内生准入、
@@ -1009,6 +1080,9 @@ def run_zero_hardcode_cluster_conserved(
             max_single_asset_weight=max_single_asset_weight,
             min_effective_assets=min_effective_assets,
             target_portfolio_vol=target_portfolio_vol,
+            adjust_roll_gaps=adjust_roll_gaps,
+            charge_roll_fee=charge_roll_fee,
+            fee_multiplier=fee_multiplier,
         )
         ledgers.append(led)
         w_oos = led["weights_df"]
@@ -1164,6 +1238,254 @@ def build_satellite_sop_table(
     return pd.DataFrame(rows)
 
 
+def _count_roll_crossings(oos_fast_cache: dict, ledgers: list[dict]) -> tuple[int, int]:
+    """统计两折样本外 60 品种换月跳空总事件数与持仓实际跨越换月次数。"""
+    total_rolls = 0
+    active_crossings = 0
+    for fold, led in zip(FOLDS, ledgers, strict=True):
+        fc = oos_fast_cache[fold["id"]]
+        rm = fc.get("roll_mask_oos")
+        if rm is None:
+            continue
+        rm_df = rm[IDS_60].reindex_like(led["weights_df"]).fillna(False).astype(bool)
+        total_rolls += int(rm_df.to_numpy().sum())
+        prev_w = led["weights_df"][IDS_60].shift(1).fillna(0.0).abs() > 1e-6
+        active_crossings += int((rm_df & prev_w).to_numpy().sum())
+    return total_rolls, active_crossings
+
+
+def _run_variant_with_execution_knobs(
+    variant_name: str,
+    *,
+    oos_fast_cache: dict,
+    sleeve_daily_ret: dict,
+    is_meta_stats: dict,
+    pit_assets: dict,
+    ep_hr: dict,
+    is_liq_stats: dict,
+    price_ret_df: dict,
+    symmetric_deadzone: float | None = None,
+    adjust_roll_gaps: bool = False,
+    charge_roll_fee: bool = True,
+    fee_multiplier: float = 1.0,
+) -> tuple[dict, list[dict]]:
+    """统一调度四大代表性组合架构，支持换月跳空剥离、移仓双边成本与多倍冲击费率注入。"""
+    if variant_name == "Full60_FlatHRP_HysteresisRunner":
+        dz = 0.0 if symmetric_deadzone is None else symmetric_deadzone
+        return run_flat_60_alloc(
+            variant_name,
+            oos_fast_cache,
+            pit_assets,
+            ep_hr,
+            scheme="hr",
+            sector_damp_power=0.50,
+            symmetric_deadzone=dz,
+            adjust_roll_gaps=adjust_roll_gaps,
+            charge_roll_fee=charge_roll_fee,
+            fee_multiplier=fee_multiplier,
+        )
+    if variant_name == "Full60_SecConserved_SymDZ_HR":
+        dz = 0.025 if symmetric_deadzone is None else symmetric_deadzone
+        return run_flat_60_alloc(
+            variant_name,
+            oos_fast_cache,
+            pit_assets,
+            ep_hr,
+            scheme="hr",
+            sector_damp_power=0.90,
+            symmetric_deadzone=dz,
+            adjust_roll_gaps=adjust_roll_gaps,
+            charge_roll_fee=charge_roll_fee,
+            fee_multiplier=fee_multiplier,
+        )
+    if variant_name == "Full60_ZeroHardcode_SOPStage3":
+        dz = 0.02 if symmetric_deadzone is None else symmetric_deadzone
+        s, leds, _ = run_zero_hardcode_sop_stage3(
+            variant_name,
+            oos_fast_cache=oos_fast_cache,
+            sleeve_daily_ret=sleeve_daily_ret,
+            is_meta_stats=is_meta_stats,
+            pit_assets=pit_assets,
+            ep_map=ep_hr,
+            scheme="hr",
+            min_nf=5,
+            min_shp_fs=0.40,
+            min_shp_hr=0.50,
+            min_r=1.45,
+            min_sm=4.0,
+            sector_damp_power=0.50,
+            symmetric_deadzone=dz,
+            adjust_roll_gaps=adjust_roll_gaps,
+            charge_roll_fee=charge_roll_fee,
+            fee_multiplier=fee_multiplier,
+        )
+        return s, leds
+    dz = 0.02 if symmetric_deadzone is None else symmetric_deadzone
+    s, leds, _ = run_zero_hardcode_cluster_conserved(
+        variant_name,
+        oos_fast_cache=oos_fast_cache,
+        sleeve_daily_ret=sleeve_daily_ret,
+        is_meta_stats=is_meta_stats,
+        pit_assets=pit_assets,
+        ep_map=ep_hr,
+        is_liq_stats=is_liq_stats,
+        price_ret_df=price_ret_df,
+        scheme="hr",
+        min_nf=5,
+        min_ep=10,
+        min_shp_fs=0.45,
+        min_shp_hr=0.52,
+        min_r=1.48,
+        min_sm=4.5,
+        min_vol_wan=2.0,
+        max_per_corr_cluster=2,
+        corr_thresh=0.80,
+        cluster_damp_coeff=0.15,
+        sector_damp_power=0.45,
+        symmetric_deadzone=dz,
+        target_portfolio_vol=0.14,
+        adjust_roll_gaps=adjust_roll_gaps,
+        charge_roll_fee=charge_roll_fee,
+        fee_multiplier=fee_multiplier,
+    )
+    return s, leds
+
+
+def build_roll_and_cost_stress_tables(
+    *,
+    oos_fast_cache: dict,
+    sleeve_daily_ret: dict,
+    is_meta_stats: dict,
+    pit_assets: dict,
+    ep_hr: dict,
+    is_liq_stats: dict,
+    price_ret_df: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """构建换月跳空剥离前后对比表、1x/1.5x/2x/3x 冲击成本矩阵与死区防抖保护表。"""
+    attach_oos_roll_masks(oos_fast_cache)
+    common_kw = {
+        "oos_fast_cache": oos_fast_cache,
+        "sleeve_daily_ret": sleeve_daily_ret,
+        "is_meta_stats": is_meta_stats,
+        "pit_assets": pit_assets,
+        "ep_hr": ep_hr,
+        "is_liq_stats": is_liq_stats,
+        "price_ret_df": price_ret_df,
+    }
+    variants = (
+        "Full60_FlatHRP_HysteresisRunner",
+        "Full60_SecConserved_SymDZ_HR",
+        "Full60_ZeroHardcode_SOPStage3",
+        "Full60_ZeroHardcode_ClusterConserved_Optimal",
+    )
+    roll_rows = []
+    cost_rows = []
+    for var in variants:
+        s_unadj, leds_unadj = _run_variant_with_execution_knobs(
+            var, **common_kw, adjust_roll_gaps=False, charge_roll_fee=False, fee_multiplier=1.0
+        )
+        s_strip, _ = _run_variant_with_execution_knobs(
+            var, **common_kw, adjust_roll_gaps=True, charge_roll_fee=False, fee_multiplier=1.0
+        )
+        s_roll, leds_roll = _run_variant_with_execution_knobs(
+            var, **common_kw, adjust_roll_gaps=True, charge_roll_fee=True, fee_multiplier=1.0
+        )
+        tot_rolls, act_cross = _count_roll_crossings(oos_fast_cache, leds_roll)
+        roll_rows.append(
+            {
+                "experiment": var,
+                "total_roll_events": tot_rolls,
+                "active_roll_crossings": act_cross,
+                "unadj_gross_pct": round(float(s_unadj["gross_ret_pct"]), 3),
+                "roll_adj_gross_pct": round(float(s_roll["gross_ret_pct"]), 3),
+                "roll_gap_fake_pnl_pct": round(float(s_unadj["gross_ret_pct"] - s_roll["gross_ret_pct"]), 3),
+                "unadj_cost_pct": round(float(s_unadj["cost_ret_pct"]), 3),
+                "roll_adj_cost_pct": round(float(s_roll["cost_ret_pct"]), 3),
+                "roll_friction_cost_pct": round(float(s_roll["cost_ret_pct"] - s_unadj["cost_ret_pct"]), 3),
+                "unadj_net_pct": round(float(s_unadj["net_ret_pct"]), 3),
+                "strip_only_net_pct": round(float(s_strip["net_ret_pct"]), 3),
+                "roll_adj_net_pct": round(float(s_roll["net_ret_pct"]), 3),
+                "unadj_sharpe": round(float(s_unadj["sharpe"]), 3),
+                "strip_only_sharpe": round(float(s_strip["sharpe"]), 3),
+                "roll_adj_sharpe": round(float(s_roll["sharpe"]), 3),
+                "sharpe_delta": round(float(s_roll["sharpe"] - s_unadj["sharpe"]), 3),
+                "roll_adj_max_dd_pct": round(float(s_roll["max_dd_pct"]), 3),
+                "roll_adj_calmar": round(float(s_roll["calmar"]), 3),
+            }
+        )
+        base_1x_shp = float(s_roll["sharpe"])
+        base_1x_cost = float(s_roll["cost_ret_pct"])
+        be_mult = round(float(s_roll["gross_ret_pct"]) / base_1x_cost, 2) if base_1x_cost > 1e-9 else 0.0
+        for mult in (1.0, 1.5, 2.0, 3.0):
+            s_m = (
+                s_roll
+                if mult == 1.0
+                else _run_variant_with_execution_knobs(
+                    var, **common_kw, adjust_roll_gaps=True, charge_roll_fee=True, fee_multiplier=mult
+                )[0]
+            )
+            ret_pct = round(100.0 * float(s_m["sharpe"]) / base_1x_shp, 1) if abs(base_1x_shp) > 1e-9 else 0.0
+            cost_rows.append(
+                {
+                    "experiment": var,
+                    "cost_multiplier": f"{mult:.1f}x",
+                    "gross_ret_pct": round(float(s_m["gross_ret_pct"]), 2),
+                    "cost_ret_pct": round(float(s_m["cost_ret_pct"]), 2),
+                    "net_ret_pct": round(float(s_m["net_ret_pct"]), 2),
+                    "ann_ret_pct": round(float(s_m["ann_ret_pct"]), 2),
+                    "max_dd_pct": round(float(s_m["max_dd_pct"]), 2),
+                    "sharpe": round(float(s_m["sharpe"]), 2),
+                    "calmar": round(float(s_m["calmar"]), 2),
+                    "ann_turnover": round(float(s_m["ann_turnover"]), 2),
+                    "sharpe_retention_pct": ret_pct,
+                    "breakeven_fee_multiple": be_mult,
+                }
+            )
+
+    dz_rows = []
+    for var in ("Full60_ZeroHardcode_SOPStage3", "Full60_ZeroHardcode_ClusterConserved_Optimal"):
+        for dz in (0.02, 0.03, 0.04):
+            s_1x, _ = _run_variant_with_execution_knobs(
+                var,
+                **common_kw,
+                symmetric_deadzone=dz,
+                adjust_roll_gaps=True,
+                charge_roll_fee=True,
+                fee_multiplier=1.0,
+            )
+            c1 = float(s_1x["cost_ret_pct"])
+            be_dz = round(float(s_1x["gross_ret_pct"]) / c1, 2) if c1 > 1e-9 else 0.0
+            for mult in (1.0, 1.5, 2.0, 3.0):
+                s_dz = (
+                    s_1x
+                    if mult == 1.0
+                    else _run_variant_with_execution_knobs(
+                        var,
+                        **common_kw,
+                        symmetric_deadzone=dz,
+                        adjust_roll_gaps=True,
+                        charge_roll_fee=True,
+                        fee_multiplier=mult,
+                    )[0]
+                )
+                dz_rows.append(
+                    {
+                        "architecture": var,
+                        "symmetric_deadzone": f"{dz * 100.0:.1f}%",
+                        "cost_multiplier": f"{mult:.1f}x",
+                        "gross_ret_pct": round(float(s_dz["gross_ret_pct"]), 2),
+                        "cost_ret_pct": round(float(s_dz["cost_ret_pct"]), 2),
+                        "net_ret_pct": round(float(s_dz["net_ret_pct"]), 2),
+                        "sharpe": round(float(s_dz["sharpe"]), 2),
+                        "max_dd_pct": round(float(s_dz["max_dd_pct"]), 2),
+                        "calmar": round(float(s_dz["calmar"]), 2),
+                        "ann_turnover": round(float(s_dz["ann_turnover"]), 2),
+                        "breakeven_fee_multiple": be_dz,
+                    }
+                )
+    return pd.DataFrame(roll_rows), pd.DataFrame(cost_rows), pd.DataFrame(dz_rows)
+
+
 def generate_html_report(
     ablation_df: pd.DataFrame,
     sec_df: pd.DataFrame,
@@ -1171,6 +1493,10 @@ def generate_html_report(
     sat_df: pd.DataFrame,
     ledger_map: dict[str, list[dict]],
     output_path: Path,
+    *,
+    roll_comp_df: pd.DataFrame | None = None,
+    cost_stress_df: pd.DataFrame | None = None,
+    deadzone_df: pd.DataFrame | None = None,
 ) -> None:
     """生成自包含交互式 Plotly HTML 报告。"""
     fig = make_subplots(
@@ -1308,6 +1634,22 @@ def generate_html_report(
 
     chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn")
     ablation_show = ablation_df.drop(columns=["daily_series"], errors="ignore")
+    extra_sections = ""
+    if roll_comp_df is not None:
+        extra_sections += (
+            '<div class="card"><h2>四、主连合约换月跳空（Roll Gap）剥离与双边移仓成本对比表</h2>'
+            f"{roll_comp_df.to_html(index=False)}</div>\n"
+        )
+    if cost_stress_df is not None:
+        extra_sections += (
+            '<div class="card"><h2>五、多倍滑点/冲击成本（1.0x / 1.5x / 2.0x / 3.0x）压力测试与盈亏平衡费率倍数表</h2>'
+            f"{cost_stress_df.to_html(index=False)}</div>\n"
+        )
+    if deadzone_df is not None:
+        extra_sections += (
+            '<div class="card"><h2>六、对称调仓死区（2% vs 3% vs 4%）在高滑点环境下的换手抑制与净值保护效应表</h2>'
+            f"{deadzone_df.to_html(index=False)}</div>\n"
+        )
     html_doc = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1327,7 +1669,7 @@ td:first-child, td:nth-child(2), td:nth-child(3) {{ text-align: left; }}
 <body>
 <h1>60商品CTA修正后历史验证：完整执行证据与严格准入</h1>
 <div class="card">
-<p>本报告重新计算真实连续参考价格上的信号与完整执行事件；历史2025–2026区间已经用于研究对比，属于回溯验证，不构成未触碰盲测。2026-10-01起的数据封存。无准入与零交易表示证据不足，不证明策略有效；主连换月与真实合约成交仍需另行验证。</p>
+<p>本报告重新计算真实连续参考价格上的信号与完整执行事件，并专项纳入主连换月跳空（Roll Gap）剥离、双边移仓摩擦扣减与 1.0x~3.0x 多倍滑点压力测试。历史2025–2026区间属于回溯验证，2026-10-01起的数据封存。</p>
 <h2>一、核心消融实验总表（2025.01 ~ 2026.09，历史滚动验证区间，原生5m网格计价）</h2>
 {ablation_show.to_html(index=False)}
 </div>
@@ -1342,7 +1684,7 @@ td:first-child, td:nth-child(2), td:nth-child(3) {{ text-align: left; }}
 <h2>三、全商品池 60 品种样本内 SOP Stage-3 准入门禁指标与样本外表现表</h2>
 {sat_df.to_html(index=False)}
 </div>
-</body>
+{extra_sections}</body>
 </html>
 """
     output_path.write_text(html_doc, encoding="utf-8")
@@ -1567,11 +1909,43 @@ def main() -> None:
     sat_df = build_satellite_sop_table(is_meta_stats, sleeve_daily_ret, sel_zhc, zhc_selected=sel_zhc_opt)
     sat_csv = OUT_DIR / "full60_satellite_sop_admission.csv"
     sat_df.to_csv(sat_csv, index=False)
-    print(f"[4/5] 已生成全商品池 60 品种 SOP Stage-3 准入明细表: {sat_csv.name}")
+    print(f"[4/6] 已生成全商品池 60 品种 SOP Stage-3 准入明细表: {sat_csv.name}")
+
+    roll_comp_df, cost_stress_df, deadzone_df = build_roll_and_cost_stress_tables(
+        oos_fast_cache=oos_fast_cache,
+        sleeve_daily_ret=sleeve_daily_ret,
+        is_meta_stats=is_meta_stats,
+        pit_assets=pit_assets,
+        ep_hr=ep_hr,
+        is_liq_stats=is_liq_stats,
+        price_ret_df=price_ret_df,
+    )
+    roll_csv = OUT_DIR / "full60_roll_gap_comparison.csv"
+    cost_csv = OUT_DIR / "full60_cost_stress_matrix.csv"
+    dz_csv = OUT_DIR / "full60_deadzone_protection_matrix.csv"
+    roll_comp_df.to_csv(roll_csv, index=False)
+    cost_stress_df.to_csv(cost_csv, index=False)
+    deadzone_df.to_csv(dz_csv, index=False)
+    print(
+        f"[5/6] 已生成换月跳空剥离对比表 ({roll_csv.name})、冲击成本压力矩阵 ({cost_csv.name}) 与死区防抖保护表 ({dz_csv.name})"
+    )
+    print(roll_comp_df.to_string(index=False))
+    print(cost_stress_df.to_string(index=False))
+    print(deadzone_df.to_string(index=False))
 
     html_path = OUT_DIR / "full60_cta_expansion_report.html"
-    generate_html_report(ablation_df, sec_df, sym_df, sat_df, ledger_map, html_path)
-    print(f"[5/5] 已生成交互式 HTML 报告: {html_path} (总耗时 {time.time() - t0:.2f}s)")
+    generate_html_report(
+        ablation_df,
+        sec_df,
+        sym_df,
+        sat_df,
+        ledger_map,
+        html_path,
+        roll_comp_df=roll_comp_df,
+        cost_stress_df=cost_stress_df,
+        deadzone_df=deadzone_df,
+    )
+    print(f"[6/6] 已生成交互式 HTML 报告: {html_path} (总耗时 {time.time() - t0:.2f}s)")
 
 
 if __name__ == "__main__":

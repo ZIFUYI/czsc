@@ -76,14 +76,20 @@ fn missing_quotes_freeze_quantity_then_resume_across_price_gap() {
     );
     assert_near(&actual.gross_returns, &[0., 0., 0., 0.1, 0.]);
     assert_near(&actual.turnover, &[0., 0.5, 0., 0.1, 0.5]);
-    let by_returns =
-        executed_weight_ledger(&[0., 0., 0., 0.2, 0.], &weights, 0.001, Some(&observed)).unwrap();
+    let by_returns = executed_weight_ledger(
+        &[0., 0., 0., 0.2, 0.],
+        &weights,
+        0.001,
+        Some(&observed),
+        None,
+    )
+    .unwrap();
     assert_near(&actual.net_returns, &by_returns.net_returns);
     assert!(by_returns.quantities.is_none());
     assert!(by_returns.trade_quantities.is_none());
     for (returns, target) in [([0., 0.1], [0.5, 0.5]), ([0., 0.], [0.5, 0.25])] {
         assert!(
-            executed_weight_ledger(&returns, &target, 0.001, Some(&[true, false]))
+            executed_weight_ledger(&returns, &target, 0.001, Some(&[true, false]), None)
                 .unwrap_err()
                 .contains("missing quotes")
         );
@@ -150,7 +156,7 @@ fn terminal_liquidation_is_explicit_and_interval_attribution_conserves_flows() {
 fn return_ledger_has_no_cumulative_synthetic_price_overflow() {
     let returns = vec![1.; 2048];
     let weights = vec![0.5; 2048];
-    let ledger = executed_weight_ledger(&returns, &weights, 0.001, None).unwrap();
+    let ledger = executed_weight_ledger(&returns, &weights, 0.001, None, None).unwrap();
     assert_eq!(ledger.gross_returns[2047], 0.5);
     assert_eq!(ledger.turnover[2047], 0.5);
     assert_eq!(ledger.net_returns[2047], 0.4995);
@@ -169,9 +175,10 @@ fn shared_input_validation_and_external_gross_standardization() {
         assert!(execution_ledger(&[100.], &[0.], 0.001, capital, None).is_err());
     }
     for ret in [-1., -2., f64::INFINITY, f64::NAN] {
-        assert!(executed_weight_ledger(&[ret], &[0.], 0.001, None).is_err());
+        assert!(executed_weight_ledger(&[ret], &[0.], 0.001, None, None).is_err());
     }
-    assert!(executed_weight_ledger(&[0.], &[0.], 0.001, Some(&[])).is_err());
+    assert!(executed_weight_ledger(&[0.], &[0.], 0.001, Some(&[]), None).is_err());
+    assert!(executed_weight_ledger(&[0.], &[0.], 0.001, None, Some(&[])).is_err());
     assert!(decision_interval_ledger(&[0.1], &[0.], 0.001).is_err());
     assert!(decision_execution_ledger(&[], &[], 0.001, Some(100.)).is_err());
     assert!(
@@ -179,6 +186,21 @@ fn shared_input_validation_and_external_gross_standardization() {
             .unwrap()
             .net_returns
             .is_empty()
+    );
+}
+
+#[test]
+fn contract_roll_mask_strips_gap_return_and_charges_two_sided_rollover_friction() {
+    let returns = [0., 0., 0.15, 0.02, 0.];
+    let weights = [0., 0.5, 0.5, 0.5, 0.];
+    let roll_mask = [false, false, true, false, false];
+    let ledger = executed_weight_ledger(&returns, &weights, 0.001, None, Some(&roll_mask)).unwrap();
+    assert_near(&ledger.gross_returns, &[0., 0., 0., 0.01, 0.]);
+    assert_near(&ledger.turnover, &[0., 0.5, 1.0, 0.01, 0.5]);
+    assert_near(&ledger.cost_returns, &[0., 0.0005, 0.001, 0.00001, 0.0005]);
+    assert_near(
+        &ledger.net_returns,
+        &[0., -0.0005, -0.001, 0.00999, -0.0005],
     );
 }
 

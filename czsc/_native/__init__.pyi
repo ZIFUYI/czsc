@@ -1556,12 +1556,14 @@ def evaluate_structure_factor(setup_long: typing.Sequence[builtins.bool], setup_
     Result targets are close-time decisions for execution at the next tradable open.
     """
 
-def executed_weight_ledger(price_returns: typing.Sequence[builtins.float], weights: typing.Sequence[builtins.float], fee_rate: builtins.float = 0.0002, tradable: typing.Optional[typing.Sequence[builtins.bool]] = None) -> ExecutionLedger:
+def executed_weight_ledger(price_returns: typing.Sequence[builtins.float], weights: typing.Sequence[builtins.float], fee_rate: builtins.float = 0.0002, tradable: typing.Optional[typing.Sequence[builtins.bool]] = None, roll_mask: typing.Optional[typing.Sequence[builtins.bool]] = None) -> ExecutionLedger:
     r"""
     Account already executed finite target weights against mark-to-mark price returns.
     Every tradable mark rebalances on fixed initial capital and charges actual traded
-    notional. Missing marks require zero return and unchanged weight. Results are
-    initial-capital fractions; quantity fields are None. No terminal exit is inserted.
+    notional. Missing marks require zero return and unchanged weight. On contract roll
+    marks (`roll_mask=True`), non-trading price gaps are stripped to zero and open
+    inventory adds `2 * |previous|` rollover turnover. Results are initial-capital
+    fractions; quantity fields are None. No terminal exit is inserted.
     """
 
 def execution_episodes(open: typing.Sequence[builtins.float], high: typing.Sequence[builtins.float], low: typing.Sequence[builtins.float], close: typing.Sequence[builtins.float], atr: typing.Sequence[builtins.float], weights: typing.Sequence[builtins.float], fee_rate: builtins.float = 0.0002) -> builtins.list[ExecutionEpisode]: ...
