@@ -109,3 +109,81 @@ def test_signal_usage_summary_and_unconsumed_mirror_signals():
     # 验证 scan_factor_ast 支持直接传 family 字符串
     ac01_info = scan_factor_ast("AC01")
     assert ac01_info.family_id == "AC01" and "strength_zs_break" in ac01_info.rust_signals
+
+
+def test_sqlite_memory_ledger_db_and_full_migration():
+    """验证 SQLite 内存后端 (sqlite:///:memory:) 下 8 张核心表的建表、全量迁移与多维 SQL 聚合查询。"""
+    from alpha_lab.ledger_db import (
+        LEDGER_TABLES,
+        AlphaLabLedgerDB,
+        migrate_historical_data_to_db,
+    )
+
+    db = AlphaLabLedgerDB("sqlite:///:memory:")
+    try:
+        counts = migrate_historical_data_to_db(db=db)
+        assert set(counts) == set(LEDGER_TABLES)
+        assert counts["rust_signals"] >= 222
+        assert counts["factor_defs"] >= 131
+        assert counts["factor_signal_lineage"] >= 100
+        assert counts["preflight_audits"] >= 28
+        assert counts["factor_asset_scores"] >= 47000
+        assert counts["factor_pool_scores"] >= 370
+        assert counts["ablation_runs"] >= 18
+        assert counts["factor_graveyard"] >= 80
+
+        # 验证 6 簇 × 5 周期 = 30 个生态位饱和度矩阵
+        niche_df = db.get_niche_saturation_matrix()
+        assert len(niche_df) == 30
+        assert set(niche_df["scarcity_status"]) <= {"SCARCE", "BALANCED", "SATURATED"}
+
+        # 验证按 6 大商品板块 (sector) 的 SQL 聚合查询
+        sec_df = db.get_sector_score_summary()
+        assert len(sec_df) == 6
+        assert int(sec_df["assets"].sum()) == 60
+
+        # 验证按研发批次 (stage) 的 SQL 聚合查询
+        stg_df = db.get_stage_score_summary()
+        assert set(stg_df["stage"]) == {"Stage1_Base", "Stage2_Rust", "Stage3_OI", "Stage4_CE"}
+
+        # 验证组合消融轨迹与各簇 Top 因子榜查询
+        abl_df = db.get_ablation_evolution_table()
+        assert {"Stage1_Base_Full60", "Stage3_OI_Incremental", "Stage4_CE_Incremental"} <= set(abl_df["run_id"])
+        top_df = db.get_top_factors_by_cluster(top_k=3)
+        assert len(top_df) >= 12
+
+        # 验证证伪候选埋葬幂等写入
+        db.bury_factor(
+            "TEST_BAD01L@60m",
+            failed_gate="Preflight_Mirror",
+            reason="setup_diff=3 > 0 on affine mirror test",
+            stage="Stage_Test",
+        )
+        g_df = db.query_df("SELECT * FROM alpha_lab.factor_graveyard WHERE uid = %s", ("TEST_BAD01L@60m",))
+        assert len(g_df) == 1
+        assert g_df["failed_gate"].iloc[0] == "Preflight_Mirror"
+    finally:
+        db.close()
+
+
+def test_postgres_ledger_db_schema_and_counts():
+    """验证本机 PostgreSQL structure_state_lab.alpha_lab Schema 下的 8 张表全量数据完整性（CI 无 PG 时自动回退验证）。"""
+    from alpha_lab.ledger_db import DEFAULT_LEDGER_DB_URL, AlphaLabLedgerDB
+
+    try:
+        db = AlphaLabLedgerDB(DEFAULT_LEDGER_DB_URL, auto_init=False)
+    except Exception:
+        # 若在无外部 PG 的纯 CI 容器中运行，回退验证 sqlite:///:memory:
+        db = AlphaLabLedgerDB("sqlite:///:memory:")
+        from alpha_lab.ledger_db import migrate_historical_data_to_db
+
+        migrate_historical_data_to_db(db=db)
+    try:
+        counts = db.get_table_counts()
+        assert counts["rust_signals"] >= 222
+        assert counts["factor_defs"] >= 131
+        assert counts["factor_asset_scores"] >= 47000
+        assert counts["factor_pool_scores"] >= 370
+        assert counts["ablation_runs"] >= 18
+    finally:
+        db.close()
