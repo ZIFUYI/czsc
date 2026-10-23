@@ -187,3 +187,117 @@ def test_postgres_ledger_db_schema_and_counts():
         assert counts["ablation_runs"] >= 18
     finally:
         db.close()
+
+
+def test_preflight_audit_passes_all_28_families_and_catches_bad_candidates():
+    """验证 1 秒快速预检门禁对现有 28 个原子因子族 100% 通过，且 100% 拦截镜像不对称与前视偏差因子。"""
+    import numpy as np
+
+    from alpha_lab.ledger_db import AlphaLabLedgerDB
+    from alpha_lab.preflight import run_preflight_audit
+    from examples.alpha_mining_agent.hypothesis_bank import ARCH_A
+    from examples.multi_factor_cta.atomic_factors import ATOMIC_FACTOR_DEFS, AtomicFactorDef
+
+    db = AlphaLabLedgerDB("sqlite:///:memory:")
+    try:
+        df_ok = run_preflight_audit(db=db, persist=True)
+        assert len(df_ok) == 28
+        assert df_ok["passed"].all()
+        assert (df_ok["setup_diff"] == 0).all()
+        assert (df_ok["conf_diff"] == 0).all()
+        assert (df_ok["fire_diff"] == 0).all()
+        assert df_ok["zero_lookahead_pass"].all()
+        assert df_ok["bounds_valid"].all()
+
+        # 构造人为注入镜像不对称的坏因子 (多头常开 vs 空头按 AC01)
+        def _build_asym(ctx, side):
+            s, sq, c, cq, w = ATOMIC_FACTOR_DEFS["AC01"].build(ctx, side)
+            if side > 0:
+                s = s | (np.arange(ctx.n) % 17 == 0)
+            return s, sq, c, cq, w
+
+        # 构造人为注入未来前视偏差的坏因子 (引用未来第 t+5 根收盘价与全样本未来均值)
+        def _build_lookahead(ctx, side):
+            _, sq, _, cq, w = ATOMIC_FACTOR_DEFS["AC01"].build(ctx, side)
+            future_ret = side * (np.roll(ctx.c, -5) - np.mean(ctx.c))
+            s = future_ret > 0
+            c = future_ret > 0
+            return s, sq, c, cq, w
+
+        bad_asym = AtomicFactorDef("BAD_ASYM", "镜像不对称测试因子", ARCH_A, _build_asym, ("30m",))
+        bad_la = AtomicFactorDef("BAD_LA", "前视偏差测试因子", ARCH_A, _build_lookahead, ("30m",))
+
+        df_bad = run_preflight_audit([bad_asym, bad_la], db=db, persist=True, auto_bury_failed=True)
+        assert len(df_bad) == 2
+        assert not df_bad["passed"].any()
+        assert int(df_bad.loc[df_bad["family_id"] == "BAD_ASYM", "setup_diff"].iloc[0]) > 0
+        assert not bool(df_bad.loc[df_bad["family_id"] == "BAD_LA", "zero_lookahead_pass"].iloc[0])
+
+        # 验证失败候选已自动记入 factor_graveyard
+        g_df = db.query_df("SELECT family_id, failed_gate FROM alpha_lab.factor_graveyard")
+        assert {"BAD_ASYM", "BAD_LA"} <= set(g_df["family_id"])
+    finally:
+        db.close()
+
+
+def test_full60_context_store_parity_hot_patch_and_speed():
+    """验证 Full60ContextStore 数值结果与 FactorContext.from_df 完全一致、支持增量状态热补丁，且 60品种×3周期 评估耗时 <= 8s。"""
+    import time
+
+    import numpy as np
+
+    from alpha_lab.context_store import Full60ContextStore
+    from alpha_lab.ledger_db import DEFAULT_CACHE_60_DIR
+    from alpha_lab.preflight import _mock_quantized_raw, _prepare_kdf
+    from alpha_lab.runner import (
+        map_tf_to_15m_causal_grid,
+        run_full_sop_evaluation,
+    )
+    from examples.multi_factor_cta.atomic_factors import FactorContext, compute_family
+
+    # 1. 验证单序列从头构建 FactorContext.from_df 与 Full60ContextStore 100% 逐元素一致 + 热补丁
+    raw = _mock_quantized_raw(5).iloc[:600].reset_index(drop=True)
+    sig_cache = DEFAULT_CACHE_60_DIR / "preflight_sig_cache"
+    df_30m = _prepare_kdf(raw, "30m", sig_cache)
+    ctx_direct = FactorContext.from_df(df_30m)
+    store_custom = Full60ContextStore.from_dataframes(
+        {("au", "30m"): df_30m},
+        cache_dir=DEFAULT_CACHE_60_DIR,
+        tag="unit_test_parity",
+        persist=False,
+    )
+    res_store = store_custom.evaluate_families(["AC01", "BC01", "CC04", "EC05"], tfs=("30m",), assets=("au",))
+    for fam in ("AC01", "BC01", "CC04", "EC05"):
+        s_direct, trig_direct = compute_family(ctx_direct, fam)
+        s_cached, trig_cached = res_store[("au", "30m", fam)]
+        np.testing.assert_allclose(s_direct, s_cached, atol=1e-12, rtol=0.0)
+        np.testing.assert_array_equal(trig_direct, trig_cached)
+
+    # 验证增量状态热补丁 (patch_all_states)
+    custom_manifest = {"custom_new_state": ("完全分类V241010", None, "tas", "Stage4_CE")}
+    patched = store_custom.patch_all_states(manifest=custom_manifest)
+    assert patched[("au", "30m")] == ["custom_new_state"]
+    assert "custom_new_state" in store_custom.get("au", "30m").ctx.states
+
+    # 2. 验证 Full-60 (180 序列) 命中缓存后评估 4 个因子族耗时 <= 8s
+    t0 = time.perf_counter()
+    store_60 = Full60ContextStore.load_full60(tfs=("1d", "60m", "30m"))
+    res_60 = store_60.evaluate_families(["CC04", "CC05", "EC04", "EC05"], tfs=("1d", "60m", "30m"))
+    elapsed = time.perf_counter() - t0
+    assert len(store_60) == 180
+    assert len(res_60) == 720
+    assert elapsed <= 8.0, f"Full60ContextStore 命中缓存评估 4 族耗时 {elapsed:.2f}s > 8.0s"
+
+    # 3. 验证 runner 因果网格对齐与一键 SOP 评估流水线
+    w_aligned = map_tf_to_15m_causal_grid(df_30m["dt"], res_store[("au", "30m", "CC04")][0], df_30m["dt"])
+    assert len(w_aligned) == len(df_30m)
+    sop_out = run_full_sop_evaluation(
+        ["CC04", "EC05"],
+        stage="Stage4_CE",
+        tfs=("30m",),
+        assets=("au",),
+        store=store_custom,
+        persist_db=False,
+    )
+    assert sop_out["status"] == "OK"
+    assert len(sop_out["ablation_runs"]) == 2
