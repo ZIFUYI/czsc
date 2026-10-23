@@ -453,6 +453,24 @@ STATE_SIGNAL_MANIFEST: dict[str, tuple[str, int, str, str]] = {
     "zs_fm_v1": ("中枢形态_BS辅助V230423", 0, "Stage4_CE", "多笔中枢形态演化方向"),
     "acc_w10": ("W10_加速V221110", 0, "Stage4_CE", "10窗口动量加速突破"),
     "doji_rev": ("十字线反转V240329", 0, "Stage4_CE", "顶部底部十字孕线反转"),
+    # Stage 5 (Stage5_FDB): F/D/B 稀缺生态位挂载 —— 分型强弱、笔终点快速突破、三笔/七笔、窗口能量、双均线过滤、吞没、DIF零轴、分型决策区域与MACD一买卖
+    "fx_pwr_v1": ("F_分型强弱", 0, "Stage5_FDB", "缠论分型强弱顶底分级"),
+    "fx_pwr_v2": ("F_分型强弱", 1, "Stage5_FDB", "缠论分型是否有中枢"),
+    "be_macd_v1": ("BE辅助V230312", 0, "Stage5_FDB", "MACD笔终点多空辅助"),
+    "seven_bi": ("七笔_形态V230620", 0, "Stage5_FDB", "七笔中枢完成与背驰形态"),
+    "three_bi": ("三笔_形态V230618", 0, "Stage5_FDB", "三笔收敛扩张与无背形态"),
+    "cci_bs_v1": ("BS辅助V230323", 0, "Stage5_FDB", "CCI顺势多空区间划分"),
+    "cci_bs_v2": ("BS辅助V230323", 1, "Stage5_FDB", "CCI均线斜率向上向下"),
+    "rsi_bs_v1": ("RSI辅助V230227", 0, "Stage5_FDB", "RSI超买超卖极值状态"),
+    "dual_thrust": ("BS辅助V230403", 0, "Stage5_FDB", "DualThrust区间通道突破"),
+    "bi_end_815": ("快速突破_BE辅助V230815", 0, "Stage5_FDB", "笔终点快速突破方向确认"),
+    "vol_win_v1": ("窗口能量V230731", 0, "Stage5_FDB", "滚动窗口高能量分位状态"),
+    "vol_win_v2": ("窗口能量V230731", 1, "Stage5_FDB", "滚动窗口低能量缩量分位"),
+    "xl_engulf": ("形态V240411", 0, "Stage5_FDB", "K线看涨看跌吞没形态"),
+    "xl_ma_flt": ("双均线过滤V240330", 0, "Stage5_FDB", "双均线趋势过滤多空状态"),
+    "dif_zero_614": ("BS辅助V240614", 0, "Stage5_FDB", "DIF零轴附近买卖点确认"),
+    "cxt_dec_526": ("决策区域V240526", 0, "Stage5_FDB", "缠论分型决策区域开多开空"),
+    "macd_bs1_312": ("BS1辅助V230312", 0, "Stage5_FDB", "MACD红绿柱一买一卖辅助"),
 }
 
 
@@ -951,6 +969,35 @@ def _build_bc04(ctx, side):  # B: 持仓量急降砍仓/逼空出清与天量派
     return setup, setup_q, confirm, confirm_q, 5
 
 
+def _build_bc05(ctx, side):  # B: 分型强弱/决策区域 + MACD一买卖背驰减仓蓄势 × 笔终快速突破反转确认 (Stage 5)
+    dec_label = "开多" if side > 0 else "开空"
+    bs1_label = "看多" if side > 0 else "看空"
+    fx_labels = ["强底", "中底", "弱底"] if side > 0 else ["强顶", "中顶", "弱顶"]
+    be_fast = "向上" if side > 0 else "向下"
+    div_ok, div_q = _dir_eq(ctx, "bi_div", side)
+    fx_ok, fx_q = _dir_eq(ctx, "fx", side)
+    c_s, o_s, _, _ = _adj(ctx, side)
+    depth = np.nan_to_num(np.maximum(side * (ctx.ma20 - ctx.c), 0.0) / (1.5 * _safe_atr(ctx)), nan=0.0)
+    oi_exh = (
+        (ctx.oi_flow3_z < -0.08) | np.isin(ctx.states["vol_win_v2"], ["低量N1", "低量N2", "低量N3"]) | (depth > 0.45)
+    )
+    struct_rev = (
+        (ctx.states["cxt_dec_526"] == dec_label)
+        | (ctx.states["macd_bs1_312"] == bs1_label)
+        | (np.isin(ctx.states["fx_pwr_v1"], fx_labels) & div_ok)
+    )
+    setup = struct_rev & oi_exh
+    setup_q = np.clip(np.maximum(div_q, 0.45 + 0.55 * np.tanh(depth)), 0.22, 1.0)
+    brk, brk_q = _break_confirm(ctx, side)
+    body = np.maximum(c_s - o_s, 0.0)
+    rev_trig = (
+        (ctx.states["bi_end_815"] == be_fast) | (ctx.states["be_macd_v1"] == bs1_label) | (fx_ok & (fx_q >= 0.30)) | brk
+    )
+    confirm = rev_trig & (c_s > o_s) & (c_s > _shift(c_s))
+    confirm_q = np.clip(np.maximum(np.maximum(fx_q, brk_q), np.tanh(body / _safe_atr(ctx)) + 0.15), 0.22, 1.0)
+    return setup, setup_q, confirm, confirm_q, 5
+
+
 def _build_cc01(ctx, side):  # C: 中枢偏离回归 -tanh(kZ) + 低趋势效率 + 反转 K
     setup, q = _dir_eq(ctx, "zs_revert", side)
     setup = setup & (ctx.er20 < 0.4)
@@ -1125,6 +1172,39 @@ def _build_dc05(ctx, side):  # D: 支撑压力位缩量减仓洗盘出清 + 双�
     confirm = ((ctx.states["ds_mid_v1"] == ds_label) & (c_s > o_s) & re_inflow) | (brk & re_inflow & (vr >= 0.95))
     confirm_q = np.clip(0.50 * np.maximum(brk_q, np.where(flow_ok, fq, 0.45)) + 0.50 * np.tanh(vr), 0.20, 1.0)
     return setup, wash_q, confirm, confirm_q, 5
+
+
+def _build_dc06(ctx, side):  # D: 双均线过滤 + DIF零轴/CCI顺势蓄势 × 吞没/DualThrust与高量增仓突破 (Stage 5)
+    dir_label = "看多" if side > 0 else "看空"
+    cci_dir = "多头" if side > 0 else "空头"
+    cci_slp = "向上" if side > 0 else "向下"
+    dz_label = "买点" if side > 0 else "卖点"
+    eng_label = "看涨吞没" if side > 0 else "看跌吞没"
+    flow_ok, fq = _dir_eq(ctx, "flow", side)
+    vr = np.divide(ctx.v, ctx.vma20, out=np.ones(ctx.n), where=ctx.vma20 > EPS)
+    slope_s = np.nan_to_num(side * (ctx.ma20 - _shift(ctx.ma20, 5)) / (5.0 * _safe_atr(ctx)), nan=0.0)
+    trend_flt = (ctx.states["xl_ma_flt"] == dir_label) & (
+        ((ctx.states["cci_bs_v1"] == cci_dir) & (ctx.states["cci_bs_v2"] == cci_slp))
+        | (ctx.states["dif_zero_614"] == dz_label)
+        | flow_ok
+    )
+    oi_support = (ctx.oi_flow3_z > 0.05) | (ctx.oi_ratio >= 1.01) | (vr >= 0.95)
+    setup = trend_flt & oi_support & (side * (ctx.c - ctx.ma20) > 0.0)
+    setup_q = np.clip(
+        0.50 * np.maximum(np.where(flow_ok, fq, 0.40), 0.45) + 0.50 * np.tanh(2.5 * np.maximum(slope_s, 0.1)),
+        0.22,
+        1.0,
+    )
+    brk, brk_q = _break_confirm(ctx, side)
+    c_s, o_s, _, _ = _adj(ctx, side)
+    vol_push = np.isin(ctx.states["vol_win_v1"], ["高量N10", "高量N9", "高量N8"]) | (ctx.oi_chg_z > 0.05) | (vr >= 1.05)
+    confirm = (
+        (brk | (ctx.states["xl_engulf"] == eng_label) | (ctx.states["dual_thrust"] == dir_label))
+        & vol_push
+        & (c_s > o_s)
+    )
+    confirm_q = np.clip(0.55 * np.maximum(brk_q, 0.45) + 0.45 * np.tanh(np.maximum(vr - 0.8, 0.15)), 0.22, 1.0)
+    return setup, setup_q, confirm, confirm_q, 5
 
 
 def _build_ec01(ctx, side):  # E: KC/BOLL 挤压 -> 波动率扩张点火
@@ -1306,6 +1386,76 @@ def _build_fc04(ctx: FactorContext, side: int):
     return setup, setup_q, confirm, confirm_q, 5
 
 
+def _build_fc05(ctx: FactorContext, side: int):
+    """FC05: 板块龙头领涨共振 + 滞后品种分型强弱/笔终快速突破/三笔蓄势 × 高量增仓补涨 (Stage 5)。"""
+    n = ctx.n
+    leader_dir = ctx.sector_leader_dir if ctx.sector_leader_dir is not None else np.zeros(n, dtype=np.float64)
+    lag_gap = ctx.leader_lag_gap if ctx.leader_lag_gap is not None else np.zeros(n, dtype=np.float64)
+    cs_str = ctx.cs_strength_eff if ctx.cs_strength_eff is not None else np.zeros(n, dtype=np.float64)
+    be_fast = "向上" if side > 0 else "向下"
+    fx_labels = ["强底", "中底", "弱底"] if side > 0 else ["强顶", "中顶", "弱顶"]
+    tbi_labels = (
+        ["向上收敛", "向上盘背", "向上无背", "向上不重合"]
+        if side > 0
+        else ["向下收敛", "向下盘背", "向下无背", "向下不重合"]
+    )
+    leader_s, gap_s, cs_s = side * leader_dir, side * lag_gap, side * cs_str
+    cs_setup = ((leader_s > 0.18) & (gap_s > -0.10)) | (cs_s > 0.24)
+    native_base = (
+        (ctx.states["bi_end_815"] == be_fast)
+        | np.isin(ctx.states["fx_pwr_v1"], fx_labels)
+        | np.isin(ctx.states["three_bi"], tbi_labels)
+    )
+    setup = cs_setup & native_base & (ctx.states["fx_pwr_v2"] == "有中枢")
+    setup_q = np.clip(0.55 * np.tanh(1.2 * np.maximum(leader_s, 0.15) + 0.8 * np.maximum(gap_s, 0.0)) + 0.45, 0.22, 1.0)
+    brk, brk_q = _break_confirm(ctx, side)
+    fx_ok, fx_q = _dir_eq(ctx, "fx", side)
+    c_s, o_s, _, _ = _adj(ctx, side)
+    vr = np.divide(ctx.v, ctx.vma20, out=np.ones(n), where=ctx.vma20 > EPS)
+    oi_vol_ok = (
+        np.isin(ctx.states["vol_win_v1"], ["高量N10", "高量N9", "高量N8"]) | (ctx.oi_flow3_z > 0.05) | (vr >= 1.02)
+    )
+    confirm = brk & oi_vol_ok & (c_s > o_s)
+    confirm_q = np.clip(0.60 * np.maximum(brk_q, fx_q) + 0.40 * np.tanh(np.maximum(ctx.oi_ratio - 0.7, 0.2)), 0.22, 1.0)
+    return setup, setup_q, confirm, confirm_q, 5
+
+
+def _build_fc06(ctx: FactorContext, side: int):
+    """FC06: 截面价差极值 + 七笔/RSI超买超卖/减仓衰竭蓄势 × 笔终辅助/吞没反包确认 (Stage 5)。"""
+    n = ctx.n
+    spread_z = ctx.sector_spread_zscore if ctx.sector_spread_zscore is not None else np.zeros(n, dtype=np.float64)
+    lag_gap = ctx.leader_lag_gap if ctx.leader_lag_gap is not None else np.zeros(n, dtype=np.float64)
+    spread_stretch, gap_s = -side * spread_z, side * lag_gap
+    rsi_ext = "超卖" if side > 0 else "超买"
+    be_label = "看多" if side > 0 else "看空"
+    eng_label = "看涨吞没" if side > 0 else "看跌吞没"
+    sbi_labels = (
+        ["aAbcd式底背驰", "abcAd式底背驰", "aAb式底背驰", "类趋势底背驰", "向上中枢完成", "类三买"]
+        if side > 0
+        else ["aAbcd式顶背驰", "abcAd式顶背驰", "aAb式顶背驰", "类趋势顶背驰", "向下中枢完成", "类三卖"]
+    )
+    div_ok, div_q = _dir_eq(ctx, "bi_div", side)
+    fx_ok, fx_q = _dir_eq(ctx, "fx", side)
+    c_s, o_s, _, _ = _adj(ctx, side)
+    depth = np.nan_to_num(np.maximum(side * (ctx.ma20 - ctx.c), 0.0) / (1.5 * _safe_atr(ctx)), nan=0.0)
+    cs_stretch = (spread_stretch > 0.45) | (gap_s > 0.18)
+    exh_state = (
+        np.isin(ctx.states["seven_bi"], sbi_labels)
+        | (ctx.states["rsi_bs_v1"] == rsi_ext)
+        | div_ok
+        | (ctx.oi_flow3_z < -0.12)
+    )
+    setup = cs_stretch & exh_state & (depth > 0.20)
+    setup_q = np.clip(
+        0.50 * np.tanh(0.8 * np.maximum(spread_stretch, 0.25)) + 0.50 * np.maximum(div_q, np.tanh(depth)), 0.22, 1.0
+    )
+    brk, brk_q = _break_confirm(ctx, side)
+    rev_ok = (ctx.states["be_macd_v1"] == be_label) | (ctx.states["xl_engulf"] == eng_label) | brk
+    confirm = rev_ok & (c_s > o_s) & (c_s > _shift(c_s))
+    confirm_q = np.clip(np.maximum(fx_q, np.maximum(brk_q, 0.45)), 0.22, 1.0)
+    return setup, setup_q, confirm, confirm_q, 5
+
+
 @dataclass(frozen=True)
 class AtomicFactorDef:
     family: str  # 例如 "AC01"
@@ -1345,6 +1495,23 @@ _SPREAD_REVERT_DECAY = DecayConfig(
     trailing=0.012,
     ratchet_stop=True,
 )
+_STAGE5_LOW_TURN_DECAY = DecayConfig(
+    lam0=0.015,
+    d_eps=0.05,
+    max_hold=64,
+    trailing=0.015,
+    trail_activation=0.025,
+    ratchet_stop=False,
+)
+_STAGE5_FC_DECAY = DecayConfig(
+    lam0=0.015,
+    d_eps=0.05,
+    max_hold=64,
+    trailing=0.015,
+    trail_activation=0.025,
+    ratchet_stop=False,
+    stop_plugin="pos_second_ext",
+)
 _INITIAL_ATOMIC_FACTOR_DEFS: tuple[AtomicFactorDef, ...] = (
     AtomicFactorDef("AC01", "三买卖中枢脱离安全边际突破确认", ARCH_A, _build_ac01, _ALL_TFS, stage="Stage1_Base"),
     AtomicFactorDef(
@@ -1365,6 +1532,15 @@ _INITIAL_ATOMIC_FACTOR_DEFS: tuple[AtomicFactorDef, ...] = (
     AtomicFactorDef("BC02", "TD九转极值2B假突破", ARCH_B, _build_bc02, _ALL_TFS, stage="Stage1_Base"),
     AtomicFactorDef("BC03", "MACD背驰缩柱蓄势与笔终点反转确认", ARCH_B, _build_bc03, _ALL_TFS, stage="Stage2_Rust"),
     AtomicFactorDef("BC04", "持仓量急降砍仓逼空出清与高量柱背驰反转", ARCH_B, _build_bc04, _ALL_TFS, stage="Stage3_OI"),
+    AtomicFactorDef(
+        "BC05",
+        "分型强弱决策区域MACD一买卖背驰与笔终快破反转",
+        ARCH_B,
+        _build_bc05,
+        _ALL_TFS,
+        _STAGE5_LOW_TURN_DECAY,
+        stage="Stage5_FDB",
+    ),
     AtomicFactorDef("CC01", "中枢偏离回归", ARCH_C, _build_cc01, _ALL_TFS, stage="Stage1_Base"),
     AtomicFactorDef("CC02", "KC轨道刺破收回", ARCH_C, _build_cc02, _ALL_TFS, stage="Stage1_Base"),
     AtomicFactorDef(
@@ -1382,6 +1558,15 @@ _INITIAL_ATOMIC_FACTOR_DEFS: tuple[AtomicFactorDef, ...] = (
     AtomicFactorDef("DC04", "CVOLP筹码扩张黄金柱蓄势与增仓梯量突破", ARCH_D, _build_dc04, _ALL_TFS, stage="Stage3_OI"),
     AtomicFactorDef(
         "DC05", "支撑压力位缩量减仓洗盘与双顺中线筹码回流", ARCH_D, _build_dc05, _ALL_TFS, stage="Stage3_OI"
+    ),
+    AtomicFactorDef(
+        "DC06",
+        "双均线过滤DIF零轴CCI蓄势与吞没增仓突破",
+        ARCH_D,
+        _build_dc06,
+        _ALL_TFS,
+        _STAGE5_LOW_TURN_DECAY,
+        stage="Stage5_FDB",
     ),
     AtomicFactorDef("EC01", "挤压后波动率扩张点火", ARCH_E, _build_ec01, _ALL_TFS, stage="Stage1_Base"),
     AtomicFactorDef("EC02", "NR7窄幅突破", ARCH_E, _build_ec02, _ALL_TFS, stage="Stage1_Base"),
@@ -1426,6 +1611,24 @@ _INITIAL_ATOMIC_FACTOR_DEFS: tuple[AtomicFactorDef, ...] = (
         "FC03", "F02_截面比价超跌超涨背驰反包", ARCH_F, _build_fc03, _ALL_TFS, _SPREAD_REVERT_DECAY, stage="Stage1_Base"
     ),
     AtomicFactorDef("FC04", "F03_截面TopK斜率时序突破双共振", ARCH_F, _build_fc04, _ALL_TFS, stage="Stage1_Base"),
+    AtomicFactorDef(
+        "FC05",
+        "板块龙头领涨滞后分型笔底增仓补涨",
+        ARCH_F,
+        _build_fc05,
+        _ALL_TFS,
+        _STAGE5_FC_DECAY,
+        stage="Stage5_FDB",
+    ),
+    AtomicFactorDef(
+        "FC06",
+        "截面价差极值七笔RSI衰竭与笔终吞没反包",
+        ARCH_F,
+        _build_fc06,
+        _ALL_TFS,
+        _STAGE5_FC_DECAY,
+        stage="Stage5_FDB",
+    ),
 )
 F_CLUSTER_FAMILY_ALIASES: dict[str, str] = {
     "F01": "FC02",
@@ -1529,7 +1732,7 @@ def compute_family(
     resolved_family = F_CLUSTER_FAMILY_ALIASES.get(family, family)
     fdef = ATOMIC_FACTOR_DEFS[resolved_family]
     n = ctx.n
-    if resolved_family in {"FC02", "FC03", "FC04"} and not ctx.has_external_cs:
+    if resolved_family in {"FC02", "FC03", "FC04", "FC05", "FC06"} and not ctx.has_external_cs:
         raise ValueError(f"missing_context: {resolved_family} requires real cross-asset rank/leader/spread features")
     from czsc import evaluate_structure_factor
 
@@ -1539,13 +1742,15 @@ def compute_family(
         setup, confirm = np.asarray(setup, dtype=bool), np.asarray(confirm, dtype=bool)
         if side not in sides:
             setup, confirm = np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
-        if resolved_family in {"FC02", "FC03", "FC04"} and ctx.cs_available is not None:
+        if resolved_family in {"FC02", "FC03", "FC04", "FC05", "FC06"} and ctx.cs_available is not None:
             setup, confirm = setup & ctx.cs_available, confirm & ctx.cs_available
         inputs[side] = (setup, np.asarray(setup_q, dtype=np.float64), confirm, np.asarray(confirm_q, dtype=np.float64))
     long, short = inputs[1], inputs[-1]
     cfg = decay or fdef.default_decay or DecayConfig()
     plugin_key = cfg.stop_plugin if (cfg.stop_plugin and cfg.stop_plugin in ctx.structure_anchors) else fdef.archetype
     anchors = ctx.structure_anchors[plugin_key]
+    if not np.isfinite(anchors["long_stop"]).any() and "pos_second_ext" in ctx.structure_anchors:
+        anchors = ctx.structure_anchors["pos_second_ext"]
     pass_fx = cfg.use_fx_exit or (cfg.reentry_mode not in ("", "none"))
     result = evaluate_structure_factor(
         long[0],

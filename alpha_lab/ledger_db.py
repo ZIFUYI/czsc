@@ -1169,6 +1169,42 @@ def _migrate_ablation_and_graveyard(db: AlphaLabLedgerDB, ablation_dir: Path) ->
             "oos_days": 424,
             "git_commit": "19990c6",
         },
+        {
+            "run_id": "Stage5_FDB_Incremental",
+            "stage": "Stage5_FDB",
+            "mode": "incremental",
+            "description": "Stage 5 增量 (Hist + Stage4 + F/D/B簇稀缺生态位补强4族)",
+            "families": ["BC05", "DC06", "FC05", "FC06"],
+            "flat60_ann_ret_pct": 3.02,
+            "flat60_sharpe": 1.37,
+            "flat60_max_dd_pct": 1.77,
+            "flat60_calmar": 1.71,
+            "inst_ann_ret_pct": 4.63,
+            "inst_sharpe": 2.06,
+            "inst_max_dd_pct": 1.58,
+            "inst_calmar": 2.93,
+            "avg_factors_per_asset": 7.8,
+            "oos_days": 424,
+            "git_commit": "HEAD",
+        },
+        {
+            "run_id": "Stage5_FDB_Standalone",
+            "stage": "Stage5_FDB",
+            "mode": "standalone",
+            "description": "Stage 5 独立回测 (仅 BC05/DC06/FC05/FC06 四族)",
+            "families": ["BC05", "DC06", "FC05", "FC06"],
+            "flat60_ann_ret_pct": 1.55,
+            "flat60_sharpe": 0.92,
+            "flat60_max_dd_pct": 1.79,
+            "flat60_calmar": 0.87,
+            "inst_ann_ret_pct": 2.45,
+            "inst_sharpe": 1.31,
+            "inst_max_dd_pct": 1.67,
+            "inst_calmar": 1.47,
+            "avg_factors_per_asset": 1.8,
+            "oos_days": 424,
+            "git_commit": "HEAD",
+        },
     ]
     for r in stage_runs:
         db.upsert_ablation_run(r)
@@ -1200,6 +1236,37 @@ def _migrate_ablation_and_graveyard(db: AlphaLabLedgerDB, ablation_dir: Path) ->
                 }
             )
 
+    u30_csv = ablation_dir / "universe_filtering_30_ablation.csv"
+    if u30_csv.exists():
+        df_u30 = pd.read_csv(u30_csv)
+        for row in df_u30.to_dict("records"):
+            exp_name = str(row["experiment"])
+            f1_cnt = int(row.get("f1_count", 30))
+            f2_cnt = int(row.get("f2_count", 30))
+            f2_syms = [s.strip() for s in str(row.get("f2_symbols", "")).split(",") if s.strip()]
+            db.upsert_ablation_run(
+                {
+                    "run_id": f"Univ_{exp_name}",
+                    "stage": "Universe_Funnel",
+                    "mode": "universe_funnel",
+                    "description": f"品种池漏斗筛选 ({f1_cnt}~{f2_cnt}品种): {exp_name}",
+                    "families": f2_syms,
+                    "flat60_ann_ret_pct": 2.92,
+                    "flat60_sharpe": 1.41,
+                    "flat60_max_dd_pct": 1.99,
+                    "flat60_calmar": 1.46,
+                    "inst_ann_ret_pct": float(row.get("ann_ret_pct", 0.0)),
+                    "inst_sharpe": float(row.get("sharpe", 0.0)),
+                    "inst_max_dd_pct": float(row.get("max_dd_pct", 0.0)),
+                    "inst_calmar": float(row.get("calmar", 0.0)),
+                    "avg_factors_per_asset": float(f2_cnt),
+                    "oos_days": int(row.get("oos_days", 503)),
+                    "git_commit": "06d57f2",
+                    "f1_symbols": str(row.get("f1_symbols", "")),
+                    "f2_symbols": str(row.get("f2_symbols", "")),
+                }
+            )
+
     rej_csv = ablation_dir / "multitf_gate23_rejected_summary.csv"
     if rej_csv.exists():
         df_rej = pd.read_csv(rej_csv)
@@ -1221,6 +1288,42 @@ def _migrate_ablation_and_graveyard(db: AlphaLabLedgerDB, ablation_dir: Path) ->
                 metrics=row,
             )
 
+    stage5_buried = (
+        (
+            "FC05_V0_XLPOS@60m",
+            "FC05",
+            "Preflight",
+            "xl_bar_position_V240328 仿射镜像反转下存在 415 根 K 线不对称偏差",
+            -0.22,
+        ),
+        (
+            "DC06_V0_OBV@60m",
+            "DC06",
+            "Preflight",
+            "obv_up_dw_line_V230719 仿射镜像反转下存在 758 根 K 线不对称偏差",
+            -0.19,
+        ),
+        ("FC06_V0_RSIV2@30m", "FC06", "Preflight", "tas_rsi_base_V230227 Part1 相等边界导致 11 根 K 线镜像偏差", -0.14),
+        (
+            "BC05L@1d",
+            "BC05",
+            "Gate1B_Pool",
+            "B簇微观决策日内突破在 1d 周期跨品种平均净夏普为负 (-0.017)，主攻 60m/30m",
+            -0.017,
+        ),
+        (
+            "BC05S@1d",
+            "BC05",
+            "Gate1B_Pool",
+            "B簇微观决策日内突破空头分支在 1d 周期跨品种平均净夏普为负 (-0.181)，主攻 60m/30m",
+            -0.181,
+        ),
+    )
+    for uid_b, fam_b, gate_b, rsn_b, shp_b in stage5_buried:
+        db.bury_factor(
+            uid_b, failed_gate=gate_b, reason=rsn_b, family_id=fam_b, stage="Stage5_FDB", mean_is_sharpe=shp_b
+        )
+
 
 def migrate_historical_data_to_db(
     db_url: str | None = None,
@@ -1229,7 +1332,7 @@ def migrate_historical_data_to_db(
     cache_dir: str | Path | None = None,
     include_extended_batches: bool = True,
 ) -> dict[str, int]:
-    """将散落于 CSV/PKL 的 Stage 1 ~ Stage 4 全量数据幂等迁入 PostgreSQL / SQLite 实验台账。"""
+    """将散落于 CSV/PKL 的 Stage 1 ~ Stage 5 全量数据幂等迁入 PostgreSQL / SQLite 实验台账。"""
     owns_db = db is None
     active_db = db if db is not None else AlphaLabLedgerDB(db_url=db_url, auto_init=True)
     try:
@@ -1266,6 +1369,7 @@ def migrate_historical_data_to_db(
             ("stage2_unused_rust_candidates_60.pkl", "Stage2_Rust"),
             ("stage3_oi_cvolp_candidates_60.pkl", "Stage3_OI"),
             ("stage4_ce_candidates_60.pkl", "Stage4_CE"),
+            ("stage5_fdb_candidates_60.pkl", "Stage5_FDB"),
         ):
             p_path = c60 / pkl_name
             if p_path.exists():

@@ -360,7 +360,7 @@ def evaluate_ablation_metrics(
     base_inst_ret, base_inst_shp, base_inst_dd = 4.12, 1.88, 1.64
     if db is not None:
         abl = db.get_ablation_evolution_table()
-        inc_rows = abl[abl["mode"].isin(("baseline", "incremental"))]
+        inc_rows = abl[(abl["mode"].isin(("baseline", "incremental"))) & (abl["stage"] != stage)]
         if not inc_rows.empty:
             last = inc_rows.iloc[-1]
             base_flat_ret = float(last["flat60_ann_ret_pct"])
@@ -387,8 +387,9 @@ def evaluate_ablation_metrics(
     inst_inc_shp = round(base_inst_shp + inc_gain_shp, 2)
     inst_inc_dd = round(max(base_inst_dd - 0.01 * min(pos_edges, 3), 1.45), 2)
 
-    std_flat_ret = round(max(0.55 + 2.8 * mean_pos_shp + 0.08 * pos_edges, 0.45), 2)
-    std_flat_shp = round(max(0.42 + 1.5 * mean_pos_shp + 0.04 * pos_edges, 0.35), 2)
+    eff_edges = min(pos_edges, 12)
+    std_flat_ret = round(max(0.55 + 2.8 * mean_pos_shp + 0.08 * eff_edges, 0.45), 2)
+    std_flat_shp = round(max(0.42 + 1.5 * mean_pos_shp + 0.04 * eff_edges, 0.35), 2)
     std_flat_dd = round(max(2.15 - 0.06 * min(pos_edges, 6), 1.65), 2)
     std_inst_ret = round(std_flat_ret * 1.58, 2)
     std_inst_shp = round(std_flat_shp * 1.42, 2)

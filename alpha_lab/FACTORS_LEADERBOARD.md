@@ -1,6 +1,6 @@
 # CZSC AlphaLab 全景因子排行榜与生态位地图 (`FACTORS_LEADERBOARD.md`)
 
-> **自动生成时间**：`2026-10-23 00:39:05 UTC` | **台账后端**：`postgres` | **标的池**：`Full-60 Commodities (6 大板块 60 品种)`
+> **自动生成时间**：`2026-10-23 02:43:50 UTC` | **台账后端**：`postgres` | **标的池**：`Full-60 Commodities (6 大板块 60 品种)`
 > **生成命令**：`uv run --no-sync python -m alpha_lab.cli report`
 
 ---
@@ -10,16 +10,16 @@
 | 指标维度 | 统计数值 | 说明 |
 | :--- | :---: | :--- |
 | **Rust 原生 K 线信号总数 (`rust_signals`)** | `234` | 覆盖 17 个 Rust 信号子模块，含镜像对称审计标记 |
-| **已消费 K 线信号数** | `50 / 234` (`21.37%`) | 50 个显式状态键 + 7 类结构强度信号 |
-| **待开采精确镜像对称信号 (`exact_mirror=True`)** | `118` | 已通过仿射反转严格对称检验、尚未被现有因子消费的蓝海信号 |
-| **SSOT 原子因子族 (`ATOMIC_FACTOR_DEFS`)** | `28` | 覆盖 Stage1_Base (16) + Stage2_Rust (4) + Stage3_OI (4) + Stage4_CE (4) |
-| **登记历史候选因子总数 (`factor_defs`)** | `165` | 含 28 个原子族 + 137 个跨周期异构候选变体 |
-| **因子↔信号血缘边数 (`factor_signal_lineage`)** | `124` | AST 静态扫描自动提取的 `state`/`strength` 依赖边 |
-| **预检门禁通过率 (`preflight_audits`)** | `28 / 28` (`100%`) | `<1s` 仿射镜像对称 + 前视零泄漏 + 边界合法性门禁 |
-| **品种级评估明细行 (`factor_asset_scores`)** | `55,680` | Full-60 品种 × 多周期 × Fold1_2025 / Fold2_2026 样本外打分 |
-| **全池准入汇总行 (`factor_pool_scores`)** | `414` | Gate 1B 全品种池准入检验汇总 |
-| **组合消融归因记录 (`ablation_runs`)** | `18` | Stage 1 ~ Stage 4 等权 / 机构两层风险预算组合样本外净值 |
-| **失败实验墓地记录 (`factor_graveyard`)** | `95` | 被 Gate 1B/2/3 或 Pre-flight 淘汰的证伪候选与原因归档 |
+| **已消费 K 线信号数** | `64 / 234` (`27.35%`) | 67 个显式状态键 + 7 类结构强度信号 |
+| **待开采精确镜像对称信号 (`exact_mirror=True`)** | `104` | 已通过仿射反转严格对称检验、尚未被现有因子消费的蓝海信号 |
+| **SSOT 原子因子族 (`ATOMIC_FACTOR_DEFS`)** | `32` | 覆盖 Stage1_Base (16) + Stage2_Rust (4) + Stage3_OI (4) + Stage4_CE (4) + Stage5_FDB (4) |
+| **登记历史候选因子总数 (`factor_defs`)** | `173` | 含 32 个原子族 + 跨周期异构候选变体 |
+| **因子↔信号血缘边数 (`factor_signal_lineage`)** | `152` | AST 静态扫描自动提取的 `state`/`strength` 依赖边 |
+| **预检门禁通过率 (`preflight_audits`)** | `32 / 32` (`100%`) | `<1s` 仿射镜像对称 + 前视零泄漏 + 边界合法性门禁 |
+| **品种级评估明细行 (`factor_asset_scores`)** | `58,560` | Full-60 品种 × 多周期 × Fold1_2025 / Fold2_2026 样本外打分 |
+| **全池准入汇总行 (`factor_pool_scores`)** | `462` | Gate 1B 全品种池准入检验汇总 |
+| **组合消融归因记录 (`ablation_runs`)** | `20` | Stage 1 ~ Stage 5 等权 / 机构两层风险预算组合样本外净值 |
+| **失败实验墓地记录 (`factor_graveyard`)** | `100` | 被 Gate 1B/2/3 或 Pre-flight 淘汰的证伪候选与原因归档 |
 
 ## 二、 6×5 生态位饱和度矩阵 (Cluster A~F × Timeframe `1d`/`60m`/`30m`/`15m`/`5m`)
 
@@ -28,13 +28,13 @@
 | 机制主簇 (Cluster) | `1d` | `60m` | `30m` | `15m` | `5m` |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **A · Trend / Regime (趋势与宏观状态)** | 🟢 `0/11` (-0.23) | 🟢 `1/11` (-0.22) | 🟡 `5/13` (-0.21) | 🟢 `0/4` (-0.54) | 🟢 `0/2` (-0.97) |
-| **B · Breakout / Participation (突破与资金参与)** | 🟡 `4/10` (-0.00) | 🟢 `0/6` (-0.14) | 🟢 `0/6` (-0.18) | 🟢 `0/6` (-0.27) | 🟢 `0/4` (-0.35) |
+| **B · Breakout / Participation (突破与资金参与)** | 🟡 `4/12` (-0.00) | 🟡 `4/8` (-0.14) | 🟡 `4/8` (-0.18) | 🟢 `0/6` (-0.27) | 🟢 `0/4` (-0.35) |
 | **C · Pullback / Exhaustion (回调与衰竭反转)** | 🟡 `4/12` (-0.02) | 🟢 `1/8` (-0.21) | 🟢 `0/8` (-0.33) | 🟢 `1/6` (-0.68) | 🟢 `0/2` (-0.05) |
-| **D · Position / Carry / Basis (持仓博弈与期限结构)** | 🟢 `0/10` (-0.21) | 🟢 `1/10` (-0.24) | 🟢 `1/8` (-0.39) | 🟢 `0/4` (-0.70) | 🟢 `0/2` (-0.09) |
+| **D · Position / Carry / Basis (持仓博弈与期限结构)** | 🟢 `2/12` (-0.21) | 🟡 `5/12` (-0.22) | 🟡 `5/10` (-0.34) | 🟢 `0/4` (-0.70) | 🟢 `0/2` (-0.09) |
 | **E · Cross-Asset / Relative Value (截面强弱与相对价值)** | 🟢 `0/8` (-0.20) | 🟡 `6/10` (-0.07) | 🟢 `1/8` (-0.25) | 🟢 `2/8` (-0.40) | 🟢 `0/0` |
-| **F · Intraday / Execution Microstructure (日内微结构与冲击)** | 🟢 `0/6` (+0.00) | 🟢 `1/8` (-0.25) | 🟢 `1/8` (-0.27) | 🟢 `1/8` (-0.49) | 🟢 `0/0` |
+| **F · Intraday / Execution Microstructure (日内微结构与冲击)** | 🟡 `5/10` (+0.00) | 🟡 `9/12` (-0.23) | 🟡 `9/12` (-0.29) | 🟢 `1/8` (-0.49) | 🟢 `0/0` |
 
-## 三、 Stage 1 ~ Stage 4 全周期组合消融演进对比 (`ablation_runs`)
+## 三、 Stage 1 ~ Stage 5 全周期组合消融演进对比 (`ablation_runs`)
 
 | 运行标识 (`run_id`) | 阶段 (`stage`) | 模式 (`mode`) | Flat-60 年化 | Flat-60 Sharpe | Flat-60 Calmar | 机构两层年化 | 机构两层 Sharpe | 机构最大回撤 | 机构 Calmar | 单品种均因子数 |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -56,6 +56,8 @@
 | `Stage3_OI_Standalone` | `Stage3_OI` | `standalone` | `+0.84%` | **+0.520** | `+0.390` | `+1.42%` | **+0.780** | `1.95%` | `+0.730` | `1.6` |
 | `Stage4_CE_Incremental` | `Stage4_CE` | `incremental` | `+2.76%` | **+1.280** | `+1.490` | `+4.28%` | **+1.940** | `1.61%` | `+2.660` | `7.9` |
 | `Stage4_CE_Standalone` | `Stage4_CE` | `standalone` | `+1.38%` | **+0.890** | `+0.780` | `+2.19%` | **+1.240** | `1.68%` | `+1.300` | `1.9` |
+| `Stage5_FDB_Incremental` | `Stage5_FDB` | `incremental` | `+3.02%` | **+1.370** | `+1.710` | `+4.63%` | **+2.060** | `1.58%` | `+2.930` | `7.8` |
+| `Stage5_FDB_Standalone` | `Stage5_FDB` | `standalone` | `+1.55%` | **+0.920** | `+0.870` | `+2.45%` | **+1.310** | `1.67%` | `+1.470` | `1.8` |
 
 ## 四、 各主簇 (Cluster A~F) Top 准入因子排行榜 (`factor_pool_scores`)
 
@@ -68,31 +70,31 @@
 | **A** | 5 | `S1L@30m` | `S1L` | `30m` | `Stage1_Base` | `Fold2_2026` | **-0.2330** | `-2.85` | `38.3%` | ✅ |
 | **B** | 1 | `H1D_BC01S@1d` | `H1D_BC01` | `1d` | `Stage2_Rust` | `Fold1_2025` | **+0.2660** | `+3.19` | `61.7%` | ✅ |
 | **B** | 2 | `H1D_DV01S@1d` | `H1D_DV01` | `1d` | `Stage1_Base` | `Fold1_2025` | **+0.2370** | `+2.90` | `51.7%` | ✅ |
-| **B** | 3 | `BC01S@60m` | `BC01` | `60m` | `Stage1_Base` | `Fold2_2026` | **+0.1330** | `-0.80` | `61.7%` | ➖ |
-| **B** | 4 | `BC04L@1d` | `BC04` | `1d` | `Stage3_OI` | `Fold2_2026` | **+0.0800** | `+1.36` | `55.0%` | ➖ |
-| **B** | 5 | `H5M_LQ01S@5m` | `H5M_LQ01` | `5m` | `Stage1_Base` | `Fold1_2025` | **+0.0580** | `+1.10` | `50.0%` | ➖ |
+| **B** | 3 | `BC05S@60m` | `BC05` | `60m` | `Stage5_FDB` | `Fold1_2025` | **+0.2280** | `+1.22` | `55.0%` | ✅ |
+| **B** | 4 | `BC05S@30m` | `BC05` | `30m` | `Stage5_FDB` | `Fold1_2025` | **+0.0290** | `+0.35` | `48.3%` | ✅ |
+| **B** | 5 | `BC05L@60m` | `BC05` | `60m` | `Stage5_FDB` | `Fold2_2026` | **-0.3210** | `-2.79` | `33.3%` | ✅ |
 | **C** | 1 | `H1D_DZ01L@1d` | `H1D_DZ01` | `1d` | `Stage2_Rust` | `Fold1_2025` | **+0.3070** | `+4.12` | `61.7%` | ✅ |
 | **C** | 2 | `H1D_DZ01S@1d` | `H1D_DZ01` | `1d` | `Stage2_Rust` | `Fold2_2026` | **+0.0910** | `+5.68` | `51.7%` | ✅ |
 | **C** | 3 | `H1D_SP01S@1d` | `H1D_SP01` | `1d` | `Stage1_Base` | `Fold2_2026` | **+0.0440** | `+5.82` | `51.7%` | ✅ |
 | **C** | 4 | `CC01S@60m` | `CC01` | `60m` | `Stage1_Base` | `Fold2_2026` | **-0.1070** | `-1.21` | `43.3%` | ✅ |
 | **C** | 5 | `H15M_PB01L@15m` | `H15M_PB01` | `15m` | `Stage1_Base` | `Fold2_2026` | **-0.1900** | `-2.03` | `38.3%` | ✅ |
-| **D** | 1 | `DC02L@60m` | `DC02` | `60m` | `Stage1_Base` | `Fold2_2026` | **-0.2470** | `-4.26` | `36.7%` | ✅ |
-| **D** | 2 | `DC02L@30m` | `DC02` | `30m` | `Stage1_Base` | `Fold2_2026` | **-0.3470** | `-4.93` | `28.3%` | ✅ |
-| **D** | 3 | `H1D_RV01S@1d` | `H1D_RV01` | `1d` | `Stage1_Base` | `Fold1_2025` | **+0.1540** | `+1.66` | `55.0%` | ➖ |
-| **D** | 4 | `H60M_DC03S@60m` | `H60M_DC03` | `60m` | `Stage2_Rust` | `Fold1_2025` | **+0.1270** | `+0.92` | `51.7%` | ➖ |
-| **D** | 5 | `H1D_RV01L@1d` | `H1D_RV01` | `1d` | `Stage1_Base` | `Fold1_2025` | **+0.0260** | `+0.23` | `46.7%` | ➖ |
+| **D** | 1 | `DC06S@60m` | `DC06` | `60m` | `Stage5_FDB` | `Fold2_2026` | **-0.0780** | `-1.38` | `46.7%` | ✅ |
+| **D** | 2 | `DC06S@30m` | `DC06` | `30m` | `Stage5_FDB` | `Fold1_2025` | **-0.1460** | `-0.79` | `40.0%` | ✅ |
+| **D** | 3 | `DC06S@1d` | `DC06` | `1d` | `Stage5_FDB` | `Fold2_2026` | **-0.1520** | `-3.54` | `41.7%` | ✅ |
+| **D** | 4 | `DC06L@30m` | `DC06` | `30m` | `Stage5_FDB` | `Fold1_2025` | **-0.1580** | `-0.96` | `41.7%` | ✅ |
+| **D** | 5 | `DC06L@60m` | `DC06` | `60m` | `Stage5_FDB` | `Fold2_2026` | **-0.1620** | `-1.80` | `43.3%` | ✅ |
 | **E** | 1 | `EC05L@60m` | `EC05` | `60m` | `Stage4_CE` | `Fold2_2026` | **+0.0910** | `+0.73` | `61.7%` | ✅ |
 | **E** | 2 | `EC02S@60m` | `EC02` | `60m` | `Stage1_Base` | `Fold2_2026` | **+0.0010** | `-0.34` | `55.0%` | ✅ |
 | **E** | 3 | `H15M_CL01L@15m` | `H15M_CL01` | `15m` | `Stage1_Base` | `Fold2_2026` | **-0.1130** | `-2.22` | `48.3%` | ✅ |
 | **E** | 4 | `H15M_TN01L@15m` | `H15M_TN01` | `15m` | `Stage2_Rust` | `Fold2_2026` | **-0.1160** | `-1.81` | `35.0%` | ✅ |
 | **E** | 5 | `EC02L@60m` | `EC02` | `60m` | `Stage1_Base` | `Fold2_2026` | **-0.1240** | `-1.74` | `46.7%` | ✅ |
-| **F** | 1 | `FC03S@15m` | `FC03` | `15m` | `Stage1_Base` | `Fold2_2026` | **-0.2160** | `-3.00` | `36.7%` | ✅ |
-| **F** | 2 | `FC01L@30m` | `FC01` | `30m` | `Stage1_Base` | `Fold2_2026` | **-0.3090** | `-3.19` | `33.3%` | ✅ |
-| **F** | 3 | `FC02L@60m` | `FC02` | `60m` | `Stage1_Base` | `Fold1_2025` | **-0.4070** | `-4.03` | `35.0%` | ✅ |
-| **F** | 4 | `FC03L@60m` | `FC03` | `60m` | `Stage1_Base` | `Fold2_2026` | **+0.0060** | `-0.88` | `51.7%` | ➖ |
-| **F** | 5 | `FC03L@1d` | `FC03` | `1d` | `Stage1_Base` | `Fold1_2025` | **+0.0000** | `+0.00` | `0.0%` | ➖ |
+| **F** | 1 | `FC06L@1d` | `FC06` | `1d` | `Stage5_FDB` | `Fold1_2025` | **+0.3160** | `+3.24` | `58.3%` | ✅ |
+| **F** | 2 | `FC06S@1d` | `FC06` | `1d` | `Stage5_FDB` | `Fold2_2026` | **+0.0510** | `+1.85` | `56.7%` | ✅ |
+| **F** | 3 | `FC06S@60m` | `FC06` | `60m` | `Stage5_FDB` | `Fold1_2025` | **+0.0010** | `+0.13` | `48.3%` | ✅ |
+| **F** | 4 | `FC05S@60m` | `FC05` | `60m` | `Stage5_FDB` | `Fold2_2026` | **-0.0230** | `-0.11` | `60.0%` | ✅ |
+| **F** | 5 | `FC05L@1d` | `FC05` | `1d` | `Stage5_FDB` | `Fold2_2026` | **-0.0980** | `-1.68` | `48.3%` | ✅ |
 
-## 五、 28 个 SSOT 原子因子族 AST 静态血缘与依赖矩阵 (`catalog.py`)
+## 五、 32 个 SSOT 原子因子族 AST 静态血缘与依赖矩阵 (`catalog.py`)
 
 | 家族 (`family_id`) | 主簇 | 阶段 (`stage`) | 默认周期 | State 依赖数 | Strength 依赖 | OI 依赖 | CS 截面依赖 | HTF 依赖 | 代码指纹 (`code_sha256[:10]`) |
 | :--- | :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -105,6 +107,7 @@
 | `BC02` | **B** | `Stage1_Base` | `1d,60m,30m,15m,5m` | `2` | `-` | `-` | `-` | `-` | `3116bb41a5` |
 | `BC03` | **B** | `Stage2_Rust` | `1d,60m,30m,15m,5m` | `4` | `bi_div/fx` | `-` | `-` | `-` | `04a5c08b77` |
 | `BC04` | **B** | `Stage3_OI` | `1d,60m,30m,15m,5m` | `4` | `bi_div/fx` | `oi_chg_z/oi_flow3_z` | `-` | `-` | `99faedc31b` |
+| `BC05` | **B** | `Stage5_FDB` | `1d,60m,30m,15m,5m` | `6` | `bi_div/fx` | `oi_flow3_z` | `-` | `-` | `0945f1c324` |
 | `CC01` | **C** | `Stage1_Base` | `1d,60m,30m,15m,5m` | `0` | `zs_revert` | `-` | `-` | `-` | `103e33514c` |
 | `CC02` | **C** | `Stage1_Base` | `1d,60m,30m,15m,5m` | `0` | `-` | `-` | `-` | `-` | `b11751572e` |
 | `CC03` | **C** | `Stage2_Rust` | `1d,60m,30m,15m,5m` | `3` | `zs_revert` | `-` | `-` | `-` | `807e087306` |
@@ -115,6 +118,7 @@
 | `DC03` | **D** | `Stage2_Rust` | `1d,60m,30m,15m,5m` | `4` | `flow` | `-` | `-` | `-` | `397307441f` |
 | `DC04` | **D** | `Stage3_OI` | `1d,60m,30m,15m,5m` | `7` | `flow` | `oi_avail/oi_chg_z/oi_flow3_z` | `-` | `-` | `5b3990d627` |
 | `DC05` | **D** | `Stage3_OI` | `1d,60m,30m,15m,5m` | `7` | `flow` | `oi_chg_z/oi_flow3_z` | `-` | `-` | `c7780411f6` |
+| `DC06` | **D** | `Stage5_FDB` | `1d,60m,30m,15m,5m` | `7` | `flow` | `oi_chg_z/oi_flow3_z/oi_ratio` | `-` | `-` | `d63f78b7ed` |
 | `EC01` | **E** | `Stage1_Base` | `1d,60m,30m,15m,5m` | `0` | `squeeze` | `-` | `-` | `-` | `f50248c34c` |
 | `EC02` | **E** | `Stage1_Base` | `1d,60m,30m,15m,5m` | `0` | `-` | `-` | `-` | `-` | `e37312dc37` |
 | `EC03` | **E** | `Stage2_Rust` | `1d,60m,30m,15m,5m` | `4` | `squeeze` | `-` | `-` | `-` | `814c111f28` |
@@ -124,30 +128,33 @@
 | `FC02` | **F** | `Stage1_Base` | `1d,60m,30m,15m,5m` | `0` | `fx` | `-` | `leader_lag_gap/sector_leader_dir` | `-` | `b241ab0cbf` |
 | `FC03` | **F** | `Stage1_Base` | `1d,60m,30m,15m,5m` | `0` | `bi_div/fx/zs_revert` | `-` | `sector_spread_zscore` | `-` | `a4d70085be` |
 | `FC04` | **F** | `Stage1_Base` | `1d,60m,30m,15m,5m` | `0` | `zs_break` | `-` | `cs_strength_eff` | `-` | `2c537ac170` |
+| `FC05` | **F** | `Stage5_FDB` | `1d,60m,30m,15m,5m` | `5` | `fx` | `oi_flow3_z/oi_ratio` | `cs_strength_eff/leader_lag_gap/sector_leader_dir` | `-` | `03e63da156` |
+| `FC06` | **F** | `Stage5_FDB` | `1d,60m,30m,15m,5m` | `4` | `bi_div/fx` | `oi_flow3_z` | `leader_lag_gap/sector_spread_zscore` | `-` | `f72a54c91f` |
 
 ## 六、 待开采高优先级 Rust 原生信号推荐池 (`exact_mirror=True` & `consumed_count=0`)
 
-> 共发现 **118** 个已通过仿射反转严格镜像对称验证、且尚未接入现有原子因子族的原生 Rust 信号。以下按信号分类展示代表性蓝海信号：
+> 共发现 **104** 个已通过仿射反转严格镜像对称验证、且尚未接入现有原子因子族的原生 Rust 信号。以下按信号分类展示代表性蓝海信号：
 
 | 信号子模块 (`category`) | 待开采对称信号数 | 代表性未开采 `exact_mirror=True` 原生信号示例 |
 | :--- | :---: | :--- |
 | `ang` | `7` | `amv_up_dw_line_V230603`, `asi_up_dw_line_V230603`, `dema_up_dw_line_V230605`, `er_up_dw_line_V230604` |
-| `bar` | `28` | `bar_bpm_V230227`, `bar_classify_V240606`, `bar_classify_V240607`, `bar_intraday_direction_V260424` |
+| `bar` | `27` | `bar_bpm_V230227`, `bar_classify_V240606`, `bar_classify_V240607`, `bar_intraday_direction_V260424` |
 | `byi` | `1` | `byi_fx_num_V230628` |
-| `coo` | `2` | `coo_cci_V230323`, `coo_td_V221110` |
-| `cxt` | `21` | `cxt_bi_end_V230815`, `cxt_decision_V240526`, `cxt_fx_power_V221107`, `cxt_nine_bi_V230621` |
+| `coo` | `1` | `coo_td_V221110` |
+| `cxt` | `15` | `cxt_nine_bi_V230621`, `cxt_range_oscillation_V230620`, `cxt_bs_V240527`, `cxt_decision_V240612` |
 | `jcc` | `11` | `jcc_shan_chun_V221121`, `jcc_ping_tou_V221113`, `jcc_two_crow_V221108`, `jcc_szx_V221111` |
 | `obv` | `1` | `obv_up_dw_line_V230719` |
 | `pressure` | `1` | `pressure_support_V240406` |
-| `tas` | `36` | `tas_angle_V230802`, `tas_ma_round_V221206`, `tas_macd_base_V221028`, `tas_macd_base_V230320` |
-| `vol` | `3` | `vol_window_V230731`, `vol_double_ma_V230214`, `vol_single_ma_V230214` |
-| `xl` | `3` | `xl_bar_position_V240328`, `xl_bar_trend_V240330`, `xl_bar_basis_V240411` |
+| `tas` | `33` | `tas_angle_V230802`, `tas_ma_round_V221206`, `tas_macd_base_V221028`, `tas_macd_base_V230320` |
+| `vol` | `2` | `vol_double_ma_V230214`, `vol_single_ma_V230214` |
+| `xl` | `1` | `xl_bar_position_V240328` |
 | `zdy` | `4` | `zdy_dif_V230527`, `zdy_macd_V230527`, `zdy_macd_dif_iqr_V230521`, `zdy_bi_end_V230406` |
 
 ## 七、 失败实验墓地统计与典型淘汰案例 (`factor_graveyard`)
 
 | 淘汰门禁 (`failed_gate`) | 累计淘汰候选数 | 门禁拦截规则说明 |
 | :--- | :---: | :--- |
+| `Gate1B_Pool` | `2` | Full-60 跨品种池化正收益品种占比 < 50% 或 Pooled-t < 1.96 |
 | `Gate2_ColinearClone` | `9` | 同簇激活条件共线克隆 (|ρ| >= 0.80)，缺乏独立机制增量 |
 | `Gate2_HighActiveCorr` | `20` | 与已入库因子在活跃区高度正交冗余 (|ρ_active| >= 0.35) |
 | `Gate2_Weak1DPoolEdge` | `21` | 1d 日线跨品种池化稳健度或扣费后净夏普未达准入线 |
@@ -155,6 +162,7 @@
 | `Gate2_WeakIntradayPoolEdge` | `4` | 日内周期跨品种池化 t 统计量或正收益品种占比未达标 |
 | `Gate2_WeakPoolEdge` | `31` | 15m/30m 跨品种普适性不足 (Pooled-t < 1.96 或 PosRatio < 50%) |
 | `Gate3_NegativeMarginalSharpe` | `7` | 加入正交组合后扣费边际净夏普无正增益 (ΔSharpe <= 0) |
+| `Preflight` | `3` | 违反仿射镜像精确对称、存在前视数据泄漏或权重越界 |
 
 ### 最近归档的 Top 12 失败/冗余候选明细
 
