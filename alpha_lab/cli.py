@@ -155,6 +155,53 @@ def get_workbench_status(db: AlphaLabLedgerDB) -> dict[str, Any]:
     }
 
 
+def _append_concentration_ablation_section(lines: list[str]) -> None:
+    """追加 M0 ~ M6 动态稀疏聚焦破局双区间归因表与 14 个典型品种净贡献表."""
+    import pickle
+
+    from alpha_lab.concentration import REAL_CURVES_CACHE_PATH
+
+    if not REAL_CURVES_CACHE_PATH.exists():
+        return
+    bundle = pickle.loads(REAL_CURVES_CACHE_PATH.read_bytes())
+    schemes = bundle.get("schemes") or {}
+    if not schemes:
+        return
+    lines.append("### 3.2 破除 2026年4~9月 震荡磨损：M0 ~ M6 动态稀疏聚焦双区间实证归因")
+    lines.append("")
+    lines.append(
+        "| 机制方案 (`scheme_id`) | 全样本外年化 (`25.01~26.09`) | 全样本外 Sharpe | 全样本外回撤 | 全样本外 Calmar | `26.04~26.09` 震荡期年化 | `26.04~26.09` Sharpe | `26.04~26.09` 回撤 | `26.04~26.09` Calmar | 日均活跃品种 (`Breadth`) | 年化换手 (`Turnover`) |"
+    )
+    lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+    for sid, s in schemes.items():
+        fo = s["full_oos"]
+        ap = s["apr_sep_2026"]
+        lines.append(
+            f"| **{sid}** ({s['title'].split(' ', 1)[-1]}) | `{fo['annual_return_pct']:+.2f}%` | **{fo['net_sharpe']:+.2f}** | "
+            f"`{fo['max_drawdown_pct']:.2f}%` | `{fo['calmar']:+.2f}` | `{ap['annual_return_pct']:+.2f}%` | "
+            f"**{ap['net_sharpe']:+.2f}** | `{ap['max_drawdown_pct']:.2f}%` | `{ap['calmar']:+.2f}` | "
+            f"`{ap['active_breadth']:.1f}` | `{ap['annual_turnover']:.1f}x` |"
+        )
+    lines.append("")
+    lines.append("### 3.3 `2026-04 ~ 2026-09` 典型波段品种 vs 死水箱体品种单品种净贡献对比 (`%`)")
+    lines.append("")
+    lines.append(
+        "| 方案 | `lc` | `ag` | `au` | `sa` | `cj` | **下行波段合计** | `sc` | `bu` | `pg` | `ec` | `j` | **上行波段合计** | `oi` | `pb` | `ta` | `ao` | **死水箱体合计** |"
+    )
+    lines.append(
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
+    )
+    for sid, s in schemes.items():
+        kc = s["key_symbol_contrib_pct"]
+        lines.append(
+            f"| `{sid}` | `{kc['lc']:+.2f}%` | `{kc['ag']:+.2f}%` | `{kc['au']:+.2f}%` | `{kc['sa']:+.2f}%` | `{kc['cj']:+.2f}%` | "
+            f"**{s['down_wave_sum_pct']:+.2f}%** | `{kc['sc']:+.2f}%` | `{kc['bu']:+.2f}%` | `{kc['pg']:+.2f}%` | `{kc['ec']:+.2f}%` | `{kc['j']:+.2f}%` | "
+            f"**{s['up_wave_sum_pct']:+.2f}%** | `{kc['oi']:+.2f}%` | `{kc['pb']:+.2f}%` | `{kc['ta']:+.2f}%` | `{kc['ao']:+.2f}%` | "
+            f"**{s['chop_dead_sum_pct']:+.2f}%** |"
+        )
+    lines.append("")
+
+
 def generate_leaderboard_markdown(
     db: AlphaLabLedgerDB,
     output_path: str | Path | None = None,
@@ -284,6 +331,7 @@ def generate_leaderboard_markdown(
             f"`{float(r['inst_max_dd_pct']):.2f}%` | `{float(r['inst_calmar']):+.3f}` | `{float(r['avg_factors_per_asset']):.1f}` |"
         )
     lines.append("")
+    _append_concentration_ablation_section(lines)
 
     lines.append("## 四、 各主簇 (Cluster A~F) Top 准入因子排行榜 (`factor_pool_scores`)")
     lines.append("")

@@ -1409,6 +1409,13 @@ def _migrate_ablation_and_graveyard(db: AlphaLabLedgerDB, ablation_dir: Path) ->
             uid_b, failed_gate=gate_b, reason=rsn_b, family_id=fam_b, stage="Stage6_ACE", mean_is_sharpe=shp_b
         )
 
+    from alpha_lab.concentration import REAL_CURVES_CACHE_PATH, _sync_concentration_to_db
+
+    if REAL_CURVES_CACHE_PATH.exists():
+        import pickle
+
+        _sync_concentration_to_db(pickle.loads(REAL_CURVES_CACHE_PATH.read_bytes()), db=db)
+
 
 def migrate_historical_data_to_db(
     db_url: str | None = None,
@@ -1491,6 +1498,9 @@ def migrate_historical_data_to_db(
                 )
 
         _migrate_ablation_and_graveyard(active_db, ablation_dir)
+        from examples.multi_factor_cta.baseline_ma20_ma60_tsmom import sync_baseline_to_db
+
+        sync_baseline_to_db(db=active_db)
         return active_db.get_table_counts()
     finally:
         if owns_db:

@@ -214,7 +214,8 @@ _HTML_BODY_PART1 = """
         <div class="filter-group" style="flex-wrap:wrap;">
           <label>预设组合:</label>
           <select id="nav-preset" onchange="onNavPresetChange()">
-            <option value="stage_evo">Stage 1 ~ Stage 6 核心演进对比</option>
+            <option value="conc_breakout">🎯 M0 ~ M6 动态稀疏聚焦破局对比 (破除 2026年4~9月 震荡磨损)</option>
+            <option value="stage_evo">Stage 1 ~ Stage 6 核心演进对比 (真实日度净值)</option>
             <option value="univ_funnel">品种池漏斗筛选对比 (N=28/30/32/35/40 vs Full-60)</option>
             <option value="arch_1x">Full-60 架构变体对比 (1x 标准波动)</option>
             <option value="arch_3x">Full-60 3倍目标波动组合 (3x Target)</option>
@@ -222,9 +223,9 @@ _HTML_BODY_PART1 = """
           </select>
           <label>权重口径:</label>
           <select id="nav-metric" onchange="renderNavChart()">
-            <option value="inst">机构两层风险预算 (Institutional)</option>
-            <option value="flat">Flat-60 等权组合 (Flat HRP)</option>
-            <option value="both">同组合双口径对比 (实线=机构 / 虚线=等权)</option>
+            <option value="inst">动态稀疏聚焦 / 机构两层 (Focused / Inst)</option>
+            <option value="flat">Flat-60 静态等权基线 (Flat HRP)</option>
+            <option value="both">同组合双口径对比 (实线=聚焦 / 虚线=等权)</option>
           </select>
           <label>纵轴:</label>
           <select id="nav-unit" onchange="renderNavChart()">
@@ -240,8 +241,8 @@ _HTML_BODY_PART1 = """
     <div class="panel-card">
       <div class="panel-header">
         <div>
-          <div class="panel-title">📊 Stage 1 ~ Stage 6 & 品种池漏斗消融明细表 (`alpha_lab.ablation_runs`)</div>
-          <div class="panel-desc">勾选第一列「叠加净值」复选框可将任意策略组合曲线实时加入上方净值图对比</div>
+          <div class="panel-title">📊 M0~M6 动态稀疏聚焦 & Stage 1~6 消融明细表 (`alpha_lab.ablation_runs`)</div>
+          <div class="panel-desc">勾选第一列「叠加净值」复选框可将任意策略组合曲线实时加入上方净值图对比（全部采用 100% 真实因果逐日回测净值）</div>
         </div>
         <div class="filter-group">
           <label>阶段:</label>
@@ -249,6 +250,7 @@ _HTML_BODY_PART1 = """
           <label>模式:</label>
           <select id="ab-mode-filter" onchange="renderAblationTab()">
             <option value="">全部模式</option>
+            <option value="concentration_ablation">concentration_ablation (M0~M6 动态稀疏聚焦)</option>
             <option value="baseline">baseline (基线)</option>
             <option value="incremental">incremental (增量合成)</option>
             <option value="standalone">standalone (独立消融)</option>
@@ -577,7 +579,7 @@ const STATE = {
   liveMode: Boolean(window.__LIVE_MODE__) && window.location.protocol.startsWith('http'),
   snap: window.__INITIAL_SNAPSHOT__ || {},
   selectedNiche: { cluster: '', tf: '' },
-  selectedNavRuns: ['Stage1_Base_Full60', 'Stage2_Rust_Incremental', 'Stage3_OI_Incremental', 'Stage4_CE_Incremental', 'Stage5_FDB_Incremental', 'Stage6_ACE_Incremental'],
+  selectedNavRuns: ['M0_Static_Baseline', 'M1_TopK_Sparsity', 'M2_Regime_Ignition', 'M3_Probe_Runner_Pyramid', 'M4_Sector_Leader_Focus', 'M5_Rolling_Tradability_Mem', 'M6_Dynamic_Focused_Optimal'],
   activeNavSeries: [],
   assetOffset: 0,
   assetLimit: 100,
@@ -782,7 +784,13 @@ function renderAblationTab() {
 
 function onNavPresetChange() {
   const preset = document.getElementById('nav-preset').value;
-  if (preset === 'stage_evo') {
+  if (preset === 'conc_breakout') {
+    STATE.selectedNavRuns = [
+      'M0_Static_Baseline', 'M1_TopK_Sparsity', 'M2_Regime_Ignition',
+      'M3_Probe_Runner_Pyramid', 'M4_Sector_Leader_Focus',
+      'M5_Rolling_Tradability_Mem', 'M6_Dynamic_Focused_Optimal'
+    ];
+  } else if (preset === 'stage_evo') {
     STATE.selectedNavRuns = ['Stage1_Base_Full60', 'Stage2_Rust_Incremental', 'Stage3_OI_Incremental', 'Stage4_CE_Incremental', 'Stage5_FDB_Incremental', 'Stage6_ACE_Incremental'];
   } else if (preset === 'univ_funnel') {
     STATE.selectedNavRuns = [

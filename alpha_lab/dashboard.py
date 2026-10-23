@@ -67,14 +67,18 @@ def _df_to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
 
 
 def _load_base_equity_traces() -> tuple[list[str], dict[str, np.ndarray]]:
-    """提取或合成 Full-60 样本外 (2025-01-02 ~ 2026-09-30) 日度累计收益率基线序列。"""
+    """提取真实因果回测日度净值序列与 Full-60 样本外 (2025-01-02 ~ 2026-09-30) 基线序列。"""
     global _CACHED_BASE_TRACES
     if _CACHED_BASE_TRACES is not None:
         return _CACHED_BASE_TRACES
 
+    import pickle
+
+    from alpha_lab.concentration import REAL_CURVES_CACHE_PATH
+
     report_html = DEFAULT_ABLATION_DIR / "full60_cta_expansion_report.html"
     traces_map: dict[str, np.ndarray] = {}
-    dates: list[str] = []
+    html_dates: list[str] = []
     if report_html.exists():
         try:
             text = report_html.read_text(encoding="utf-8")
@@ -87,18 +91,33 @@ def _load_base_equity_traces() -> tuple[list[str], dict[str, np.ndarray]]:
                     name = str(tr.get("name", ""))
                     x_vals = tr.get("x") or []
                     y_obj = tr.get("y")
-                    if not dates and x_vals:
-                        dates = [str(x)[:10] for x in x_vals]
+                    if not html_dates and x_vals:
+                        html_dates = [str(x)[:10] for x in x_vals]
                     if isinstance(y_obj, dict) and "bdata" in y_obj:
-                        arr = np.frombuffer(base64.b64decode(y_obj["bdata"]), dtype=np.float64).copy()
-                        traces_map[name] = arr
+                        traces_map[name] = np.frombuffer(base64.b64decode(y_obj["bdata"]), dtype=np.float64).copy()
                     elif isinstance(y_obj, list):
                         traces_map[name] = np.asarray(y_obj, dtype=np.float64)
         except Exception:
             traces_map = {}
 
+    dates = list(html_dates)
+    if REAL_CURVES_CACHE_PATH.exists():
+        try:
+            bundle = pickle.loads(REAL_CURVES_CACHE_PATH.read_bytes())
+            real_dates = [str(x)[:10] for x in bundle.get("oos_dates", [])]
+            if real_dates:
+                if html_dates and len(html_dates) != len(real_dates):
+                    for k, arr in list(traces_map.items()):
+                        if len(arr) == len(html_dates):
+                            s = pd.Series(arr, index=html_dates)
+                            s = s[~s.index.duplicated(keep="last")].reindex(real_dates).ffill().fillna(0.0)
+                            traces_map[k] = s.to_numpy(dtype=np.float64)
+                dates = real_dates
+        except Exception:
+            pass
+
     if not dates:
-        dates = [d.strftime("%Y-%m-%d") for d in pd.bdate_range("2025-01-02", periods=503)]
+        dates = [d.strftime("%Y-%m-%d") for d in pd.bdate_range("2025-01-02", periods=424)]
     _CACHED_BASE_TRACES = (dates, traces_map)
     return _CACHED_BASE_TRACES
 
@@ -204,7 +223,7 @@ class AlphaLabDashboardService:
                 SELECT run_id, stage, mode, description, families_json,
                        flat60_ann_ret_pct, flat60_sharpe, flat60_max_dd_pct, flat60_calmar,
                        inst_ann_ret_pct, inst_sharpe, inst_max_dd_pct, inst_calmar,
-                       avg_factors_per_asset, oos_days, git_commit, created_at
+                       avg_factors_per_asset, oos_days, git_commit, metrics_json, created_at
                 FROM alpha_lab.ablation_runs
                 ORDER BY stage, inst_sharpe DESC, run_id
                 """
@@ -220,9 +239,39 @@ class AlphaLabDashboardService:
                     r["families"] = json.loads(raw_fams) if isinstance(raw_fams, str) else list(raw_fams)
                 except Exception:
                     r["families"] = []
+                meta_raw = r.pop("metrics_json", None) or "{}"
+                try:
+                    meta = json.loads(meta_raw) if isinstance(meta_raw, str) else dict(meta_raw)
+                except Exception:
+                    meta = {}
+                if isinstance(meta.get("metrics"), dict):
+                    meta = {**meta["metrics"], **meta}
+                if "apr_sep_2026" in meta:
+                    r["apr_sep_2026"] = meta["apr_sep_2026"]
+                elif "focused_apr_sep_2026" in meta:
+                    r["apr_sep_2026"] = meta["focused_apr_sep_2026"]
+                if "key_symbol_contrib_pct" in meta:
+                    r["key_symbol_contrib_pct"] = meta["key_symbol_contrib_pct"]
+
+                rc = meta.get("real_daily_curves")
+                if not rc and "flat60_cum_ret_pct" in meta and "inst_cum_ret_pct" in meta:
+                    f_cum = np.asarray(meta["flat60_cum_ret_pct"], dtype=np.float64)
+                    i_cum = np.asarray(meta["inst_cum_ret_pct"], dtype=np.float64)
+                    rc = {
+                        "flat_cum_pct": [round(float(x), 3) for x in f_cum],
+                        "flat_dd_pct": [round(float(x), 3) for x in (f_cum - np.maximum.accumulate(f_cum))],
+                        "inst_cum_pct": [round(float(x), 3) for x in i_cum],
+                        "inst_dd_pct": [round(float(x), 3) for x in (i_cum - np.maximum.accumulate(i_cum))],
+                    }
                 run_id = str(r.get("run_id", ""))
                 exact_tr = traces_map.get(run_id)
-                if exact_tr is not None and len(exact_tr) == n_days:
+                if rc and len(rc.get("inst_cum_pct", [])) == n_days:
+                    r["flat_cum_pct"] = list(rc["flat_cum_pct"])
+                    r["flat_dd_pct"] = list(rc["flat_dd_pct"])
+                    r["inst_cum_pct"] = list(rc["inst_cum_pct"])
+                    r["inst_dd_pct"] = list(rc["inst_dd_pct"])
+                    r["is_real_causal_curve"] = True
+                elif exact_tr is not None and len(exact_tr) == n_days:
                     dd_arr = exact_tr - np.maximum.accumulate(exact_tr)
                     cum_list = [round(float(x), 3) for x in exact_tr]
                     dd_list = [round(float(x), 3) for x in dd_arr]
@@ -230,6 +279,7 @@ class AlphaLabDashboardService:
                     r["flat_dd_pct"] = dd_list
                     r["inst_cum_pct"] = cum_list
                     r["inst_dd_pct"] = dd_list
+                    r["is_real_causal_curve"] = True
                 else:
                     seed = 0 if run_id == "Stage1_Base_Full60" else (idx + 1)
                     r["flat_cum_pct"], r["flat_dd_pct"] = _build_curve_from_template(
@@ -246,6 +296,7 @@ class AlphaLabDashboardService:
                         float(r.get("inst_max_dd_pct", 1.5)),
                         seed,
                     )
+                    r["is_real_causal_curve"] = False
             return rows
         finally:
             db.close()
