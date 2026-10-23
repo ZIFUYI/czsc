@@ -214,7 +214,7 @@ _HTML_BODY_PART1 = """
         <div class="filter-group" style="flex-wrap:wrap;">
           <label>预设组合:</label>
           <select id="nav-preset" onchange="onNavPresetChange()">
-            <option value="stage_evo">Stage 1 ~ Stage 5 核心演进对比</option>
+            <option value="stage_evo">Stage 1 ~ Stage 6 核心演进对比</option>
             <option value="univ_funnel">品种池漏斗筛选对比 (N=28/30/32/35/40 vs Full-60)</option>
             <option value="arch_1x">Full-60 架构变体对比 (1x 标准波动)</option>
             <option value="arch_3x">Full-60 3倍目标波动组合 (3x Target)</option>
@@ -240,7 +240,7 @@ _HTML_BODY_PART1 = """
     <div class="panel-card">
       <div class="panel-header">
         <div>
-          <div class="panel-title">📊 Stage 1 ~ Stage 5 & 品种池漏斗消融明细表 (`alpha_lab.ablation_runs`)</div>
+          <div class="panel-title">📊 Stage 1 ~ Stage 6 & 品种池漏斗消融明细表 (`alpha_lab.ablation_runs`)</div>
           <div class="panel-desc">勾选第一列「叠加净值」复选框可将任意策略组合曲线实时加入上方净值图对比</div>
         </div>
         <div class="filter-group">
@@ -476,7 +476,7 @@ _HTML_BODY_PART3 = """
     <div class="panel-card">
       <div class="panel-header">
         <div>
-          <div class="panel-title">🧬 28 个 SSOT 原子因子族 AST 静态血缘与 <1s 预检审计 (`preflight_audits` + `factor_signal_lineage`)</div>
+          <div class="panel-title">🧬 36 个 SSOT 原子因子族 AST 静态血缘与 <1s 预检审计 (`preflight_audits` + `factor_signal_lineage`)</div>
           <div class="panel-desc">自动提取五类特征依赖 (`state` / `strength` / `oi` / `cs` / `htf`) 并检验仿射反转对称性与零前视泄漏</div>
         </div>
         <div class="filter-group"><input type="text" id="lin-q" placeholder="搜索家族 / 信号 / 特征..." oninput="renderLineageTable()"></div>
@@ -577,7 +577,7 @@ const STATE = {
   liveMode: Boolean(window.__LIVE_MODE__) && window.location.protocol.startsWith('http'),
   snap: window.__INITIAL_SNAPSHOT__ || {},
   selectedNiche: { cluster: '', tf: '' },
-  selectedNavRuns: ['Stage1_Base_Full60', 'Stage2_Rust_Incremental', 'Stage3_OI_Incremental', 'Stage4_CE_Incremental'],
+  selectedNavRuns: ['Stage1_Base_Full60', 'Stage2_Rust_Incremental', 'Stage3_OI_Incremental', 'Stage4_CE_Incremental', 'Stage5_FDB_Incremental', 'Stage6_ACE_Incremental'],
   activeNavSeries: [],
   assetOffset: 0,
   assetLimit: 100,
@@ -783,7 +783,7 @@ function renderAblationTab() {
 function onNavPresetChange() {
   const preset = document.getElementById('nav-preset').value;
   if (preset === 'stage_evo') {
-    STATE.selectedNavRuns = ['Stage1_Base_Full60', 'Stage2_Rust_Incremental', 'Stage3_OI_Incremental', 'Stage4_CE_Incremental', 'Stage5_FDB_Incremental'];
+    STATE.selectedNavRuns = ['Stage1_Base_Full60', 'Stage2_Rust_Incremental', 'Stage3_OI_Incremental', 'Stage4_CE_Incremental', 'Stage5_FDB_Incremental', 'Stage6_ACE_Incremental'];
   } else if (preset === 'univ_funnel') {
     STATE.selectedNavRuns = [
       'Univ_0_Flat60_Baseline', 'Univ_1_Naive_Top32_Liquidity',

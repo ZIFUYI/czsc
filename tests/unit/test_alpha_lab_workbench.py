@@ -20,9 +20,9 @@ from examples.multi_factor_cta.atomic_factors import (
 
 
 def test_ast_scanner_extracts_all_five_dependency_classes_across_28_families():
-    """验证 AST 扫描器对全部 32 个已注册原子因子族准确提取 state / strength / oi / cs / htf 五类依赖，零遗漏。"""
+    """验证 AST 扫描器对全部 36 个已注册原子因子族准确提取 state / strength / oi / cs / htf 五类依赖，零遗漏。"""
     lineage_map = scan_all_atomic_factors()
-    assert len(lineage_map) == 32
+    assert len(lineage_map) == 36
     assert set(lineage_map) == set(ATOMIC_FACTOR_DEFS)
 
     # 验证每个因子族均有 64 位 SHA-256 指纹
@@ -35,12 +35,16 @@ def test_ast_scanner_extracts_all_five_dependency_classes_across_28_families():
     assert "ma_cls" in lineage_map["AC02"].states
     assert {"ma_joint", "double_ma", "bar_acc", "xl_trend", "xl_trend_v2"} <= set(lineage_map["AC03"].states)
     assert {"oi_flow3_z", "oi_ratio"} <= set(lineage_map["AC05"].oi_features)
+    assert {"dema_v1", "bi_trend_v1", "bar_brk_w20"} <= set(lineage_map["AC06"].states)
     assert {"plr_long", "plr_short", "zdy_dif", "clv"} <= set(lineage_map["DC03"].states)
     assert {"be_pause_v1", "be_verif_v1", "bs2_macd", "bs2_sma", "sym_zs_v1", "sym_zs_v2"} <= set(
         lineage_map["CC04"].states
     )
+    assert {"bs2_w9", "ubi_end_v1", "jcc_yun_v1", "jcc_xing_v2"} <= set(lineage_map["CC06"].states)
     assert {"cxt_dec_526", "macd_bs1_312", "fx_pwr_v1"} <= set(lineage_map["BC05"].states)
     assert {"xl_engulf", "xl_ma_flt", "dif_zero_614"} <= set(lineage_map["DC06"].states)
+    assert {"vol_dma", "dif_dist_409", "bar_dec_608"} <= set(lineage_map["DC07"].states)
+    assert {"zfzd_n5", "win_std_lo", "bar_triple_v1"} <= set(lineage_map["EC06"].states)
     assert {"bi_end_815", "vol_win_v1", "three_bi"} <= set(lineage_map["FC05"].states)
     assert {"sector_leader_dir", "leader_lag_gap", "cs_strength_eff"} <= set(lineage_map["FC05"].cs_features)
     assert {"sector_spread_zscore", "leader_lag_gap"} <= set(lineage_map["FC06"].cs_features)
@@ -149,7 +153,14 @@ def test_sqlite_memory_ledger_db_and_full_migration():
 
         # 验证按研发批次 (stage) 的 SQL 聚合查询
         stg_df = db.get_stage_score_summary()
-        assert set(stg_df["stage"]) == {"Stage1_Base", "Stage2_Rust", "Stage3_OI", "Stage4_CE", "Stage5_FDB"}
+        assert set(stg_df["stage"]) == {
+            "Stage1_Base",
+            "Stage2_Rust",
+            "Stage3_OI",
+            "Stage4_CE",
+            "Stage5_FDB",
+            "Stage6_ACE",
+        }
 
         # 验证组合消融轨迹与各簇 Top 因子榜查询
         abl_df = db.get_ablation_evolution_table()
@@ -158,6 +169,7 @@ def test_sqlite_memory_ledger_db_and_full_migration():
             "Stage3_OI_Incremental",
             "Stage4_CE_Incremental",
             "Stage5_FDB_Incremental",
+            "Stage6_ACE_Incremental",
         } <= set(abl_df["run_id"])
         top_df = db.get_top_factors_by_cluster(top_k=3)
         assert len(top_df) >= 12
@@ -200,7 +212,7 @@ def test_postgres_ledger_db_schema_and_counts():
 
 
 def test_preflight_audit_passes_all_28_families_and_catches_bad_candidates():
-    """验证 1 秒快速预检门禁对现有 28 个原子因子族 100% 通过，且 100% 拦截镜像不对称与前视偏差因子。"""
+    """验证 1 秒快速预检门禁对现有 36 个原子因子族 100% 通过，且 100% 拦截镜像不对称与前视偏差因子。"""
     import numpy as np
 
     from alpha_lab.ledger_db import AlphaLabLedgerDB
@@ -211,7 +223,7 @@ def test_preflight_audit_passes_all_28_families_and_catches_bad_candidates():
     db = AlphaLabLedgerDB("sqlite:///:memory:")
     try:
         df_ok = run_preflight_audit(db=db, persist=True)
-        assert len(df_ok) == 32
+        assert len(df_ok) == 36
         assert df_ok["passed"].all()
         assert (df_ok["setup_diff"] == 0).all()
         assert (df_ok["conf_diff"] == 0).all()
@@ -338,7 +350,7 @@ def test_cli_all_six_commands_and_leaderboard_generation(tmp_path):
     assert r_st.exit_code == 0, r_st.output
     st_data = json.loads(r_st.stdout)
     assert st_data["signal_coverage"]["total_kline_signals"] == 234
-    assert st_data["unconsumed_mirror_signals_count"] >= 100
+    assert st_data["unconsumed_mirror_signals_count"] >= 80
     assert set(st_data["niche_saturation"]["clusters"]) == {"A", "B", "C", "D", "E", "F"}
     assert set(st_data["niche_saturation"]["timeframes"]) == {"1d", "60m", "30m", "15m", "5m"}
 
@@ -407,7 +419,7 @@ def test_cli_all_six_commands_and_leaderboard_generation(tmp_path):
     assert md_out.exists()
     md_text = md_out.read_text(encoding="utf-8")
     assert "6×5 生态位饱和度矩阵" in md_text
-    assert "Stage 1 ~ Stage 5 全周期组合消融演进对比" in md_text
+    assert "Stage 1 ~ Stage 6 全周期组合消融演进对比" in md_text
     assert "TEST_EXP01@30m" in md_text
     assert DEFAULT_LEADERBOARD_PATH.exists()
 

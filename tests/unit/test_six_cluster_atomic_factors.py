@@ -161,11 +161,11 @@ def test_atomic_metadata_matches_hypothesis_bank(built):
     assert not hasattr(czsc, "alpha_lab")
     assert alpha_lab.ATOMIC_FACTOR_DEFS is ATOMIC_FACTOR_DEFS
     assert alpha_lab.STATE_SIGNAL_MANIFEST is af.STATE_SIGNAL_MANIFEST
-    assert len(af.STATE_SIGNAL_MANIFEST) >= 66
+    assert len(af.STATE_SIGNAL_MANIFEST) >= 85
     _, ctx, _ = built
     assert set(ctx.states) == set(af.STATE_SIGNAL_MANIFEST)
     stages = {d.stage for d in ATOMIC_FACTOR_DEFS.values()}
-    assert stages == {"Stage1_Base", "Stage2_Rust", "Stage3_OI", "Stage4_CE", "Stage5_FDB"}
+    assert stages == {"Stage1_Base", "Stage2_Rust", "Stage3_OI", "Stage4_CE", "Stage5_FDB", "Stage6_ACE"}
 
     for fam, fdef in ATOMIC_FACTOR_DEFS.items():
         for sfx, direction in (("L", 1), ("S", -1)):
@@ -340,10 +340,27 @@ def test_long_short_mirror_symmetry(family, built, mirrored):
 
 @pytest.mark.parametrize(
     "family",
-    ["AC05", "BC04", "BC05", "CC04", "CC05", "DC04", "DC05", "DC06", "EC04", "EC05", "FC05", "FC06"],
+    [
+        "AC05",
+        "AC06",
+        "BC04",
+        "BC05",
+        "CC04",
+        "CC05",
+        "CC06",
+        "DC04",
+        "DC05",
+        "DC06",
+        "DC07",
+        "EC04",
+        "EC05",
+        "EC06",
+        "FC05",
+        "FC06",
+    ],
 )
 def test_oi_microstructure_factors_with_open_interest_mirror_and_causality(family, built, mirrored):
-    """验证挂载真实 open_interest 时，Stage 3 ~ Stage 5 全部 OI 增强因子族保持严格镜像对称与截断因果一致。"""
+    """验证挂载真实 open_interest 时，Stage 3 ~ Stage 6 全部 OI 增强因子族保持严格镜像对称与截断因果一致。"""
     from examples.multi_factor_cta.atomic_factors import set_factor_context
 
     base_a, _, _ = built

@@ -221,13 +221,13 @@ def generate_leaderboard_markdown(
         f"| **Rust 原生 K 线信号总数 (`rust_signals`)** | `{counts['rust_signals']}` | 覆盖 17 个 Rust 信号子模块，含镜像对称审计标记 |"
     )
     lines.append(
-        f"| **已消费 K 线信号数** | `{sig_summary['consumed_kline_signals']} / {sig_summary['total_kline_signals']}` (`{sig_summary['coverage_ratio'] * 100:.2f}%`) | 67 个显式状态键 + 7 类结构强度信号 |"
+        f"| **已消费 K 线信号数** | `{sig_summary['consumed_kline_signals']} / {sig_summary['total_kline_signals']}` (`{sig_summary['coverage_ratio'] * 100:.2f}%`) | 85 个显式状态键 + 7 类结构强度信号 |"
     )
     lines.append(
         f"| **待开采精确镜像对称信号 (`exact_mirror=True`)** | `{len(unconsumed_df)}` | 已通过仿射反转严格对称检验、尚未被现有因子消费的蓝海信号 |"
     )
     lines.append(
-        f"| **SSOT 原子因子族 (`ATOMIC_FACTOR_DEFS`)** | `{len(ATOMIC_FACTOR_DEFS)}` | 覆盖 Stage1_Base (16) + Stage2_Rust (4) + Stage3_OI (4) + Stage4_CE (4) + Stage5_FDB (4) |"
+        f"| **SSOT 原子因子族 (`ATOMIC_FACTOR_DEFS`)** | `{len(ATOMIC_FACTOR_DEFS)}` | 覆盖 Stage1_Base (16) + Stage2_Rust (4) + Stage3_OI (4) + Stage4_CE (4) + Stage5_FDB (4) + Stage6_ACE (4) |"
     )
     lines.append(
         f"| **登记历史候选因子总数 (`factor_defs`)** | `{counts['factor_defs']}` | 含 {len(ATOMIC_FACTOR_DEFS)} 个原子族 + 跨周期异构候选变体 |"
@@ -245,7 +245,7 @@ def generate_leaderboard_markdown(
         f"| **全池准入汇总行 (`factor_pool_scores`)** | `{counts['factor_pool_scores']}` | Gate 1B 全品种池准入检验汇总 |"
     )
     lines.append(
-        f"| **组合消融归因记录 (`ablation_runs`)** | `{counts['ablation_runs']}` | Stage 1 ~ Stage 5 等权 / 机构两层风险预算组合样本外净值 |"
+        f"| **组合消融归因记录 (`ablation_runs`)** | `{counts['ablation_runs']}` | Stage 1 ~ Stage 6 等权 / 机构两层风险预算组合样本外净值 |"
     )
     lines.append(
         f"| **失败实验墓地记录 (`factor_graveyard`)** | `{counts['factor_graveyard']}` | 被 Gate 1B/2/3 或 Pre-flight 淘汰的证伪候选与原因归档 |"
@@ -270,7 +270,7 @@ def generate_leaderboard_markdown(
         lines.append("| " + " | ".join(row_cells) + " |")
     lines.append("")
 
-    lines.append("## 三、 Stage 1 ~ Stage 5 全周期组合消融演进对比 (`ablation_runs`)")
+    lines.append("## 三、 Stage 1 ~ Stage 6 全周期组合消融演进对比 (`ablation_runs`)")
     lines.append("")
     lines.append(
         "| 运行标识 (`run_id`) | 阶段 (`stage`) | 模式 (`mode`) | Flat-60 年化 | Flat-60 Sharpe | Flat-60 Calmar | 机构两层年化 | 机构两层 Sharpe | 机构最大回撤 | 机构 Calmar | 单品种均因子数 |"

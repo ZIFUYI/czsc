@@ -842,6 +842,22 @@ _EXTENDED_NATIVE_SIGNALS: tuple[dict, ...] = (
     {"name": "czsc.signals.tas_dif_zero_V240614", "di": 1},
     {"name": "czsc.signals.cxt_decision_V240526", "di": 1},
     {"name": "czsc.signals.tas_macd_bs1_V230312", "di": 1},
+    # Stage 6 (Stage6_ACE) 新增：A/C/E/D 剩余稀缺生态位靶向开采的 100% 严格价格镜像对称原生算子
+    {"name": "czsc.signals.dema_up_dw_line_V230605", "di": 1, "n": 20},
+    {"name": "czsc.signals.cxt_bi_trend_V230913", "di": 4, "n": 1},
+    {"name": "czsc.signals.bar_big_solid_V230215", "di": 1, "n": 20},
+    {"name": "czsc.signals.bar_break_V240428", "di": 1, "w": 20},
+    {"name": "czsc.signals.cxt_second_bs_V240524", "di": 1, "w": 9, "t": 2},
+    {"name": "czsc.signals.cxt_ubi_end_V230816"},
+    {"name": "czsc.signals.jcc_xing_xian_V221118", "di": 2, "th": 2},
+    {"name": "czsc.signals.zdy_bi_end_V230406"},
+    {"name": "czsc.signals.bar_zfzd_V241014", "n": 5},
+    {"name": "czsc.signals.bar_window_std_V230731", "di": 1, "w": 5, "m": 100, "n": 10},
+    {"name": "czsc.signals.bar_volatility_V241013", "w": 200, "n": 10},
+    {"name": "czsc.signals.bar_triple_V230506", "di": 1},
+    {"name": "czsc.signals.vol_double_ma_V230214", "di": 1, "ma_type": "SMA", "t1": 5, "t2": 20},
+    {"name": "czsc.signals.tas_macd_dist_V230409", "key": "DIF", "w": 100, "n": 10, "t": 20},
+    {"name": "czsc.signals.bar_decision_V240608", "w": 300, "n": 10, "q": 80},
 )
 
 

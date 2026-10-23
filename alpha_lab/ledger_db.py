@@ -1203,6 +1203,42 @@ def _migrate_ablation_and_graveyard(db: AlphaLabLedgerDB, ablation_dir: Path) ->
             "inst_calmar": 1.47,
             "avg_factors_per_asset": 1.8,
             "oos_days": 424,
+            "git_commit": "d1b669f",
+        },
+        {
+            "run_id": "Stage6_ACE_Incremental",
+            "stage": "Stage6_ACE",
+            "mode": "incremental",
+            "description": "Stage 6 增量 (Hist + Stage5 + A/C/E/D簇稀缺生态位收官4族)",
+            "families": ["AC06", "CC06", "EC06", "DC07"],
+            "flat60_ann_ret_pct": 3.28,
+            "flat60_sharpe": 1.46,
+            "flat60_max_dd_pct": 1.69,
+            "flat60_calmar": 1.94,
+            "inst_ann_ret_pct": 4.98,
+            "inst_sharpe": 2.18,
+            "inst_max_dd_pct": 1.55,
+            "inst_calmar": 3.21,
+            "avg_factors_per_asset": 7.8,
+            "oos_days": 424,
+            "git_commit": "HEAD",
+        },
+        {
+            "run_id": "Stage6_ACE_Standalone",
+            "stage": "Stage6_ACE",
+            "mode": "standalone",
+            "description": "Stage 6 独立回测 (仅 AC06/CC06/EC06/DC07 四族)",
+            "families": ["AC06", "CC06", "EC06", "DC07"],
+            "flat60_ann_ret_pct": 1.52,
+            "flat60_sharpe": 0.90,
+            "flat60_max_dd_pct": 1.79,
+            "flat60_calmar": 0.85,
+            "inst_ann_ret_pct": 2.40,
+            "inst_sharpe": 1.28,
+            "inst_max_dd_pct": 1.67,
+            "inst_calmar": 1.44,
+            "avg_factors_per_asset": 1.8,
+            "oos_days": 424,
             "git_commit": "HEAD",
         },
     ]
@@ -1324,6 +1360,55 @@ def _migrate_ablation_and_graveyard(db: AlphaLabLedgerDB, ablation_dir: Path) ->
             uid_b, failed_gate=gate_b, reason=rsn_b, family_id=fam_b, stage="Stage5_FDB", mean_is_sharpe=shp_b
         )
 
+    stage6_buried = (
+        (
+            "AC06_V0_ASI@1d",
+            "AC06",
+            "Preflight",
+            "asi_up_dw_line_V230603 仿射镜像反转下存在 1762 根 K 线不对称偏差",
+            -0.25,
+        ),
+        (
+            "CC06_V0_PS@60m",
+            "CC06",
+            "Preflight",
+            "pressure_support_V240406 仿射镜像反转下存在 391 根 K 线不对称偏差",
+            -0.16,
+        ),
+        (
+            "EC06_V0_ER@1d",
+            "EC06",
+            "Preflight",
+            "er_up_dw_line_V230604 仿射镜像反转下存在 2812 根 K 线不对称偏差",
+            -0.28,
+        ),
+        (
+            "DC07_V0_ADTM@1d",
+            "DC07",
+            "Preflight",
+            "adtm_up_dw_line_V230603 仿射镜像反转下存在 2179 根 K 线不对称偏差",
+            -0.21,
+        ),
+        (
+            "CC06L@1d",
+            "CC06",
+            "Gate1B_Pool",
+            "C簇顺势二买卖缩量回调做多在 1d 周期 Fold1_2025 未触发局部极值门禁，主攻 60m/30m",
+            -0.124,
+        ),
+        (
+            "DC07L@1d",
+            "DC07",
+            "Gate1B_Pool",
+            "D簇DIF远离双均量线突破做多在 1d 周期 Fold1_2025 样本受限，由 Fold2_2026 双边准入",
+            -0.186,
+        ),
+    )
+    for uid_b, fam_b, gate_b, rsn_b, shp_b in stage6_buried:
+        db.bury_factor(
+            uid_b, failed_gate=gate_b, reason=rsn_b, family_id=fam_b, stage="Stage6_ACE", mean_is_sharpe=shp_b
+        )
+
 
 def migrate_historical_data_to_db(
     db_url: str | None = None,
@@ -1332,7 +1417,7 @@ def migrate_historical_data_to_db(
     cache_dir: str | Path | None = None,
     include_extended_batches: bool = True,
 ) -> dict[str, int]:
-    """将散落于 CSV/PKL 的 Stage 1 ~ Stage 5 全量数据幂等迁入 PostgreSQL / SQLite 实验台账。"""
+    """将散落于 CSV/PKL 的 Stage 1 ~ Stage 6 全量数据幂等迁入 PostgreSQL / SQLite 实验台账。"""
     owns_db = db is None
     active_db = db if db is not None else AlphaLabLedgerDB(db_url=db_url, auto_init=True)
     try:
@@ -1370,6 +1455,7 @@ def migrate_historical_data_to_db(
             ("stage3_oi_cvolp_candidates_60.pkl", "Stage3_OI"),
             ("stage4_ce_candidates_60.pkl", "Stage4_CE"),
             ("stage5_fdb_candidates_60.pkl", "Stage5_FDB"),
+            ("stage6_ace_candidates_60.pkl", "Stage6_ACE"),
         ):
             p_path = c60 / pkl_name
             if p_path.exists():
