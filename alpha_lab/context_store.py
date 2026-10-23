@@ -181,6 +181,25 @@ def _resample_from_15m(df_15m: pd.DataFrame, symbol: str, tf: str) -> pd.DataFra
     return enriched
 
 
+def _ensure_cross_sectional_features(frames_map: dict[tuple[str, str], pd.DataFrame]) -> None:
+    """当同一周期存在 >=2 个品种且缺失因果截面列时，自动调用 compute_causal_cross_sectional_features 挂载。"""
+    from examples.multi_factor_cta.data_engine import compute_causal_cross_sectional_features
+
+    by_tf: dict[str, dict[str, pd.DataFrame]] = {}
+    for (aid, tf), df in frames_map.items():
+        by_tf.setdefault(tf, {})[aid] = df
+    for tf, pool in by_tf.items():
+        if len(pool) < 2:
+            continue
+        needs_cs = any(
+            not all(c in df.columns for c in ("cs_slope_rank", "sector_leader_dir", "sector_spread_zscore"))
+            for df in pool.values()
+        )
+        if needs_cs:
+            specs = {aid: FULL60_ASSET_SPECS.get(aid, (aid, "COMMODITY", 0.00015))[1] for aid in pool}
+            compute_causal_cross_sectional_features(pool, specs=specs, tf=tf, attach_to_dfs=True)
+
+
 class Full60ContextStore:
     """
     Full-60 跨品种多周期 FactorContext 预计算特征包缓存库。
@@ -200,6 +219,7 @@ class Full60ContextStore:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._entries: dict[tuple[str, str], CachedContextEntry] = dict(entries) if entries is not None else {}
         self._raw_dfs: dict[tuple[str, str], pd.DataFrame] = {}
+        self._loaded_pkl_path: Path | None = None
 
     @property
     def entries(self) -> dict[tuple[str, str], CachedContextEntry]:
@@ -286,6 +306,7 @@ class Full60ContextStore:
                     with open(pkl_path, "rb") as f:
                         payload = pickle.load(f)
                     store._entries = payload["entries"]
+                    store._loaded_pkl_path = pkl_path
                     store.patch_all_states()
                     return store
                 except Exception:
@@ -297,6 +318,7 @@ class Full60ContextStore:
                     all_entries = payload["entries"]
                     t_set, a_set = set(tfs), set(target_assets)
                     store._entries = {k: v for k, v in all_entries.items() if k[0] in a_set and k[1] in t_set}
+                    store._loaded_pkl_path = pkl_path if len(store._entries) == len(all_entries) else None
                     store.patch_all_states()
                     return store
                 except Exception:
@@ -335,6 +357,7 @@ class Full60ContextStore:
                     else:
                         frames_map[(aid, tf)] = _resample_from_15m(df15, sym, tf)
 
+        _ensure_cross_sectional_features(frames_map)
         store._raw_dfs = frames_map
         for (aid, tf), df in frames_map.items():
             sym, sec, fee = FULL60_ASSET_SPECS[aid]
@@ -352,6 +375,7 @@ class Full60ContextStore:
                 ctx=ctx,
             )
 
+        store._loaded_pkl_path = pkl_path
         with open(pkl_path, "wb") as f:
             pickle.dump({"entries": store._entries}, f, protocol=pickle.HIGHEST_PROTOCOL)
         return store
@@ -359,17 +383,43 @@ class Full60ContextStore:
     def get(self, asset: str, tf: str) -> CachedContextEntry:
         return self._entries[(asset, tf)]
 
+    def _lazy_load_raw_dfs_if_needed(self) -> None:
+        if self._raw_dfs:
+            return
+        remediation_frames_pkl = (
+            ROOT_DIR / "examples/results/cta_audit_remediation_20261021/full60/full60_inputs/multitf_grid15m_frames.pkl"
+        )
+        if not remediation_frames_pkl.exists():
+            return
+        with open(remediation_frames_pkl, "rb") as f:
+            all_frames = pickle.load(f)
+        for aid, tf in self._entries:
+            sym = FULL60_ASSET_SPECS.get(aid, (aid, "UNKNOWN", 0.00015))[0]
+            asset_dict = all_frames.get(sym) or all_frames.get(aid, {})
+            if tf in asset_dict:
+                self._raw_dfs[(aid, tf)] = asset_dict[tf]
+
     def patch_all_states(
         self,
         manifest: Mapping[str, tuple[str, int | None, str, str]] | None = None,
     ) -> dict[tuple[str, str], list[str]]:
         """对库内全部 FactorContext 执行增量状态热补丁，返回每个 (asset, tf) 注入的新状态键。"""
+        target_manifest = manifest if manifest is not None else STATE_SIGNAL_MANIFEST
+        needs_patch = any(any(k not in e.ctx.states for k in target_manifest) for e in self._entries.values())
+        if needs_patch and not self._raw_dfs and manifest is None:
+            self._lazy_load_raw_dfs_if_needed()
         patched: dict[tuple[str, str], list[str]] = {}
         for key, entry in self._entries.items():
             raw_df = self._raw_dfs.get(key)
             added = patch_context_states(entry.ctx, raw_df, manifest=manifest)
             if added:
                 patched[key] = added
+        if patched and manifest is None and self._loaded_pkl_path is not None:
+            try:
+                with open(self._loaded_pkl_path, "wb") as f:
+                    pickle.dump({"entries": self._entries}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception:
+                pass
         return patched
 
     def evaluate_families(

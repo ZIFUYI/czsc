@@ -834,6 +834,14 @@ _EXTENDED_NATIVE_SIGNALS: tuple[dict, ...] = (
     {"name": "czsc.signals.xl_bar_basis_V240412"},
     {"name": "czsc.signals.xl_bar_trend_V240623"},
     {"name": "czsc.signals.coo_sar_V230325"},
+    # Stage 5 (Stage5_FDB) 新增：F/D/B 稀缺生态位靶向开采的 100% 严格价格镜像对称原生算子
+    {"name": "czsc.signals.cxt_bi_end_V230815", "di": 1},
+    {"name": "czsc.signals.vol_window_V230731", "di": 1, "w": 5, "n": 20},
+    {"name": "czsc.signals.xl_bar_basis_V240411", "di": 1},
+    {"name": "czsc.signals.xl_bar_trend_V240330", "di": 1},
+    {"name": "czsc.signals.tas_dif_zero_V240614", "di": 1},
+    {"name": "czsc.signals.cxt_decision_V240526", "di": 1},
+    {"name": "czsc.signals.tas_macd_bs1_V230312", "di": 1},
 )
 
 

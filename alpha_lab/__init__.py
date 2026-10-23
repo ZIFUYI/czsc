@@ -238,6 +238,12 @@ __all__ = [
     "sync_atomic_specs_to_hypothesis_bank",
     "two_stage_trigger",
     "unregister_atomic_factor_def",
+    "AlphaLabDashboardService",
+    "DEFAULT_DASHBOARD_HTML_PATH",
+    "create_dashboard_server",
+    "export_dashboard_html",
+    "serve_dashboard",
+    "validate_readonly_sql",
 ]
 
 
@@ -246,4 +252,15 @@ def __getattr__(name: str):
         from alpha_lab import cli as _cli
 
         return getattr(_cli, name)
+    if name in (
+        "AlphaLabDashboardService",
+        "DEFAULT_DASHBOARD_HTML_PATH",
+        "create_dashboard_server",
+        "export_dashboard_html",
+        "serve_dashboard",
+        "validate_readonly_sql",
+    ):
+        from alpha_lab import dashboard as _dashboard
+
+        return getattr(_dashboard, name)
     raise AttributeError(f"module 'alpha_lab' has no attribute {name!r}")

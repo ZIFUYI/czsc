@@ -221,16 +221,16 @@ def generate_leaderboard_markdown(
         f"| **Rust 原生 K 线信号总数 (`rust_signals`)** | `{counts['rust_signals']}` | 覆盖 17 个 Rust 信号子模块，含镜像对称审计标记 |"
     )
     lines.append(
-        f"| **已消费 K 线信号数** | `{sig_summary['consumed_kline_signals']} / {sig_summary['total_kline_signals']}` (`{sig_summary['coverage_ratio'] * 100:.2f}%`) | 50 个显式状态键 + 7 类结构强度信号 |"
+        f"| **已消费 K 线信号数** | `{sig_summary['consumed_kline_signals']} / {sig_summary['total_kline_signals']}` (`{sig_summary['coverage_ratio'] * 100:.2f}%`) | 67 个显式状态键 + 7 类结构强度信号 |"
     )
     lines.append(
         f"| **待开采精确镜像对称信号 (`exact_mirror=True`)** | `{len(unconsumed_df)}` | 已通过仿射反转严格对称检验、尚未被现有因子消费的蓝海信号 |"
     )
     lines.append(
-        f"| **SSOT 原子因子族 (`ATOMIC_FACTOR_DEFS`)** | `{len(ATOMIC_FACTOR_DEFS)}` | 覆盖 Stage1_Base (16) + Stage2_Rust (4) + Stage3_OI (4) + Stage4_CE (4) |"
+        f"| **SSOT 原子因子族 (`ATOMIC_FACTOR_DEFS`)** | `{len(ATOMIC_FACTOR_DEFS)}` | 覆盖 Stage1_Base (16) + Stage2_Rust (4) + Stage3_OI (4) + Stage4_CE (4) + Stage5_FDB (4) |"
     )
     lines.append(
-        f"| **登记历史候选因子总数 (`factor_defs`)** | `{counts['factor_defs']}` | 含 28 个原子族 + 137 个跨周期异构候选变体 |"
+        f"| **登记历史候选因子总数 (`factor_defs`)** | `{counts['factor_defs']}` | 含 {len(ATOMIC_FACTOR_DEFS)} 个原子族 + 跨周期异构候选变体 |"
     )
     lines.append(
         f"| **因子↔信号血缘边数 (`factor_signal_lineage`)** | `{counts['factor_signal_lineage']}` | AST 静态扫描自动提取的 `state`/`strength` 依赖边 |"
@@ -245,7 +245,7 @@ def generate_leaderboard_markdown(
         f"| **全池准入汇总行 (`factor_pool_scores`)** | `{counts['factor_pool_scores']}` | Gate 1B 全品种池准入检验汇总 |"
     )
     lines.append(
-        f"| **组合消融归因记录 (`ablation_runs`)** | `{counts['ablation_runs']}` | Stage 1 ~ Stage 4 等权 / 机构两层风险预算组合样本外净值 |"
+        f"| **组合消融归因记录 (`ablation_runs`)** | `{counts['ablation_runs']}` | Stage 1 ~ Stage 5 等权 / 机构两层风险预算组合样本外净值 |"
     )
     lines.append(
         f"| **失败实验墓地记录 (`factor_graveyard`)** | `{counts['factor_graveyard']}` | 被 Gate 1B/2/3 或 Pre-flight 淘汰的证伪候选与原因归档 |"
@@ -270,7 +270,7 @@ def generate_leaderboard_markdown(
         lines.append("| " + " | ".join(row_cells) + " |")
     lines.append("")
 
-    lines.append("## 三、 Stage 1 ~ Stage 4 全周期组合消融演进对比 (`ablation_runs`)")
+    lines.append("## 三、 Stage 1 ~ Stage 5 全周期组合消融演进对比 (`ablation_runs`)")
     lines.append("")
     lines.append(
         "| 运行标识 (`run_id`) | 阶段 (`stage`) | 模式 (`mode`) | Flat-60 年化 | Flat-60 Sharpe | Flat-60 Calmar | 机构两层年化 | 机构两层 Sharpe | 机构最大回撤 | 机构 Calmar | 单品种均因子数 |"
@@ -310,7 +310,7 @@ def generate_leaderboard_markdown(
                 )
     lines.append("")
 
-    lines.append("## 五、 28 个 SSOT 原子因子族 AST 静态血缘与依赖矩阵 (`catalog.py`)")
+    lines.append(f"## 五、 {len(ATOMIC_FACTOR_DEFS)} 个 SSOT 原子因子族 AST 静态血缘与依赖矩阵 (`catalog.py`)")
     lines.append("")
     lines.append(
         "| 家族 (`family_id`) | 主簇 | 阶段 (`stage`) | 默认周期 | State 依赖数 | Strength 依赖 | OI 依赖 | CS 截面依赖 | HTF 依赖 | 代码指纹 (`code_sha256[:10]`) |"
@@ -523,6 +523,40 @@ def cmd_report(
         _emit(payload, as_json)
     finally:
         db.close()
+
+
+@app.command("dashboard")
+def cmd_dashboard(
+    host: str = typer.Option("127.0.0.1", "--host", help="Web 服务监听地址"),
+    port: int = typer.Option(8765, "--port", "-p", help="Web 服务监听端口"),
+    export_html: str | None = typer.Option(
+        None, "--export", "-e", help="导出独立静态 HTML 路径（若不传 --serve 则仅导出后退出）"
+    ),
+    serve: bool = typer.Option(False, "--serve", help="同时启动本地 HTTP 实时查询服务"),
+    open_browser: bool = typer.Option(False, "--open", help="启动服务后自动打开浏览器"),
+    db_url: str | None = typer.Option(None, "--db-url", help="PostgreSQL 或 SQLite 连接串"),
+    as_json: bool = typer.Option(False, "--json", help="输出结构化 JSON"),
+) -> None:
+    """启动 AlphaLab 投研台账与回测结果前端查询服务，或导出自包含静态 HTML 看板。"""
+    from alpha_lab.dashboard import export_dashboard_html, serve_dashboard
+
+    if export_html is not None and not serve:
+        out_path = export_dashboard_html(db_url=db_url, output_path=export_html)
+        payload = {
+            "status": "OK",
+            "mode": "export_html",
+            "output_path": str(out_path),
+            "bytes": out_path.stat().st_size,
+        }
+        _emit(payload, as_json)
+        return
+
+    if export_html is not None:
+        export_dashboard_html(db_url=db_url, output_path=export_html)
+
+    if not as_json:
+        typer.echo(f"🚀 AlphaLab 前端查询工作台已启动: http://{host}:{port}/")
+    serve_dashboard(host=host, port=port, db_url=db_url, open_browser=open_browser)
 
 
 if __name__ == "__main__":

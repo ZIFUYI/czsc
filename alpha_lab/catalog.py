@@ -88,6 +88,23 @@ NATIVE_CZSC_SIGNAL_MAP: dict[str, str] = {
     "zs_fm_v1": "zdy_zs_V230423",
     "acc_w10": "bar_accelerate_V221110",
     "doji_rev": "xl_bar_trend_V240329",
+    "fx_pwr_v1": "cxt_fx_power_V221107",
+    "fx_pwr_v2": "cxt_fx_power_V221107",
+    "be_macd_v1": "cxt_bi_end_V230312",
+    "seven_bi": "cxt_seven_bi_V230620",
+    "three_bi": "cxt_three_bi_V230618",
+    "cci_bs_v1": "coo_cci_V230323",
+    "cci_bs_v2": "coo_cci_V230323",
+    "rsi_bs_v1": "tas_rsi_base_V230227",
+    "dual_thrust": "bar_dual_thrust_V230403",
+    "bi_end_815": "cxt_bi_end_V230815",
+    "vol_win_v1": "vol_window_V230731",
+    "vol_win_v2": "vol_window_V230731",
+    "xl_engulf": "xl_bar_basis_V240411",
+    "xl_ma_flt": "xl_bar_trend_V240330",
+    "dif_zero_614": "tas_dif_zero_V240614",
+    "cxt_dec_526": "cxt_decision_V240526",
+    "macd_bs1_312": "tas_macd_bs1_V230312",
 }
 
 STRENGTH_RUST_SIGNAL_MAP: dict[str, str] = {

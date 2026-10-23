@@ -20,9 +20,9 @@ from examples.multi_factor_cta.atomic_factors import (
 
 
 def test_ast_scanner_extracts_all_five_dependency_classes_across_28_families():
-    """验证 AST 扫描器对全部 28 个现有原子因子族准确提取 state / strength / oi / cs / htf 五类依赖，零遗漏。"""
+    """验证 AST 扫描器对全部 32 个已注册原子因子族准确提取 state / strength / oi / cs / htf 五类依赖，零遗漏。"""
     lineage_map = scan_all_atomic_factors()
-    assert len(lineage_map) == 28
+    assert len(lineage_map) == 32
     assert set(lineage_map) == set(ATOMIC_FACTOR_DEFS)
 
     # 验证每个因子族均有 64 位 SHA-256 指纹
@@ -39,6 +39,11 @@ def test_ast_scanner_extracts_all_five_dependency_classes_across_28_families():
     assert {"be_pause_v1", "be_verif_v1", "bs2_macd", "bs2_sma", "sym_zs_v1", "sym_zs_v2"} <= set(
         lineage_map["CC04"].states
     )
+    assert {"cxt_dec_526", "macd_bs1_312", "fx_pwr_v1"} <= set(lineage_map["BC05"].states)
+    assert {"xl_engulf", "xl_ma_flt", "dif_zero_614"} <= set(lineage_map["DC06"].states)
+    assert {"bi_end_815", "vol_win_v1", "three_bi"} <= set(lineage_map["FC05"].states)
+    assert {"sector_leader_dir", "leader_lag_gap", "cs_strength_eff"} <= set(lineage_map["FC05"].cs_features)
+    assert {"sector_spread_zscore", "leader_lag_gap"} <= set(lineage_map["FC06"].cs_features)
     assert {"htf_dir", "htf_q"} == set(lineage_map["FC01"].htf_features)
     assert {"xs", "has_external_cs"} <= set(lineage_map["FC01"].cs_features)
     assert {"sector_leader_dir", "leader_lag_gap"} <= set(lineage_map["FC02"].cs_features)
@@ -144,11 +149,16 @@ def test_sqlite_memory_ledger_db_and_full_migration():
 
         # 验证按研发批次 (stage) 的 SQL 聚合查询
         stg_df = db.get_stage_score_summary()
-        assert set(stg_df["stage"]) == {"Stage1_Base", "Stage2_Rust", "Stage3_OI", "Stage4_CE"}
+        assert set(stg_df["stage"]) == {"Stage1_Base", "Stage2_Rust", "Stage3_OI", "Stage4_CE", "Stage5_FDB"}
 
         # 验证组合消融轨迹与各簇 Top 因子榜查询
         abl_df = db.get_ablation_evolution_table()
-        assert {"Stage1_Base_Full60", "Stage3_OI_Incremental", "Stage4_CE_Incremental"} <= set(abl_df["run_id"])
+        assert {
+            "Stage1_Base_Full60",
+            "Stage3_OI_Incremental",
+            "Stage4_CE_Incremental",
+            "Stage5_FDB_Incremental",
+        } <= set(abl_df["run_id"])
         top_df = db.get_top_factors_by_cluster(top_k=3)
         assert len(top_df) >= 12
 
@@ -201,7 +211,7 @@ def test_preflight_audit_passes_all_28_families_and_catches_bad_candidates():
     db = AlphaLabLedgerDB("sqlite:///:memory:")
     try:
         df_ok = run_preflight_audit(db=db, persist=True)
-        assert len(df_ok) == 28
+        assert len(df_ok) == 32
         assert df_ok["passed"].all()
         assert (df_ok["setup_diff"] == 0).all()
         assert (df_ok["conf_diff"] == 0).all()
@@ -397,6 +407,104 @@ def test_cli_all_six_commands_and_leaderboard_generation(tmp_path):
     assert md_out.exists()
     md_text = md_out.read_text(encoding="utf-8")
     assert "6×5 生态位饱和度矩阵" in md_text
-    assert "Stage 1 ~ Stage 4 全周期组合消融演进对比" in md_text
+    assert "Stage 1 ~ Stage 5 全周期组合消融演进对比" in md_text
     assert "TEST_EXP01@30m" in md_text
     assert DEFAULT_LEADERBOARD_PATH.exists()
+
+
+def test_dashboard_service_http_api_and_static_html_export(tmp_path):
+    """验证 AlphaLabDashboardService、HTTP REST API、只读 SQL 安全拦截与静态 HTML 导出。"""
+    import json
+    import threading
+    import urllib.error
+    import urllib.request
+
+    import pytest
+    from typer.testing import CliRunner
+
+    from alpha_lab.cli import app
+    from alpha_lab.dashboard import (
+        AlphaLabDashboardService,
+        create_dashboard_server,
+        validate_readonly_sql,
+    )
+    from alpha_lab.ledger_db import AlphaLabLedgerDB, migrate_historical_data_to_db
+
+    # 1. 只读 SQL 校验器测试
+    assert validate_readonly_sql("SELECT COUNT(*) FROM alpha_lab.ablation_runs;") == (
+        "SELECT COUNT(*) FROM alpha_lab.ablation_runs"
+    )
+    for bad_sql in (
+        "DROP TABLE alpha_lab.ablation_runs",
+        "DELETE FROM alpha_lab.factor_graveyard",
+        "SELECT 1; SELECT 2",
+        "UPDATE alpha_lab.rust_signals SET consumed_count = 0",
+    ):
+        with pytest.raises(ValueError):
+            validate_readonly_sql(bad_sql)
+
+    # 2. 基于临时 SQLite 台账验证 DashboardService 与 CLI 导出
+    sqlite_file = tmp_path / "dash_test.sqlite"
+    db_url = f"sqlite:///{sqlite_file}"
+    db = AlphaLabLedgerDB(db_url)
+    migrate_historical_data_to_db(db=db)
+    db.close()
+
+    svc = AlphaLabDashboardService(db_url)
+    ov = svc.get_overview()
+    assert ov["table_counts"]["rust_signals"] == 234
+    assert len(svc.get_ablation_runs()) >= 10
+    assert len(svc.get_pool_scores(gate1b_only=True)) > 0
+    asset_res = svc.get_asset_scores(sector="PRECIOUS_METALS", limit=10, offset=0)
+    assert asset_res["summary"]["total_rows"] > 0
+    assert len(asset_res["rows"]) <= 10
+
+    # 3. 启动后台 HTTP 服务验证 REST 端点与 POST /api/sql
+    server = create_dashboard_server(host="127.0.0.1", port=0, db_url=db_url)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{port}"
+        with urllib.request.urlopen(f"{base_url}/") as resp:
+            html_index = resp.read().decode("utf-8")
+            assert "CZSC AlphaLab" in html_index
+            assert "window.__LIVE_MODE__ = true;" in html_index
+
+        with urllib.request.urlopen(f"{base_url}/api/asset-scores?sector=FERROUS&limit=5") as resp:
+            as_json = json.loads(resp.read().decode("utf-8"))
+            assert len(as_json["rows"]) == 5
+
+        req_ok = urllib.request.Request(
+            f"{base_url}/api/sql",
+            data=json.dumps(
+                {"sql": "SELECT stage, COUNT(*) AS cnt FROM alpha_lab.ablation_runs GROUP BY stage"}
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_ok) as resp:
+            sql_json = json.loads(resp.read().decode("utf-8"))
+            assert sql_json["status"] == "OK"
+            assert sql_json["total_rows"] >= 4
+
+        req_bad = urllib.request.Request(
+            f"{base_url}/api/sql",
+            data=json.dumps({"sql": "DELETE FROM alpha_lab.ablation_runs"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req_bad)
+        assert exc_info.value.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    # 4. 验证 CLI dashboard --export
+    runner = CliRunner()
+    html_out = tmp_path / "DASHBOARD.html"
+    r_exp = runner.invoke(app, ["dashboard", "--export", str(html_out), "--db-url", db_url, "--json"])
+    assert r_exp.exit_code == 0, r_exp.output
+    assert html_out.exists()
+    assert "window.__LIVE_MODE__ = false;" in html_out.read_text(encoding="utf-8")
