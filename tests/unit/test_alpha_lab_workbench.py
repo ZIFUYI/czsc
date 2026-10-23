@@ -301,3 +301,102 @@ def test_full60_context_store_parity_hot_patch_and_speed():
     )
     assert sop_out["status"] == "OK"
     assert len(sop_out["ablation_runs"]) == 2
+
+
+def test_cli_all_six_commands_and_leaderboard_generation(tmp_path):
+    """验证 alpha_lab.cli 全部 6 个子命令 (migrate-db/status/preflight/eval/bury/report) 及 FACTORS_LEADERBOARD.md 生成。"""
+    import json
+
+    from typer.testing import CliRunner
+
+    from alpha_lab.cli import DEFAULT_LEADERBOARD_PATH, app
+
+    runner = CliRunner()
+    sqlite_file = tmp_path / "cli_test.sqlite"
+    db_url = f"sqlite:///{sqlite_file}"
+
+    # 1. migrate-db --json
+    r_mig = runner.invoke(app, ["migrate-db", "--db-url", db_url, "--json"])
+    assert r_mig.exit_code == 0, r_mig.output
+    mig_data = json.loads(r_mig.stdout)
+    assert mig_data["status"] == "OK"
+    assert mig_data["table_counts"]["rust_signals"] == 234
+    assert mig_data["table_counts"]["factor_asset_scores"] >= 47000
+
+    # 2. status --json
+    r_st = runner.invoke(app, ["status", "--db-url", db_url, "--json"])
+    assert r_st.exit_code == 0, r_st.output
+    st_data = json.loads(r_st.stdout)
+    assert st_data["signal_coverage"]["total_kline_signals"] == 234
+    assert st_data["unconsumed_mirror_signals_count"] >= 100
+    assert set(st_data["niche_saturation"]["clusters"]) == {"A", "B", "C", "D", "E", "F"}
+    assert set(st_data["niche_saturation"]["timeframes"]) == {"1d", "60m", "30m", "15m", "5m"}
+
+    # 3. preflight --families AC01,CC04,EC05 --json
+    r_pf = runner.invoke(app, ["preflight", "--families", "AC01,CC04,EC05", "--db-url", db_url, "--json"])
+    assert r_pf.exit_code == 0, r_pf.output
+    pf_data = json.loads(r_pf.stdout)
+    assert pf_data["status"] == "OK"
+    assert pf_data["passed"] == 3
+
+    # 4. eval --families CC04,EC05 --tfs 30m --assets au,rb --json
+    r_ev = runner.invoke(
+        app,
+        [
+            "eval",
+            "--families",
+            "CC04,EC05",
+            "--stage",
+            "Stage4_CE",
+            "--tfs",
+            "30m",
+            "--assets",
+            "au,rb",
+            "--db-url",
+            db_url,
+            "--json",
+        ],
+    )
+    assert r_ev.exit_code == 0, r_ev.output
+    ev_data = json.loads(r_ev.stdout)
+    assert ev_data["status"] == "OK"
+    assert ev_data["asset_score_rows"] == 16
+    assert ev_data["pool_score_rows"] == 8
+
+    # 5. bury --json
+    r_bu = runner.invoke(
+        app,
+        [
+            "bury",
+            "--family-id",
+            "TEST_EXP01",
+            "--candidate-key",
+            "TEST_EXP01@30m",
+            "--stage",
+            "Stage4_CE",
+            "--failed-gate",
+            "Gate2_WeakPoolEdge",
+            "--reason",
+            "单元测试模拟淘汰",
+            "--db-url",
+            db_url,
+            "--json",
+        ],
+    )
+    assert r_bu.exit_code == 0, r_bu.output
+    bu_data = json.loads(r_bu.stdout)
+    assert bu_data["status"] == "OK"
+    assert bu_data["candidate_key"] == "TEST_EXP01@30m"
+
+    # 6. report --output ... --json
+    md_out = tmp_path / "FACTORS_LEADERBOARD.md"
+    r_rp = runner.invoke(app, ["report", "--output", str(md_out), "--db-url", db_url, "--json"])
+    assert r_rp.exit_code == 0, r_rp.output
+    rp_data = json.loads(r_rp.stdout)
+    assert rp_data["status"] == "OK"
+    assert md_out.exists()
+    md_text = md_out.read_text(encoding="utf-8")
+    assert "6×5 生态位饱和度矩阵" in md_text
+    assert "Stage 1 ~ Stage 4 全周期组合消融演进对比" in md_text
+    assert "TEST_EXP01@30m" in md_text
+    assert DEFAULT_LEADERBOARD_PATH.exists()

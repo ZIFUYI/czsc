@@ -65,7 +65,7 @@ class RuleFactorRegistry:
         self._load_builtin_rule_factors()
 
     def _load_builtin_rule_factors(self) -> None:
-        for spec in BASE_SEED_SIGNALS + CANDIDATE_HYPOTHESIS_POOL:
+        for spec in list(BASE_SEED_SIGNALS) + list(CANDIDATE_HYPOTHESIS_POOL) + list(ALL_SIGNAL_SPECS.values()):
             self._factors[spec.sig_id] = RuleFactorSpec(
                 factor_id=spec.sig_id,
                 name=spec.name,

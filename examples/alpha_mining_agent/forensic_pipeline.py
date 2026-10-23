@@ -1411,3 +1411,8 @@ def backtest_slice(df_30m_slice: pd.DataFrame, w_slice: np.ndarray) -> dict[str,
         "nav_series": nav_s,
         "dd_series": dd_s,
     }
+
+
+from examples.alpha_mining_agent.hypothesis_bank import _bootstrap_atomic_ssot as _sync_ssot  # noqa: E402
+
+_sync_ssot()

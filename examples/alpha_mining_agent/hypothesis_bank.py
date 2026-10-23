@@ -2207,6 +2207,10 @@ def _bootstrap_atomic_ssot() -> None:
     """在 hypothesis_bank 独立导入时触发 atomic_factors 的 SSOT 自动同步。"""
     import sys
 
+    fp_mod = sys.modules.get("examples.alpha_mining_agent.forensic_pipeline")
+    if fp_mod is not None and not hasattr(fp_mod, "run_parameter_smoothness_audit"):
+        return
+
     af_mod = sys.modules.get("examples.multi_factor_cta.atomic_factors")
     if af_mod is None:
         from examples.multi_factor_cta.atomic_factors import sync_atomic_specs_to_hypothesis_bank

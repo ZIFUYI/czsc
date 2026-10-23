@@ -138,9 +138,10 @@ def refine_commodity_pool_groups(groups: dict[str, str]) -> dict[str, str]:
     assets present; otherwise the family keeps its legacy sector labels. Assets outside every sub-chain keep their
     sector label, so they can never borrow a larger, heterogeneous pool.
     """
-    refined = {k: str(v).strip().lower() for k, v in groups.items()}
+    refined = dict(groups)
+    norm_groups = {k: str(v).strip().lower() for k, v in groups.items()}
     for sectors, chains in COMMODITY_SUBCHAIN_FAMILIES.items():
-        members = {asset: group for asset, group in refined.items() if group in sectors}
+        members = {asset: group for asset, group in norm_groups.items() if group in sectors}
         if len(members) <= COMMODITY_SUBCHAIN_MIN_FAMILY_SIZE:
             continue
         present = {

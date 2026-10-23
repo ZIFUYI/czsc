@@ -194,6 +194,7 @@ __all__ = [
     "attach_causal_oi_features",
     "attach_native_czsc_signals",
     "audit_single_family",
+    "build_niche_saturation_matrix",
     "compute_atomic_signal",
     "compute_causal_cross_sectional_features",
     "compute_cross_sectional_concurrency",
@@ -207,9 +208,11 @@ __all__ = [
     "enrich_kline_features",
     "evaluate_ablation_metrics",
     "evaluate_series_on_fold",
+    "generate_leaderboard_markdown",
     "get_factor_lineage_table",
     "get_preflight_benchmark_contexts",
     "get_signal_usage_summary",
+    "get_workbench_status",
     "gram_schmidt_cluster_orthogonalize",
     "joint_is_coordinate_reweight",
     "link_higher_timeframes",
@@ -236,3 +239,11 @@ __all__ = [
     "two_stage_trigger",
     "unregister_atomic_factor_def",
 ]
+
+
+def __getattr__(name: str):
+    if name in ("build_niche_saturation_matrix", "generate_leaderboard_markdown", "get_workbench_status"):
+        from alpha_lab import cli as _cli
+
+        return getattr(_cli, name)
+    raise AttributeError(f"module 'alpha_lab' has no attribute {name!r}")
